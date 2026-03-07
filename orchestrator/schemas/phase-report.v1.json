@@ -1,0 +1,40 @@
+{
+  "type": "object",
+  "required": [
+    "schema",
+    "run_id",
+    "phase",
+    "summary",
+    "objective_outcomes",
+    "accepted_bundles",
+    "unresolved_risks",
+    "proposed_role_changes",
+    "recommendation",
+    "human_approved"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"type": "string", "enum": ["phase-report.v1"]},
+    "run_id": {"type": "string"},
+    "phase": {"type": "string", "enum": ["discovery", "design", "mvp-build", "polish"]},
+    "summary": {"type": "string"},
+    "objective_outcomes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["objective_id", "status", "accepted_bundles"],
+        "additionalProperties": false,
+        "properties": {
+          "objective_id": {"type": "string"},
+          "status": {"type": "string", "enum": ["accepted", "pending"]},
+          "accepted_bundles": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "accepted_bundles": {"type": "array", "items": {"type": "string"}},
+    "unresolved_risks": {"type": "array", "items": {"type": "string"}},
+    "proposed_role_changes": {"type": "array", "items": {"type": "string"}},
+    "recommendation": {"type": "string", "enum": ["advance", "hold"]},
+    "human_approved": {"type": "boolean"}
+  }
+}

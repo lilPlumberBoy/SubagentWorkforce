@@ -1,0 +1,2 @@
+[console_scripts]
+company-orchestrator = company_orchestrator.cli:main

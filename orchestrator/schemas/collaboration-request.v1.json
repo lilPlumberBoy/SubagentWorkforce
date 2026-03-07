@@ -1,0 +1,28 @@
+{
+  "type": "object",
+  "required": [
+    "schema",
+    "run_id",
+    "request_id",
+    "objective_id",
+    "from_role",
+    "to_role",
+    "type",
+    "summary",
+    "blocking",
+    "status"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "schema": {"type": "string", "enum": ["collaboration-request.v1"]},
+    "run_id": {"type": "string"},
+    "request_id": {"type": "string"},
+    "objective_id": {"type": "string"},
+    "from_role": {"type": "string"},
+    "to_role": {"type": "string"},
+    "type": {"type": "string"},
+    "summary": {"type": "string"},
+    "blocking": {"type": "boolean"},
+    "status": {"type": "string", "enum": ["open", "resolved", "rejected"]}
+  }
+}

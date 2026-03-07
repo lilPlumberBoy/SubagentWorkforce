@@ -1,0 +1,97 @@
+{
+  "type": "object",
+  "required": [
+    "schema",
+    "run_id",
+    "phase",
+    "objective_id",
+    "summary",
+    "tasks",
+    "bundle_plan",
+    "dependency_notes",
+    "collaboration_edges"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"type": "string", "enum": ["objective-plan.v1"]},
+    "run_id": {"type": "string"},
+    "phase": {"type": "string", "enum": ["discovery", "design", "mvp-build", "polish"]},
+    "objective_id": {"type": "string"},
+    "summary": {"type": "string"},
+    "tasks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "task_id",
+          "capability",
+          "assigned_role",
+          "objective",
+          "inputs",
+          "expected_outputs",
+          "done_when",
+          "depends_on",
+          "validation",
+          "collaboration_rules",
+          "working_directory",
+          "additional_directories",
+          "sandbox_mode"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "task_id": {"type": "string"},
+          "capability": {"type": ["string", "null"]},
+          "assigned_role": {"type": "string"},
+          "objective": {"type": "string"},
+          "inputs": {"type": "array", "items": {"type": "string"}},
+          "expected_outputs": {"type": "array", "items": {"type": "string"}},
+          "done_when": {"type": "array", "items": {"type": "string"}},
+          "depends_on": {"type": "array", "items": {"type": "string"}},
+          "validation": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["id", "command"],
+              "additionalProperties": false,
+              "properties": {
+                "id": {"type": "string"},
+                "command": {"type": "string"}
+              }
+            }
+          },
+          "collaboration_rules": {"type": "array", "items": {"type": "string"}},
+          "working_directory": {"type": ["string", "null"]},
+          "additional_directories": {"type": "array", "items": {"type": "string"}},
+          "sandbox_mode": {"type": "string", "enum": ["read-only", "workspace-write", "danger-full-access"]}
+        }
+      }
+    },
+    "bundle_plan": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["bundle_id", "task_ids", "summary"],
+        "additionalProperties": false,
+        "properties": {
+          "bundle_id": {"type": "string"},
+          "task_ids": {"type": "array", "items": {"type": "string"}},
+          "summary": {"type": "string"}
+        }
+      }
+    },
+    "dependency_notes": {"type": "array", "items": {"type": "string"}},
+    "collaboration_edges": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["from_task_id", "to_role", "reason"],
+        "additionalProperties": false,
+        "properties": {
+          "from_task_id": {"type": "string"},
+          "to_role": {"type": "string"},
+          "reason": {"type": "string"}
+        }
+      }
+    }
+  }
+}

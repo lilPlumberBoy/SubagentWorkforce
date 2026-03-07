@@ -1,0 +1,70 @@
+{
+  "type": "object",
+  "required": [
+    "summary",
+    "status",
+    "artifacts",
+    "validation_results",
+    "dependency_impact",
+    "open_issues",
+    "follow_up_requests",
+    "context_echo",
+    "collaboration_request"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "summary": {"type": "string"},
+    "status": {"type": "string", "enum": ["ready_for_bundle_review", "blocked", "needs_revision"]},
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "status"],
+        "additionalProperties": false,
+        "properties": {
+          "path": {"type": "string"},
+          "status": {"type": "string"}
+        }
+      }
+    },
+    "validation_results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "status", "evidence"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {"type": "string"},
+          "status": {"type": "string", "enum": ["passed", "failed"]},
+          "evidence": {"type": "string"}
+        }
+      }
+    },
+    "dependency_impact": {"type": "array", "items": {"type": "string"}},
+    "open_issues": {"type": "array", "items": {"type": "string"}},
+    "follow_up_requests": {"type": "array", "items": {"type": "string"}},
+    "context_echo": {
+      "type": ["object", "null"],
+      "required": ["role_id", "objective_id", "phase", "prompt_layers", "schema"],
+      "additionalProperties": false,
+      "properties": {
+        "role_id": {"type": "string"},
+        "objective_id": {"type": "string"},
+        "phase": {"type": "string"},
+        "prompt_layers": {"type": "array", "items": {"type": "string"}},
+        "schema": {"type": "string"}
+      }
+    },
+    "collaboration_request": {
+      "type": ["object", "null"],
+      "required": ["to_role", "type", "summary", "blocking"],
+      "additionalProperties": false,
+      "properties": {
+        "to_role": {"type": "string"},
+        "type": {"type": "string"},
+        "summary": {"type": "string"},
+        "blocking": {"type": "boolean"}
+      }
+    }
+  }
+}

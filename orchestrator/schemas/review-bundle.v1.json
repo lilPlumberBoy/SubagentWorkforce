@@ -1,0 +1,29 @@
+{
+  "type": "object",
+  "required": [
+    "schema",
+    "run_id",
+    "phase",
+    "objective_id",
+    "bundle_id",
+    "assembled_by",
+    "reviewed_by",
+    "included_tasks",
+    "status",
+    "required_checks"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "schema": {"type": "string", "enum": ["review-bundle.v1"]},
+    "run_id": {"type": "string"},
+    "phase": {"type": "string", "enum": ["discovery", "design", "mvp-build", "polish"]},
+    "objective_id": {"type": "string"},
+    "bundle_id": {"type": "string"},
+    "assembled_by": {"type": "string"},
+    "reviewed_by": {"type": "string"},
+    "included_tasks": {"type": "array", "items": {"type": "string"}},
+    "status": {"type": "string", "enum": ["pending_review", "accepted", "rejected"]},
+    "required_checks": {"type": "array", "items": {"type": "string"}},
+    "rejection_reasons": {"type": "array", "items": {"type": "string"}}
+  }
+}

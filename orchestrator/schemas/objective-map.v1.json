@@ -1,0 +1,33 @@
+{
+  "type": "object",
+  "required": ["schema", "run_id", "objectives", "dependencies"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"type": "string", "enum": ["objective-map.v1"]},
+    "run_id": {"type": "string"},
+    "objectives": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["objective_id", "title", "summary", "status", "capabilities"],
+        "additionalProperties": false,
+        "properties": {
+          "objective_id": {"type": "string"},
+          "title": {"type": "string"},
+          "summary": {"type": "string"},
+          "status": {"type": "string", "enum": ["proposed", "approved", "complete"]},
+          "capabilities": {
+            "type": "array",
+            "items": {"type": "string"}
+          }
+        }
+      }
+    },
+    "dependencies": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    }
+  }
+}

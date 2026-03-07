@@ -1,0 +1,15 @@
+{
+  "schema": "completion-report.v1",
+  "run_id": "run-001",
+  "phase": "design",
+  "objective_id": "web-app",
+  "task_id": "WEB-DES-012",
+  "agent_role": "objectives.web-app.frontend-worker",
+  "status": "ready_for_bundle_review",
+  "summary": "Completed the assigned step.",
+  "artifacts": [{"path": "<artifact path>", "status": "created"}],
+  "validation_results": [{"id": "required-check-1", "status": "passed", "evidence": "command returned success"}],
+  "dependency_impact": [],
+  "open_issues": [],
+  "follow_up_requests": []
+}

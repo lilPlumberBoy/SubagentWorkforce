@@ -1,0 +1,28 @@
+{
+  "type": "object",
+  "required": [
+    "schema",
+    "run_id",
+    "change_id",
+    "summary",
+    "recommended_reentry_phase",
+    "impacted_objectives",
+    "impacted_teams",
+    "proposed_role_changes",
+    "regression_scope",
+    "approved"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"type": "string", "enum": ["change-proposal.v1"]},
+    "run_id": {"type": "string"},
+    "change_id": {"type": "string"},
+    "summary": {"type": "string"},
+    "recommended_reentry_phase": {"type": "string", "enum": ["discovery", "design", "mvp-build", "polish"]},
+    "impacted_objectives": {"type": "array", "items": {"type": "string"}},
+    "impacted_teams": {"type": "array", "items": {"type": "string"}},
+    "proposed_role_changes": {"type": "array", "items": {"type": "string"}},
+    "regression_scope": {"type": "string"},
+    "approved": {"type": "boolean"}
+  }
+}

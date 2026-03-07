@@ -1,0 +1,19 @@
+{
+  "schema": "task-assignment.v1",
+  "run_id": "run-001",
+  "phase": "design",
+  "objective_id": "web-app",
+  "capability": "frontend",
+  "task_id": "WEB-DES-012",
+  "assigned_role": "objectives.web-app.frontend-worker",
+  "manager_role": "objectives.web-app.frontend-manager",
+  "acceptance_role": "objectives.web-app.acceptance-manager",
+  "objective": "Define the internal screen contract for the approved slice.",
+  "inputs": [],
+  "expected_outputs": ["design artifact path"],
+  "done_when": ["design artifact is complete", "required checks pass"],
+  "depends_on": [],
+  "validation": [{"id": "required-check-1", "command": "<project-specific validation command>"}],
+  "collaboration_rules": ["open a collaboration request when another team is required"]
+}
+

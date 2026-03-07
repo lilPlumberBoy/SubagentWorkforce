@@ -1,0 +1,69 @@
+{
+  "type": "object",
+  "required": [
+    "schema",
+    "run_id",
+    "phase",
+    "objective_id",
+    "task_id",
+    "agent_role",
+    "status",
+    "summary",
+    "artifacts",
+    "validation_results",
+    "dependency_impact",
+    "open_issues",
+    "follow_up_requests"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "schema": {"type": "string", "enum": ["completion-report.v1"]},
+    "run_id": {"type": "string"},
+    "phase": {"type": "string", "enum": ["discovery", "design", "mvp-build", "polish"]},
+    "objective_id": {"type": "string"},
+    "task_id": {"type": "string"},
+    "agent_role": {"type": "string"},
+    "status": {"type": "string", "enum": ["ready_for_bundle_review", "blocked", "needs_revision"]},
+    "summary": {"type": "string"},
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "status"],
+        "additionalProperties": false,
+        "properties": {
+          "path": {"type": "string"},
+          "status": {"type": "string"}
+        }
+      }
+    },
+    "validation_results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "status", "evidence"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {"type": "string"},
+          "status": {"type": "string", "enum": ["passed", "failed"]},
+          "evidence": {"type": "string"}
+        }
+      }
+    },
+    "dependency_impact": {"type": "array", "items": {"type": "string"}},
+    "open_issues": {"type": "array", "items": {"type": "string"}},
+    "follow_up_requests": {"type": "array", "items": {"type": "string"}},
+    "context_echo": {
+      "type": "object",
+      "required": ["role_id", "objective_id", "phase", "prompt_layers", "schema"],
+      "additionalProperties": false,
+      "properties": {
+        "role_id": {"type": "string"},
+        "objective_id": {"type": "string"},
+        "phase": {"type": "string"},
+        "prompt_layers": {"type": "array", "items": {"type": "string"}},
+        "schema": {"type": "string"}
+      }
+    }
+  }
+}

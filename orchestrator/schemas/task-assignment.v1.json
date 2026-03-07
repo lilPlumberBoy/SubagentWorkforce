@@ -1,0 +1,53 @@
+{
+  "type": "object",
+  "required": [
+    "schema",
+    "run_id",
+    "phase",
+    "objective_id",
+    "task_id",
+    "assigned_role",
+    "manager_role",
+    "acceptance_role",
+    "objective",
+    "inputs",
+    "expected_outputs",
+    "done_when",
+    "depends_on",
+    "validation",
+    "collaboration_rules"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"type": "string", "enum": ["task-assignment.v1"]},
+    "run_id": {"type": "string"},
+    "phase": {"type": "string", "enum": ["discovery", "design", "mvp-build", "polish"]},
+    "objective_id": {"type": "string"},
+    "capability": {"type": ["string", "null"]},
+    "working_directory": {"type": ["string", "null"]},
+    "sandbox_mode": {"type": "string", "enum": ["read-only", "workspace-write", "danger-full-access"]},
+    "additional_directories": {"type": "array", "items": {"type": "string"}},
+    "task_id": {"type": "string"},
+    "assigned_role": {"type": "string"},
+    "manager_role": {"type": "string"},
+    "acceptance_role": {"type": "string"},
+    "objective": {"type": "string"},
+    "inputs": {"type": "array", "items": {"type": "string"}},
+    "expected_outputs": {"type": "array", "items": {"type": "string"}},
+    "done_when": {"type": "array", "items": {"type": "string"}},
+    "depends_on": {"type": "array", "items": {"type": "string"}},
+    "validation": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "command"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {"type": "string"},
+          "command": {"type": "string"}
+        }
+      }
+    },
+    "collaboration_rules": {"type": "array", "items": {"type": "string"}}
+  }
+}

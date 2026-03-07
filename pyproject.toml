@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "company-orchestrator"
+version = "0.1.0"
+description = "Local-first company-style subagent orchestration scaffolding."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{name = "Codex"}]
+
+[project.scripts]
+company-orchestrator = "company_orchestrator.cli:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["company_orchestrator*"]
+

@@ -1,0 +1,23 @@
+{
+  "type": "object",
+  "required": ["schema", "run_id", "current_phase", "phases"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"type": "string", "enum": ["phase-plan.v1"]},
+    "run_id": {"type": "string"},
+    "current_phase": {"type": "string", "enum": ["discovery", "design", "mvp-build", "polish"]},
+    "phases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["phase", "status", "human_approved"],
+        "additionalProperties": false,
+        "properties": {
+          "phase": {"type": "string", "enum": ["discovery", "design", "mvp-build", "polish"]},
+          "status": {"type": "string", "enum": ["active", "locked", "complete"]},
+          "human_approved": {"type": "boolean"}
+        }
+      }
+    }
+  }
+}

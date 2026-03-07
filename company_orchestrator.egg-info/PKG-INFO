@@ -1,0 +1,72 @@
+Metadata-Version: 2.4
+Name: company-orchestrator
+Version: 0.1.0
+Summary: Local-first company-style subagent orchestration scaffolding.
+Author: Codex
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+
+# Company Orchestrator
+
+Local-first scaffolding for a company-style subagent orchestration system. The repo implements the initial runtime contracts, prompt-layer assembly, phase gating, bundle review, collaboration requests, change re-entry, and a smoke-test workflow.
+
+## What Is Implemented
+
+- A Python CLI for creating runs, decomposing goals, suggesting teams, generating role files, rendering prompts, reviewing bundles, creating phase reports, and managing change requests.
+- On-disk JSON contracts for phase plans, objective maps, team registries, task assignments, completion reports, review bundles, collaboration requests, phase reports, change requests, and change proposals.
+- Markdown role assets for base roles, capability overlays, phase overlays, and reusable templates.
+- A smoke-test scaffold that creates two isolated objectives and verifies prompt inheritance, context echo reporting, and acceptance review.
+- A test suite covering phase locks, objective isolation, bundle rejection on blocking collaboration, phase advancement gating, and change re-entry.
+
+## Quick Start
+
+Initialize a run from a goal file:
+
+```bash
+company-orchestrator init-run run-001 path/to/goal.md
+company-orchestrator decompose-goal run-001
+company-orchestrator suggest-teams run-001
+company-orchestrator generate-roles run-001
+```
+
+Scaffold and verify the minimal communication test:
+
+```bash
+company-orchestrator scaffold-smoke-test --run-id smoke-demo
+company-orchestrator verify-smoke smoke-demo
+company-orchestrator phase-report smoke-demo
+company-orchestrator approve-phase smoke-demo discovery
+company-orchestrator advance-phase smoke-demo
+```
+
+Create and analyze a change request:
+
+```bash
+company-orchestrator create-change smoke-demo chg-001 "Need interface updates" --interface-changed
+company-orchestrator analyze-change smoke-demo chg-001
+company-orchestrator approve-change smoke-demo chg-001
+company-orchestrator scaffold-delta smoke-demo chg-001
+```
+
+## Prompt Assembly
+
+Prompts are assembled in this order:
+
+1. `orchestrator/roles/base/company.md`
+2. `orchestrator/roles/base/<manager|worker|acceptance-manager>.md`
+3. `orchestrator/roles/capabilities/<capability>.md` when present
+4. `orchestrator/roles/objectives/<objective-id>/approved/<role>.md` or `charter.md`
+5. `orchestrator/phase-overlays/<current-phase>.md`
+6. The rendered `task-assignment.v1` JSON
+
+Every render writes a prompt log under `runs/<run-id>/prompt-logs/`.
+
+## Running Tests
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+## Current Scope
+
+This repo implements the orchestration skeleton and local runtime contracts. It does not yet include a live Codex executor adapter that spawns real subagents from inside the Python runtime. The current smoke test uses a mock context-echo flow so the contract and review system can be verified independently of the execution backend.
