@@ -22,7 +22,7 @@
     "assembled_by": {"type": "string"},
     "reviewed_by": {"type": "string"},
     "included_tasks": {"type": "array", "items": {"type": "string"}},
-    "status": {"type": "string", "enum": ["pending_review", "accepted", "rejected"]},
+    "status": {"type": "string", "enum": ["pending_review", "accepted", "rejected", "blocked"]},
     "required_checks": {"type": "array", "items": {"type": "string"}},
     "rejection_reasons": {"type": "array", "items": {"type": "string"}}
   }

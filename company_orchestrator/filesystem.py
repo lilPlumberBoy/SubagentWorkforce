@@ -3,8 +3,23 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any
+
+
+_PATH_LOCKS: dict[str, threading.Lock] = {}
+_PATH_LOCKS_GUARD = threading.Lock()
+
+
+def path_lock(path: Path) -> threading.Lock:
+    key = str(path.resolve())
+    with _PATH_LOCKS_GUARD:
+        lock = _PATH_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _PATH_LOCKS[key] = lock
+        return lock
 
 
 def ensure_dir(path: Path) -> Path:
@@ -33,10 +48,11 @@ def write_text(path: Path, content: str) -> None:
 def write_text_atomic(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     normalized = content.rstrip() + "\n"
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
-        handle.write(normalized)
-        temp_path = Path(handle.name)
-    os.replace(temp_path, path)
+    with path_lock(path):
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+            handle.write(normalized)
+            temp_path = Path(handle.name)
+        os.replace(temp_path, path)
 
 
 def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
@@ -45,8 +61,9 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
 
 def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, sort_keys=True) + "\n")
+    with path_lock(path):
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
 def load_optional_json(path: Path) -> dict[str, Any] | None:

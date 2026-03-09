@@ -53,6 +53,18 @@
     "dependency_impact": {"type": "array", "items": {"type": "string"}},
     "open_issues": {"type": "array", "items": {"type": "string"}},
     "follow_up_requests": {"type": "array", "items": {"type": "string"}},
+    "runtime_warnings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["code", "message"],
+        "additionalProperties": false,
+        "properties": {
+          "code": {"type": "string"},
+          "message": {"type": "string"}
+        }
+      }
+    },
     "context_echo": {
       "type": "object",
       "required": ["role_id", "objective_id", "phase", "prompt_layers", "schema"],

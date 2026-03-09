@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -16,13 +18,15 @@ from company_orchestrator.changes import analyze_change_request, approve_change,
 from company_orchestrator.collaboration import create_collaboration_request, resolve_collaboration_request
 from company_orchestrator.executor import ExecutorError, execute_task
 from company_orchestrator.filesystem import read_json, write_json
-from company_orchestrator.management import run_phase
+from company_orchestrator.management import run_phase, schedule_tasks
 from company_orchestrator.monitoring import build_activity_detail, build_run_dashboard, inspect_activity
 from company_orchestrator.objective_planner import build_planning_prompt, plan_objective, plan_phase
 from company_orchestrator.planner import generate_role_files, initialize_run, suggest_team_proposals
 from company_orchestrator.prompts import build_planning_payload, render_prompt
 from company_orchestrator.reports import advance_phase, generate_phase_report, record_human_approval
 from company_orchestrator.smoke import scaffold_smoke_test, simulate_context_echo_completion, verify_smoke_reports
+from company_orchestrator.worktree_manager import commit_task_workspace, ensure_run_integration_workspace, ensure_task_workspace
+from company_orchestrator.bundles import land_accepted_bundle
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -760,6 +764,194 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(executed_order, ["APP-A-SMOKE-001", "APP-B-SMOKE-001"])
         self.assertEqual(summary["recommendation"], "advance")
 
+    def test_schedule_tasks_runs_parallel_read_only_work(self) -> None:
+        scaffold_smoke_test(self.project_root, "parallel")
+        run_dir = self.project_root / "runs" / "parallel"
+        tasks = [read_json(path) for path in sorted((run_dir / "tasks").glob("*.json"))]
+        timing: dict[str, tuple[float, float]] = {}
+
+        def side_effect(project_root: Path, run_id: str, task_id: str, *, runtime=None, **_: object):
+            start = time.perf_counter()
+            time.sleep(0.2)
+            summary = write_managed_report(
+                project_root,
+                run_id,
+                task_id,
+                status="ready_for_bundle_review",
+                summary=f"{task_id} complete",
+            )
+            summary["parallel_execution_requested"] = runtime.parallel_execution_requested if runtime else False
+            summary["parallel_execution_granted"] = runtime.parallel_execution_granted if runtime else False
+            summary["parallel_fallback_reason"] = runtime.parallel_fallback_reason if runtime else None
+            summary["runtime_warnings"] = list(runtime.runtime_warnings) if runtime else []
+            write_json(project_root / "runs" / run_id / "executions" / f"{task_id}.json", summary)
+            timing[task_id] = (start, time.perf_counter())
+            return summary
+
+        with patch("company_orchestrator.management.execute_task", side_effect=side_effect):
+            summary = schedule_tasks(
+                self.project_root,
+                "parallel",
+                tasks,
+                sandbox_mode="read-only",
+                codex_path="codex",
+                force=False,
+                timeout_seconds=30,
+                max_concurrency=2,
+            )
+
+        self.assertEqual(summary["max_concurrency"], 2)
+        a_start, a_end = timing["APP-A-SMOKE-001"]
+        b_start, b_end = timing["APP-B-SMOKE-001"]
+        self.assertLess(max(a_start, b_start), min(a_end, b_end))
+        for execution in summary["executed"]:
+            self.assertTrue(execution["parallel_execution_granted"])
+
+    def test_schedule_tasks_serializes_conflicting_parallel_writes_with_warning(self) -> None:
+        scaffold_smoke_test(self.project_root, "serialize-warning")
+        run_dir = self.project_root / "runs" / "serialize-warning"
+        task_ids = ["APP-A-SMOKE-001", "APP-B-SMOKE-001"]
+        for task_id in task_ids:
+            task_path = run_dir / "tasks" / f"{task_id}.json"
+            task = read_json(task_path)
+            task["execution_mode"] = "isolated_write"
+            task["parallel_policy"] = "allow"
+            task["owned_paths"] = ["apps/todo/shared.txt"]
+            write_json(task_path, task)
+        tasks = [read_json(run_dir / "tasks" / f"{task_id}.json") for task_id in task_ids]
+
+        def side_effect(project_root: Path, run_id: str, task_id: str, *, runtime=None, **_: object):
+            summary = write_managed_report(
+                project_root,
+                run_id,
+                task_id,
+                status="ready_for_bundle_review",
+                summary=f"{task_id} complete",
+            )
+            summary["parallel_execution_requested"] = runtime.parallel_execution_requested if runtime else False
+            summary["parallel_execution_granted"] = runtime.parallel_execution_granted if runtime else False
+            summary["parallel_fallback_reason"] = runtime.parallel_fallback_reason if runtime else None
+            summary["runtime_warnings"] = list(runtime.runtime_warnings) if runtime else []
+            write_json(project_root / "runs" / run_id / "executions" / f"{task_id}.json", summary)
+            return summary
+
+        with patch("company_orchestrator.management.execute_task", side_effect=side_effect):
+            summary = schedule_tasks(
+                self.project_root,
+                "serialize-warning",
+                tasks,
+                sandbox_mode="read-only",
+                codex_path="codex",
+                force=False,
+                timeout_seconds=30,
+                max_concurrency=2,
+            )
+
+        serialized = [
+            item for item in summary["executed"]
+            if not item["parallel_execution_granted"]
+        ]
+        self.assertEqual(len(serialized), 1)
+        self.assertIn("Conflicts on owned paths", serialized[0]["parallel_fallback_reason"])
+        fallback_task = serialized[0]["task_id"]
+        activity = read_json(run_dir / "live" / "activities" / f"{fallback_task}.json")
+        self.assertTrue(activity["warnings"])
+        phase_report, _ = generate_phase_report(self.project_root, "serialize-warning")
+        self.assertEqual(phase_report["parallelism_summary"]["tasks_serialized_by_runtime_conflict"], 1)
+
+    def test_worktree_isolation_and_landing_merge_accepted_changes(self) -> None:
+        init_git_repo(self.project_root)
+        run_dir = initialize_run(self.project_root, "git-run", "# Goal\n\n## Objectives\n- App A")
+        objective_map = {
+            "schema": "objective-map.v1",
+            "run_id": "git-run",
+            "objectives": [
+                {
+                    "objective_id": "app-a",
+                    "title": "App A",
+                    "summary": "App A",
+                    "status": "approved",
+                    "capabilities": ["frontend"],
+                }
+            ],
+            "dependencies": [],
+        }
+        write_json(run_dir / "objective-map.json", objective_map)
+        suggest_team_proposals(self.project_root, "git-run")
+        generate_role_files(self.project_root, "git-run", approve=True)
+        task = {
+            "schema": "task-assignment.v1",
+            "run_id": "git-run",
+            "phase": "mvp-build",
+            "objective_id": "app-a",
+            "capability": "frontend",
+            "task_id": "APP-A-MVP-001",
+            "assigned_role": "objectives.app-a.frontend-worker",
+            "manager_role": "objectives.app-a.objective-manager",
+            "acceptance_role": "objectives.app-a.acceptance-manager",
+            "objective": "Write isolated file",
+            "inputs": [],
+            "expected_outputs": ["apps/todo/sample.txt"],
+            "done_when": ["file exists"],
+            "execution_mode": "isolated_write",
+            "parallel_policy": "allow",
+            "owned_paths": ["apps/todo/sample.txt"],
+            "shared_asset_ids": [],
+            "depends_on": [],
+            "validation": [],
+            "collaboration_rules": [],
+            "working_directory": None,
+            "additional_directories": [],
+            "sandbox_mode": "workspace-write",
+        }
+        write_json(run_dir / "tasks" / "APP-A-MVP-001.json", task)
+        write_json(
+            run_dir / "reports" / "APP-A-MVP-001.json",
+            {
+                "schema": "completion-report.v1",
+                "run_id": "git-run",
+                "phase": "mvp-build",
+                "objective_id": "app-a",
+                "task_id": "APP-A-MVP-001",
+                "agent_role": "objectives.app-a.frontend-worker",
+                "status": "ready_for_bundle_review",
+                "summary": "done",
+                "artifacts": [{"path": "apps/todo/sample.txt", "status": "created"}],
+                "validation_results": [],
+                "dependency_impact": [],
+                "open_issues": [],
+                "follow_up_requests": [],
+            },
+        )
+        bundle = {
+            "schema": "review-bundle.v1",
+            "run_id": "git-run",
+            "phase": "mvp-build",
+            "objective_id": "app-a",
+            "bundle_id": "app-a-mvp-bundle",
+            "assembled_by": "objectives.app-a.objective-manager",
+            "reviewed_by": "objectives.app-a.acceptance-manager",
+            "included_tasks": ["APP-A-MVP-001"],
+            "status": "accepted",
+            "required_checks": [],
+            "rejection_reasons": [],
+        }
+        write_json(run_dir / "bundles" / "app-a-mvp-bundle.json", bundle)
+
+        integration = ensure_run_integration_workspace(self.project_root, "git-run")
+        workspace = ensure_task_workspace(self.project_root, "git-run", "APP-A-MVP-001")
+        self.assertTrue(integration.workspace_path.exists())
+        self.assertTrue(workspace.workspace_path.exists())
+        (workspace.workspace_path / "apps" / "todo").mkdir(parents=True, exist_ok=True)
+        (workspace.workspace_path / "apps" / "todo" / "sample.txt").write_text("from task\n", encoding="utf-8")
+        commit_result = commit_task_workspace(workspace, "APP-A-MVP-001")
+        self.assertTrue(commit_result["committed"])
+
+        landing = land_accepted_bundle(self.project_root, "git-run", bundle)
+        self.assertEqual(landing["status"], "accepted")
+        merged_text = (integration.workspace_path / "apps" / "todo" / "sample.txt").read_text(encoding="utf-8")
+        self.assertEqual(merged_text, "from task\n")
+
     def test_plan_objective_materializes_tasks_from_manager_plan(self) -> None:
         scaffold_planning_run(self.project_root, "planned", ["frontend"])
         final_payload = {
@@ -1258,6 +1450,13 @@ def write_managed_report(
         "report_path": f"runs/{run_id}/reports/{task_id}.json",
         "collaboration_request_ids": [],
         "status": status,
+        "runtime_warnings": [],
+        "parallel_execution_requested": False,
+        "parallel_execution_granted": False,
+        "parallel_fallback_reason": None,
+        "branch_name": None,
+        "workspace_path": None,
+        "commit_sha": None,
     }
     write_json(project_root / "runs" / run_id / "executions" / f"{task_id}.json", execution_summary)
     return execution_summary
@@ -1329,6 +1528,10 @@ def planned_payload_for_objective(run_id: str, objective_id: str) -> dict[str, o
                 "inputs": [],
                 "expected_outputs": ["note"],
                 "done_when": ["task complete"],
+                "execution_mode": "read_only",
+                "parallel_policy": "allow",
+                "owned_paths": [],
+                "shared_asset_ids": [],
                 "depends_on": [],
                 "validation": [{"id": "manager-check", "command": "check"}],
                 "collaboration_rules": [],
@@ -1347,3 +1550,12 @@ def planned_payload_for_objective(run_id: str, objective_id: str) -> dict[str, o
         "dependency_notes": [],
         "collaboration_edges": []
     }
+
+
+def init_git_repo(project_root: Path) -> None:
+    subprocess.run(["git", "init", "-b", "main"], cwd=project_root, capture_output=True, check=True, text=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=project_root, capture_output=True, check=True, text=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=project_root, capture_output=True, check=True, text=True)
+    (project_root / ".gitignore").write_text("runs/\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=project_root, capture_output=True, check=True, text=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=project_root, capture_output=True, check=True, text=True)

@@ -7,7 +7,9 @@ from .bundle_plans import objective_bundle_specs
 from .constants import PHASES
 from .filesystem import read_json, write_json, write_text
 from .live import initialize_live_run, record_event, refresh_run_state
+from .parallelism import summarize_parallelism_for_phase
 from .schemas import validate_document
+from .worktree_manager import WorktreeError, cleanup_phase_task_worktrees
 
 
 def generate_phase_report(project_root: Path, run_id: str) -> tuple[dict[str, Any], Path]:
@@ -19,11 +21,14 @@ def generate_phase_report(project_root: Path, run_id: str) -> tuple[dict[str, An
     bundles = [read_json(path) for path in sorted((run_dir / "bundles").glob("*.json"))]
     accepted_by_objective = {}
     rejected = []
+    blocked = []
     for bundle in bundles:
         if bundle["phase"] != phase:
             continue
         if bundle["status"] == "accepted":
             accepted_by_objective.setdefault(bundle["objective_id"], []).append(bundle["bundle_id"])
+        elif bundle["status"] == "blocked":
+            blocked.append(bundle)
         elif bundle["status"] == "rejected":
             rejected.append(bundle)
 
@@ -35,10 +40,23 @@ def generate_phase_report(project_root: Path, run_id: str) -> tuple[dict[str, An
             required_bundle_specs = objective_bundle_specs(run_dir, phase, objective["objective_id"], [])
             required_bundle_ids = [bundle["bundle_id"] for bundle in required_bundle_specs]
             matched_bundle_ids = [bundle_id for bundle_id in required_bundle_ids if bundle_id in accepted_bundle_ids]
-            status = "accepted" if required_bundle_ids and set(required_bundle_ids).issubset(set(accepted_bundle_ids)) else "pending"
+            blocked_bundle_ids = {
+                bundle["bundle_id"]
+                for bundle in blocked
+                if bundle["objective_id"] == objective["objective_id"]
+            }
+            if blocked_bundle_ids:
+                status = "blocked"
+            elif required_bundle_ids and set(required_bundle_ids).issubset(set(accepted_bundle_ids)):
+                status = "accepted"
+            else:
+                status = "pending"
         else:
             matched_bundle_ids = accepted_bundle_ids
-            status = "accepted" if matched_bundle_ids else "pending"
+            if any(bundle["objective_id"] == objective["objective_id"] for bundle in blocked):
+                status = "blocked"
+            else:
+                status = "accepted" if matched_bundle_ids else "pending"
         outcomes.append(
             {
                 "objective_id": objective["objective_id"],
@@ -49,6 +67,12 @@ def generate_phase_report(project_root: Path, run_id: str) -> tuple[dict[str, An
 
     recommendation = "advance" if outcomes and all(item["status"] == "accepted" for item in outcomes) else "hold"
     accepted_bundle_ids = [bundle_id for item in outcomes for bundle_id in item["accepted_bundles"]]
+    phase_tasks = []
+    for path in sorted((run_dir / "tasks").glob("*.json")):
+        task = read_json(path)
+        if task["phase"] == phase:
+            phase_tasks.append(task)
+    parallelism_summary = summarize_parallelism_for_phase(run_dir, phase, phase_tasks)
     payload = {
         "schema": "phase-report.v1",
         "run_id": run_id,
@@ -56,7 +80,8 @@ def generate_phase_report(project_root: Path, run_id: str) -> tuple[dict[str, An
         "summary": f"{phase} phase report for {run_id}",
         "objective_outcomes": outcomes,
         "accepted_bundles": accepted_bundle_ids,
-        "unresolved_risks": [bundle["bundle_id"] for bundle in rejected],
+        "unresolved_risks": [bundle["bundle_id"] for bundle in rejected] + [bundle["bundle_id"] for bundle in blocked],
+        "parallelism_summary": parallelism_summary,
         "proposed_role_changes": [],
         "recommendation": recommendation,
         "human_approved": False,
@@ -112,6 +137,22 @@ def render_phase_report_markdown(report: dict[str, Any]) -> str:
             lines.append(f"- {risk}")
     else:
         lines.append("- none")
+    lines.extend(
+        [
+            "",
+            "## Parallelism Summary",
+            f"- total tasks considered: {report['parallelism_summary']['total_tasks_considered']}",
+            f"- tasks run in parallel: {report['parallelism_summary']['tasks_run_in_parallel']}",
+            f"- tasks serialized by policy: {report['parallelism_summary']['tasks_serialized_by_policy']}",
+            f"- tasks serialized by runtime conflict: {report['parallelism_summary']['tasks_serialized_by_runtime_conflict']}",
+        ]
+    )
+    if report["parallelism_summary"]["incidents"]:
+        lines.append("- incidents:")
+        for incident in report["parallelism_summary"]["incidents"]:
+            lines.append(f"  - {incident['task_id']}: {incident['reason']} ({incident['artifact_path']})")
+    else:
+        lines.append("- incidents: none")
     return "\n".join(lines)
 
 
@@ -129,6 +170,16 @@ def record_human_approval(project_root: Path, run_id: str, phase: str, approved:
         report = read_json(report_path)
         report["human_approved"] = approved
         write_json(report_path, report)
+    if approved:
+        try:
+            phase_task_ids = [
+                path.stem
+                for path in sorted((project_root / "runs" / run_id / "tasks").glob("*.json"))
+                if read_json(path)["phase"] == phase
+            ]
+            cleanup_phase_task_worktrees(project_root, run_id, phase_task_ids)
+        except WorktreeError:
+            pass
     refresh_run_state(project_root, run_id)
     return phase_plan
 

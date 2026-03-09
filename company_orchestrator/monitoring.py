@@ -109,6 +109,7 @@ def build_run_dashboard(project_root: Path, run_id: str):
         build_activity_table("Active Task Activities", active_tasks),
         build_activity_table("Queued Tasks", queued_tasks),
         build_activity_table("Blocked Tasks", blocked_tasks),
+        build_warning_rollup_panel(activities),
         build_phase_progress_panel(objectives, activities),
     ]
     return Group(*renderables)
@@ -174,16 +175,19 @@ def build_activity_table(title: str, activities: list[dict[str, Any]]) -> Table:
     table.add_column("Activity")
     table.add_column("Objective")
     table.add_column("Status")
+    table.add_column("Warnings")
     table.add_column("Progress")
     table.add_column("Current")
     if not activities:
-        table.add_row("none", "-", "-", progress_renderable(0.0), "-")
+        table.add_row("none", "-", "-", "-", progress_renderable(0.0), "-")
         return table
     for activity in sorted(activities, key=activity_sort_key):
+        warnings_text = "; ".join(item["message"] for item in activity.get("warnings", [])) or "-"
         table.add_row(
             activity["activity_id"],
             activity["objective_id"],
             activity["status"],
+            warnings_text,
             progress_renderable(activity["progress_fraction"]),
             activity.get("current_activity") or "-",
         )
@@ -200,9 +204,19 @@ def build_activity_summary_panel(activity: dict[str, Any]) -> Panel:
         f"Status: {activity['status']}",
         f"Stage: {activity['progress_stage']}",
         f"Progress: {percent_text(activity['progress_fraction'])}",
+        f"Parallel requested: {activity.get('parallel_execution_requested', False)}",
+        f"Parallel granted: {activity.get('parallel_execution_granted', False)}",
+        f"Fallback reason: {activity.get('parallel_fallback_reason') or '-'}",
+        f"Workspace: {activity.get('workspace_path') or '-'}",
+        f"Branch: {activity.get('branch_name') or '-'}",
         f"Current: {activity.get('current_activity') or '-'}",
         f"Updated: {activity['updated_at']}",
     ]
+    warnings = activity.get("warnings", [])
+    if warnings:
+        lines.append("Warnings:")
+        for item in warnings:
+            lines.append(f"- {item['code']}: {item['message']}")
     return Panel("\n".join(lines), title="Activity", border_style="yellow")
 
 
@@ -225,8 +239,20 @@ def build_artifact_paths_panel(activity: dict[str, Any]) -> Panel:
         f"Stdout: {activity.get('stdout_path') or '-'}",
         f"Stderr: {activity.get('stderr_path') or '-'}",
         f"Output: {activity.get('output_path') or '-'}",
+        f"Workspace: {activity.get('workspace_path') or '-'}",
+        f"Branch: {activity.get('branch_name') or '-'}",
     ]
     return Panel("\n".join(lines), title="Artifacts", border_style="blue")
+
+
+def build_warning_rollup_panel(activities: list[dict[str, Any]]) -> Panel:
+    warning_lines = []
+    for activity in sorted(activities, key=activity_sort_key):
+        for item in activity.get("warnings", []):
+            warning_lines.append(f"- {activity['activity_id']}: {item['message']}")
+    if not warning_lines:
+        warning_lines = ["- none"]
+    return Panel("\n".join(warning_lines), title="Parallelism Warnings", border_style="red")
 
 
 def load_prompt_text(project_root: Path, prompt_path: str | None) -> str:

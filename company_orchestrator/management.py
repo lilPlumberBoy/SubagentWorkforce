@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import time
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any
 
 from .bundle_plans import objective_bundle_specs
-from .bundles import assemble_review_bundle, review_bundle
-from .executor import ExecutorError, execute_task
+from .bundles import assemble_review_bundle, land_accepted_bundle, review_bundle
+from .executor import ExecutorError, TaskExecutionRuntime, execute_task
 from .filesystem import ensure_dir, read_json, write_json
 from .live import ensure_activity, initialize_live_run, record_event, update_activity
+from .parallelism import classify_parallel_safety, parallel_requested, warning
 from .reports import generate_phase_report
 
 
@@ -19,6 +22,7 @@ def run_phase(
     codex_path: str = "codex",
     force: bool = False,
     timeout_seconds: int = 300,
+    max_concurrency: int = 3,
 ) -> dict[str, Any]:
     run_dir = project_root / "runs" / run_id
     phase = active_phase(run_dir)
@@ -32,6 +36,7 @@ def run_phase(
         codex_path=codex_path,
         force=force,
         timeout_seconds=timeout_seconds,
+        max_concurrency=max_concurrency,
     )
     objective_summaries = {}
     for objective_id in objective_ids:
@@ -58,6 +63,7 @@ def run_objective(
     codex_path: str = "codex",
     force: bool = False,
     timeout_seconds: int = 300,
+    max_concurrency: int = 3,
 ) -> dict[str, Any]:
     run_dir = project_root / "runs" / run_id
     phase = active_phase(run_dir)
@@ -72,6 +78,7 @@ def run_objective(
         codex_path=codex_path,
         force=force,
         timeout_seconds=timeout_seconds,
+        max_concurrency=max_concurrency,
     )
     objective_summary = finalize_objective_bundle(project_root, run_id, phase, objective_id)
     summary = {
@@ -108,13 +115,13 @@ def schedule_tasks(
     codex_path: str,
     force: bool,
     timeout_seconds: int,
+    max_concurrency: int,
 ) -> dict[str, Any]:
     run_dir = project_root / "runs" / run_id
     initialize_live_run(project_root, run_id)
     reports_dir = run_dir / "reports"
     tasks_by_id = {task["task_id"]: task for task in tasks}
     all_reports = {path.stem: read_json(path) for path in sorted(reports_dir.glob("*.json"))}
-    existing_reports = {task_id: report for task_id, report in all_reports.items() if task_id in tasks_by_id}
     if force:
         completed: set[str] = set()
         failed: set[str] = set()
@@ -127,6 +134,84 @@ def schedule_tasks(
     skipped_dependency: dict[str, list[str]] = {}
     unresolved_dependencies: dict[str, list[str]] = {}
     failures: list[dict[str, str]] = []
+    running: dict[str, dict[str, Any]] = {}
+    warning_events_emitted: set[tuple[str, str]] = set()
+    forced_serialization: dict[str, tuple[str, str]] = {}
+    max_concurrency = max(1, max_concurrency)
+
+    def emit_parallel_warning(task: dict[str, Any], code: str, message: str) -> None:
+        marker = (task["task_id"], code)
+        if marker in warning_events_emitted:
+            return
+        warning_events_emitted.add(marker)
+        record_event(
+            project_root,
+            run_id,
+            phase=task["phase"],
+            activity_id=task["task_id"],
+            event_type="task.parallel_warning",
+            message=f"Task {task['task_id']} will run serialized: {message}",
+            payload={"code": code, "reason": message},
+        )
+
+    def set_queue_state(
+        task: dict[str, Any],
+        *,
+        queue_position: int | None,
+        current_activity: str,
+        warnings: list[dict[str, str]] | None = None,
+        parallel_execution_granted: bool | None = None,
+        parallel_fallback_reason: str | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "status": "queued",
+            "progress_stage": "queued",
+            "current_activity": current_activity,
+            "dependency_blockers": [],
+            "queue_position": queue_position,
+            "parallel_execution_requested": parallel_requested(task),
+        }
+        if warnings is not None:
+            payload["warnings"] = warnings
+        if parallel_execution_granted is not None:
+            payload["parallel_execution_granted"] = parallel_execution_granted
+        if parallel_fallback_reason is not None:
+            payload["parallel_fallback_reason"] = parallel_fallback_reason
+        update_activity(project_root, run_id, task["task_id"], **payload)
+
+    def launch_task(
+        pool: ThreadPoolExecutor,
+        task: dict[str, Any],
+        *,
+        granted: bool,
+        warning_code: str | None = None,
+        warning_message: str | None = None,
+    ) -> None:
+        runtime_warnings = []
+        if warning_code and warning_message:
+            runtime_warnings.append(warning(warning_code, warning_message))
+            emit_parallel_warning(task, warning_code, warning_message)
+        future = pool.submit(
+            execute_task,
+            project_root,
+            run_id,
+            task["task_id"],
+            sandbox_mode=sandbox_mode,
+            codex_path=codex_path,
+            timeout_seconds=timeout_seconds,
+            runtime=TaskExecutionRuntime(
+                parallel_execution_requested=parallel_requested(task),
+                parallel_execution_granted=granted,
+                parallel_fallback_reason=warning_message,
+                runtime_warnings=runtime_warnings,
+            ),
+        )
+        running[task["task_id"]] = {
+            "future": future,
+            "task": task,
+            "serialized": not granted,
+        }
+        pending.pop(task["task_id"], None)
 
     for task in tasks:
         ensure_activity(
@@ -147,6 +232,7 @@ def schedule_tasks(
             stderr_path=f"runs/{run_id}/executions/{task['task_id']}.stderr.log",
             output_path=f"runs/{run_id}/reports/{task['task_id']}.json",
             dependency_blockers=list(task["depends_on"]),
+            parallel_execution_requested=parallel_requested(task),
         )
         record_event(
             project_root,
@@ -160,153 +246,262 @@ def schedule_tasks(
 
     if not force:
         for task_id in list(pending):
-            if task_id in completed:
-                skipped_existing.append(task_id)
-                report = all_reports[task_id]
-                update_activity(
-                    project_root,
-                    run_id,
-                    task_id,
-                    status=report["status"],
-                    progress_stage=report["status"],
-                    current_activity="Using existing task report.",
-                    dependency_blockers=[],
-                    queue_position=None,
-                )
-                record_event(
-                    project_root,
-                    run_id,
-                    phase=tasks_by_id[task_id]["phase"],
-                    activity_id=task_id,
-                    event_type="task.skipped_existing",
-                    message=f"Skipped {task_id} because an existing completed report is present.",
-                    payload={"report_status": report["status"]},
-                )
-                pending.pop(task_id)
-
-    while pending:
-        ready: list[dict[str, Any]] = []
-        for task_id, task in list(pending.items()):
-            failed_deps = [dependency for dependency in task["depends_on"] if dependency in failed or dependency in skipped_dependency]
-            if failed_deps:
-                skipped_dependency[task_id] = failed_deps
-                update_activity(
-                    project_root,
-                    run_id,
-                    task_id,
-                    status="blocked",
-                    progress_stage="blocked",
-                    current_activity="Blocked by failed dependencies.",
-                    dependency_blockers=failed_deps,
-                    queue_position=None,
-                )
-                record_event(
-                    project_root,
-                    run_id,
-                    phase=task["phase"],
-                    activity_id=task_id,
-                    event_type="task.blocked",
-                    message=f"Task {task_id} is blocked by failed dependencies.",
-                    payload={"dependency_blockers": failed_deps},
-                )
-                pending.pop(task_id)
+            if task_id not in completed:
                 continue
-            unmet_deps = [dependency for dependency in task["depends_on"] if dependency not in completed]
-            if not unmet_deps:
-                ready.append(task)
-            else:
-                update_activity(
-                    project_root,
-                    run_id,
-                    task_id,
-                    status="waiting_dependencies",
-                    progress_stage="waiting_dependencies",
-                    current_activity="Waiting on dependency completion.",
-                    dependency_blockers=unmet_deps,
-                    queue_position=None,
-                )
-                record_event(
-                    project_root,
-                    run_id,
-                    phase=task["phase"],
-                    activity_id=task_id,
-                    event_type="task.waiting_dependencies",
-                    message=f"Task {task_id} is waiting on dependencies.",
-                    payload={"dependency_blockers": unmet_deps},
-                )
-
-        if not ready:
-            for task_id, task in pending.items():
-                unresolved_dependencies[task_id] = [
-                    dependency for dependency in task["depends_on"] if dependency not in completed
-                ]
-            break
-
-        ordered_ready = sorted(ready, key=lambda item: item["task_id"])
-        for index, queued_task in enumerate(ordered_ready, start=1):
-            update_activity(
-                project_root,
-                run_id,
-                queued_task["task_id"],
-                status="queued",
-                progress_stage="queued",
-                current_activity="Queued for execution.",
-                dependency_blockers=[],
-                queue_position=index,
-            )
-            record_event(
-                project_root,
-                run_id,
-                phase=queued_task["phase"],
-                activity_id=queued_task["task_id"],
-                event_type="task.queued",
-                message=f"Queued task {queued_task['task_id']} for execution.",
-                payload={"queue_position": index},
-            )
-
-        for task in ordered_ready:
-            task_id = task["task_id"]
-            pending.pop(task_id, None)
-            try:
-                execution_summary = execute_task(
-                    project_root,
-                    run_id,
-                    task_id,
-                    sandbox_mode=sandbox_mode,
-                    codex_path=codex_path,
-                    timeout_seconds=timeout_seconds,
-                )
-            except ExecutorError as exc:
-                failures.append({"task_id": task_id, "message": str(exc)})
-                failed.add(task_id)
-                record_event(
-                    project_root,
-                    run_id,
-                    phase=task["phase"],
-                    activity_id=task_id,
-                    event_type="task.failed",
-                    message=f"Task {task_id} failed during execution.",
-                    payload={"error": str(exc)},
-                )
-                continue
-            executed.append(execution_summary)
+            skipped_existing.append(task_id)
+            report = all_reports[task_id]
             update_activity(
                 project_root,
                 run_id,
                 task_id,
-                status=execution_summary["status"],
-                progress_stage=execution_summary["status"],
-                current_activity=f"Execution finished with status {execution_summary['status']}.",
-                queue_position=None,
+                status=report["status"],
+                progress_stage=report["status"],
+                current_activity="Using existing task report.",
                 dependency_blockers=[],
-                stdout_path=execution_summary.get("stdout_path"),
-                stderr_path=execution_summary.get("stderr_path"),
-                output_path=execution_summary.get("report_path"),
+                queue_position=None,
             )
-            if execution_summary["status"] == "ready_for_bundle_review":
-                completed.add(task_id)
-            else:
-                failed.add(task_id)
+            record_event(
+                project_root,
+                run_id,
+                phase=tasks_by_id[task_id]["phase"],
+                activity_id=task_id,
+                event_type="task.skipped_existing",
+                message=f"Skipped {task_id} because an existing completed report is present.",
+                payload={"report_status": report["status"]},
+            )
+            pending.pop(task_id)
+
+    with ThreadPoolExecutor(max_workers=max_concurrency) as pool:
+        while pending or running:
+            progressed = False
+
+            for task_id, info in list(running.items()):
+                future: Future[dict[str, Any]] = info["future"]
+                if not future.done():
+                    continue
+                progressed = True
+                task = info["task"]
+                del running[task_id]
+                try:
+                    execution_summary = future.result()
+                except ExecutorError as exc:
+                    failures.append({"task_id": task_id, "message": str(exc)})
+                    failed.add(task_id)
+                    record_event(
+                        project_root,
+                        run_id,
+                        phase=task["phase"],
+                        activity_id=task_id,
+                        event_type="task.failed",
+                        message=f"Task {task_id} failed during execution.",
+                        payload={"error": str(exc)},
+                    )
+                    continue
+                executed.append(execution_summary)
+                update_activity(
+                    project_root,
+                    run_id,
+                    task_id,
+                    status=execution_summary["status"],
+                    progress_stage=execution_summary["status"],
+                    current_activity=f"Execution finished with status {execution_summary['status']}.",
+                    queue_position=None,
+                    dependency_blockers=[],
+                    stdout_path=execution_summary.get("stdout_path"),
+                    stderr_path=execution_summary.get("stderr_path"),
+                    output_path=execution_summary.get("report_path"),
+                    warnings=list(execution_summary.get("runtime_warnings", [])),
+                    parallel_execution_requested=execution_summary.get("parallel_execution_requested", False),
+                    parallel_execution_granted=execution_summary.get("parallel_execution_granted", False),
+                    parallel_fallback_reason=execution_summary.get("parallel_fallback_reason"),
+                    workspace_path=execution_summary.get("workspace_path"),
+                    branch_name=execution_summary.get("branch_name"),
+                )
+                if execution_summary["status"] == "ready_for_bundle_review":
+                    completed.add(task_id)
+                else:
+                    failed.add(task_id)
+
+            ready: list[dict[str, Any]] = []
+            for task_id, task in list(pending.items()):
+                failed_deps = [dependency for dependency in task["depends_on"] if dependency in failed or dependency in skipped_dependency]
+                if failed_deps:
+                    skipped_dependency[task_id] = failed_deps
+                    update_activity(
+                        project_root,
+                        run_id,
+                        task_id,
+                        status="blocked",
+                        progress_stage="blocked",
+                        current_activity="Blocked by failed dependencies.",
+                        dependency_blockers=failed_deps,
+                        queue_position=None,
+                    )
+                    record_event(
+                        project_root,
+                        run_id,
+                        phase=task["phase"],
+                        activity_id=task_id,
+                        event_type="task.blocked",
+                        message=f"Task {task_id} is blocked by failed dependencies.",
+                        payload={"dependency_blockers": failed_deps},
+                    )
+                    pending.pop(task_id)
+                    continue
+
+                unmet_deps = [dependency for dependency in task["depends_on"] if dependency not in completed]
+                if unmet_deps:
+                    update_activity(
+                        project_root,
+                        run_id,
+                        task_id,
+                        status="waiting_dependencies",
+                        progress_stage="waiting_dependencies",
+                        current_activity="Waiting on dependency completion.",
+                        dependency_blockers=unmet_deps,
+                        queue_position=None,
+                    )
+                    record_event(
+                        project_root,
+                        run_id,
+                        phase=task["phase"],
+                        activity_id=task_id,
+                        event_type="task.waiting_dependencies",
+                        message=f"Task {task_id} is waiting on dependencies.",
+                        payload={"dependency_blockers": unmet_deps},
+                    )
+                    continue
+                ready.append(task)
+
+            if not ready and not running and pending:
+                for task_id, task in pending.items():
+                    unresolved_dependencies[task_id] = [
+                        dependency for dependency in task["depends_on"] if dependency not in completed
+                    ]
+                break
+            if not ready and running:
+                wait([info["future"] for info in running.values()], timeout=0.1, return_when=FIRST_COMPLETED)
+                continue
+
+            ordered_ready = sorted(ready, key=lambda item: item["task_id"])
+            serialized_running = any(info["serialized"] for info in running.values())
+            candidate_running = [info["task"] for info in running.values() if not info["serialized"]]
+            ready_parallel: list[dict[str, Any]] = []
+            ready_serialized: list[tuple[dict[str, Any], str, str]] = []
+            for task in ordered_ready:
+                serialized_reason = forced_serialization.get(task["task_id"])
+                if serialized_reason is not None:
+                    ready_serialized.append((task, serialized_reason[0], serialized_reason[1]))
+                    continue
+                is_safe, warning_code, warning_message = classify_parallel_safety(task, running_tasks=candidate_running)
+                if is_safe:
+                    ready_parallel.append(task)
+                    candidate_running.append(task)
+                else:
+                    reason = (
+                        warning_code or "serialize_only",
+                        warning_message or "Task must run serialized.",
+                    )
+                    forced_serialization[task["task_id"]] = reason
+                    ready_serialized.append(
+                        (
+                            task,
+                            reason[0],
+                            reason[1],
+                        )
+                    )
+
+            queue_index = 1
+            if serialized_running:
+                for task in ordered_ready:
+                    set_queue_state(
+                        task,
+                        queue_position=queue_index,
+                        current_activity="Waiting for the serialized execution lane to clear.",
+                    )
+                    record_event(
+                        project_root,
+                        run_id,
+                        phase=task["phase"],
+                        activity_id=task["task_id"],
+                        event_type="task.serialized_lane_wait",
+                        message=f"Task {task['task_id']} is waiting because a serialized task is currently running.",
+                        payload={},
+                    )
+                    queue_index += 1
+                wait([info["future"] for info in running.values()], timeout=0.1, return_when=FIRST_COMPLETED)
+                continue
+
+            started_any = False
+            slots = max(0, max_concurrency - len(running))
+            for task in ready_parallel[:slots]:
+                set_queue_state(
+                    task,
+                    queue_position=queue_index,
+                    current_activity="Queued for parallel execution.",
+                    parallel_execution_granted=True,
+                )
+                record_event(
+                    project_root,
+                    run_id,
+                    phase=task["phase"],
+                    activity_id=task["task_id"],
+                    event_type="task.queued",
+                    message=f"Queued task {task['task_id']} for parallel execution.",
+                    payload={"queue_position": queue_index},
+                )
+                launch_task(pool, task, granted=True)
+                queue_index += 1
+                started_any = True
+
+            for task in ready_parallel[slots:]:
+                set_queue_state(
+                    task,
+                    queue_position=queue_index,
+                    current_activity="Queued for parallel execution.",
+                    parallel_execution_granted=True,
+                )
+                record_event(
+                    project_root,
+                    run_id,
+                    phase=task["phase"],
+                    activity_id=task["task_id"],
+                    event_type="task.queued",
+                    message=f"Queued task {task['task_id']} for parallel execution.",
+                    payload={"queue_position": queue_index},
+                )
+                queue_index += 1
+
+            for task, warning_code, warning_message in ready_serialized:
+                set_queue_state(
+                    task,
+                    queue_position=queue_index,
+                    current_activity="Queued for serialized execution.",
+                    warnings=[warning(warning_code, warning_message)],
+                    parallel_execution_granted=False,
+                    parallel_fallback_reason=warning_message,
+                )
+                emit_parallel_warning(task, warning_code, warning_message)
+                record_event(
+                    project_root,
+                    run_id,
+                    phase=task["phase"],
+                    activity_id=task["task_id"],
+                    event_type="task.queued",
+                    message=f"Queued task {task['task_id']} for serialized execution.",
+                    payload={"queue_position": queue_index, "reason": warning_message},
+                )
+                queue_index += 1
+
+            if not started_any and not running and ready_serialized:
+                task, warning_code, warning_message = ready_serialized[0]
+                launch_task(pool, task, granted=False, warning_code=warning_code, warning_message=warning_message)
+                started_any = True
+
+            if not started_any and running:
+                wait([info["future"] for info in running.values()], timeout=0.1, return_when=FIRST_COMPLETED)
+            elif not started_any and not progressed:
+                time.sleep(0.05)
 
     return {
         "phase": active_phase(run_dir),
@@ -315,6 +510,7 @@ def schedule_tasks(
         "skipped_dependency": skipped_dependency,
         "unresolved_dependencies": unresolved_dependencies,
         "failures": failures,
+        "max_concurrency": max_concurrency,
     }
 
 
@@ -324,6 +520,7 @@ def finalize_objective_bundle(project_root: Path, run_id: str, phase: str, objec
     bundle_specs = objective_bundle_specs(run_dir, phase, objective_id, list(tasks))
     accepted_bundles = []
     rejected_bundles = []
+    blocked_bundles = []
     missing_by_bundle: dict[str, list[str]] = {}
 
     for bundle_spec in bundle_specs:
@@ -348,10 +545,14 @@ def finalize_objective_bundle(project_root: Path, run_id: str, phase: str, objec
             f"objectives.{objective_id}.acceptance-manager",
         )
         bundle = review_bundle(project_root, run_id, bundle_spec["bundle_id"])
-        if bundle["status"] == "accepted":
-            accepted_bundles.append(bundle)
-        else:
+        if bundle["status"] != "accepted":
             rejected_bundles.append(bundle)
+            continue
+        landing = land_accepted_bundle(project_root, run_id, bundle)
+        if landing["status"] == "blocked":
+            blocked_bundles.append(landing["bundle"])
+            continue
+        accepted_bundles.append(landing["bundle"])
 
     if missing_by_bundle:
         return {
@@ -359,6 +560,14 @@ def finalize_objective_bundle(project_root: Path, run_id: str, phase: str, objec
             "status": "pending",
             "reason": "missing_reports",
             "missing_by_bundle": missing_by_bundle,
+        }
+    if blocked_bundles:
+        return {
+            "objective_id": objective_id,
+            "status": "blocked",
+            "accepted_bundle_ids": [bundle["bundle_id"] for bundle in accepted_bundles],
+            "blocked_bundle_ids": [bundle["bundle_id"] for bundle in blocked_bundles],
+            "rejection_reasons": [reason for bundle in blocked_bundles for reason in bundle.get("rejection_reasons", [])],
         }
     if rejected_bundles:
         return {

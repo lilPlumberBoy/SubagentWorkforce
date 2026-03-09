@@ -4,15 +4,16 @@ import json
 import os
 import subprocess
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .collaboration import create_collaboration_request
 from .filesystem import ensure_dir, read_json, read_text, write_json, write_text
-from .live import ensure_activity, record_event, update_activity
+from .live import append_activity_warning, ensure_activity, record_event, update_activity
 from .prompts import render_prompt
 from .schemas import SchemaValidationError, validate_document
+from .worktree_manager import WorkspaceInfo, WorktreeError, commit_task_workspace, ensure_task_workspace
 
 
 class ExecutorError(RuntimeError):
@@ -24,6 +25,17 @@ class CodexProcessResult:
     returncode: int
     stdout: str
     stderr: str
+
+
+@dataclass
+class TaskExecutionRuntime:
+    parallel_execution_requested: bool = False
+    parallel_execution_granted: bool = False
+    parallel_fallback_reason: str | None = None
+    runtime_warnings: list[dict[str, str]] = field(default_factory=list)
+    branch_name: str | None = None
+    workspace_path: str | None = None
+    commit_sha: str | None = None
 
 
 def coerce_process_text(stream: str | bytes | None) -> str:
@@ -109,6 +121,7 @@ def execute_task(
     sandbox_mode: str = "read-only",
     codex_path: str = "codex",
     timeout_seconds: int = 300,
+    runtime: TaskExecutionRuntime | None = None,
 ) -> dict[str, Any]:
     run_dir = project_root / "runs" / run_id
     task_path = run_dir / "tasks" / f"{task_id}.json"
@@ -116,6 +129,7 @@ def execute_task(
         raise ExecutorError(f"Task {task_id} does not exist for run {run_id}")
 
     task = read_json(task_path)
+    runtime = prepare_task_runtime(project_root, run_id, task, runtime=runtime)
     prompt_metadata = render_prompt(project_root, run_id, task_path)
     prompt_text = read_text(project_root / prompt_metadata["prompt_path"])
     execution_prompt = build_execution_prompt(prompt_text)
@@ -126,7 +140,7 @@ def execute_task(
     stderr_path = execution_dir / f"{task_id}.stderr.log"
     summary_path = execution_dir / f"{task_id}.json"
     report_path = run_dir / "reports" / f"{task_id}.json"
-    working_directory = task.get("working_directory")
+    working_directory = runtime.workspace_path or task.get("working_directory")
     command = build_codex_command(
         codex_path=codex_path,
         working_directory=Path(working_directory).resolve() if working_directory else project_root,
@@ -153,7 +167,21 @@ def execute_task(
         stderr_path=str(stderr_path.relative_to(project_root)),
         output_path=str(report_path.relative_to(project_root)),
         runner_id="codex",
+        warnings=list(runtime.runtime_warnings),
+        parallel_execution_requested=runtime.parallel_execution_requested,
+        parallel_execution_granted=runtime.parallel_execution_granted,
+        parallel_fallback_reason=runtime.parallel_fallback_reason,
+        workspace_path=runtime.workspace_path,
+        branch_name=runtime.branch_name,
     )
+    for warning in runtime.runtime_warnings:
+        append_activity_warning(
+            project_root,
+            run_id,
+            task_id,
+            code=warning["code"],
+            message=warning["message"],
+        )
     record_event(
         project_root,
         run_id,
@@ -172,6 +200,12 @@ def execute_task(
         current_activity="Launching Codex worker.",
         queue_position=None,
         dependency_blockers=[],
+        warnings=list(runtime.runtime_warnings),
+        parallel_execution_requested=runtime.parallel_execution_requested,
+        parallel_execution_granted=runtime.parallel_execution_granted,
+        parallel_fallback_reason=runtime.parallel_fallback_reason,
+        workspace_path=runtime.workspace_path,
+        branch_name=runtime.branch_name,
     )
     record_event(
         project_root,
@@ -180,7 +214,11 @@ def execute_task(
         activity_id=task_id,
         event_type="task.launching",
         message=f"Launching task {task_id}.",
-        payload={"command": command[:4]},
+        payload={
+            "command": command[:4],
+            "workspace_path": runtime.workspace_path,
+            "branch_name": runtime.branch_name,
+        },
     )
 
     def on_stdout_line(raw_line: str) -> None:
@@ -207,6 +245,12 @@ def execute_task(
             status="failed",
             progress_stage="failed",
             current_activity=f"Timed out after {timeout_seconds} seconds.",
+            warnings=list(runtime.runtime_warnings),
+            parallel_execution_requested=runtime.parallel_execution_requested,
+            parallel_execution_granted=runtime.parallel_execution_granted,
+            parallel_fallback_reason=runtime.parallel_fallback_reason,
+            workspace_path=runtime.workspace_path,
+            branch_name=runtime.branch_name,
         )
         record_event(
             project_root,
@@ -232,6 +276,12 @@ def execute_task(
             status="failed",
             progress_stage="failed",
             current_activity=message,
+            warnings=list(runtime.runtime_warnings),
+            parallel_execution_requested=runtime.parallel_execution_requested,
+            parallel_execution_granted=runtime.parallel_execution_granted,
+            parallel_fallback_reason=runtime.parallel_fallback_reason,
+            workspace_path=runtime.workspace_path,
+            branch_name=runtime.branch_name,
         )
         record_event(
             project_root,
@@ -255,6 +305,12 @@ def execute_task(
             status="failed",
             progress_stage="failed",
             current_activity="Final response was not valid JSON.",
+            warnings=list(runtime.runtime_warnings),
+            parallel_execution_requested=runtime.parallel_execution_requested,
+            parallel_execution_granted=runtime.parallel_execution_granted,
+            parallel_fallback_reason=runtime.parallel_fallback_reason,
+            workspace_path=runtime.workspace_path,
+            branch_name=runtime.branch_name,
         )
         raise ExecutorError(f"Final response was not valid JSON: {final_response}") from exc
 
@@ -268,10 +324,25 @@ def execute_task(
             status="failed",
             progress_stage="failed",
             current_activity="Executor response failed schema validation.",
+            warnings=list(runtime.runtime_warnings),
+            parallel_execution_requested=runtime.parallel_execution_requested,
+            parallel_execution_granted=runtime.parallel_execution_granted,
+            parallel_fallback_reason=runtime.parallel_fallback_reason,
+            workspace_path=runtime.workspace_path,
+            branch_name=runtime.branch_name,
         )
         raise ExecutorError(f"Executor response failed schema validation: {exc}") from exc
 
-    report, collaboration_ids = materialize_executor_response(project_root, run_id, task, parsed_response)
+    report, collaboration_ids = materialize_executor_response(
+        project_root,
+        run_id,
+        task,
+        parsed_response,
+        runtime_warnings=runtime.runtime_warnings,
+    )
+    if task.get("execution_mode", "read_only") == "isolated_write" and report["status"] == "ready_for_bundle_review":
+        commit_result = commit_isolated_workspace(runtime, task_id)
+        runtime.commit_sha = commit_result.get("commit_sha")
     update_activity(
         project_root,
         run_id,
@@ -282,6 +353,12 @@ def execute_task(
         output_path=str(report_path.relative_to(project_root)),
         queue_position=None,
         dependency_blockers=[],
+        warnings=list(runtime.runtime_warnings),
+        parallel_execution_requested=runtime.parallel_execution_requested,
+        parallel_execution_granted=runtime.parallel_execution_granted,
+        parallel_fallback_reason=runtime.parallel_fallback_reason,
+        workspace_path=runtime.workspace_path,
+        branch_name=runtime.branch_name,
     )
     record_event(
         project_root,
@@ -290,7 +367,16 @@ def execute_task(
         activity_id=task_id,
         event_type="task.completed",
         message=f"Task {task_id} finished with status {report['status']}.",
-        payload={"status": report["status"], "report_path": str(report_path.relative_to(project_root))},
+        payload={
+            "status": report["status"],
+            "report_path": str(report_path.relative_to(project_root)),
+            "parallel_execution_requested": runtime.parallel_execution_requested,
+            "parallel_execution_granted": runtime.parallel_execution_granted,
+            "parallel_fallback_reason": runtime.parallel_fallback_reason,
+            "branch_name": runtime.branch_name,
+            "workspace_path": runtime.workspace_path,
+            "commit_sha": runtime.commit_sha,
+        },
     )
     execution_summary = {
         "task_id": task_id,
@@ -302,9 +388,47 @@ def execute_task(
         "report_path": str(report_path.relative_to(project_root)),
         "collaboration_request_ids": collaboration_ids,
         "status": report["status"],
+        "runtime_warnings": list(runtime.runtime_warnings),
+        "parallel_execution_requested": runtime.parallel_execution_requested,
+        "parallel_execution_granted": runtime.parallel_execution_granted,
+        "parallel_fallback_reason": runtime.parallel_fallback_reason,
+        "branch_name": runtime.branch_name,
+        "workspace_path": runtime.workspace_path,
+        "commit_sha": runtime.commit_sha,
     }
     write_json(summary_path, execution_summary)
     return execution_summary
+
+
+def prepare_task_runtime(
+    project_root: Path,
+    run_id: str,
+    task: dict[str, Any],
+    *,
+    runtime: TaskExecutionRuntime | None = None,
+) -> TaskExecutionRuntime:
+    resolved = runtime or TaskExecutionRuntime()
+    if task.get("execution_mode", "read_only") != "isolated_write":
+        return resolved
+    try:
+        workspace = ensure_task_workspace(project_root, run_id, task["task_id"])
+    except WorktreeError as exc:
+        raise ExecutorError(str(exc)) from exc
+    resolved.branch_name = workspace.branch_name
+    resolved.workspace_path = str(workspace.workspace_path)
+    return resolved
+
+
+def commit_isolated_workspace(runtime: TaskExecutionRuntime, task_id: str) -> dict[str, Any]:
+    if not runtime.branch_name or not runtime.workspace_path:
+        return {"committed": False, "commit_sha": None}
+    try:
+        return commit_task_workspace(
+            WorkspaceInfo(branch_name=runtime.branch_name, workspace_path=Path(runtime.workspace_path)),
+            task_id,
+        )
+    except WorktreeError as exc:
+        raise ExecutorError(str(exc)) from exc
 
 
 def build_exec_environment() -> dict[str, str]:
@@ -532,7 +656,12 @@ def extract_final_response(events: list[dict[str, Any]]) -> str:
 
 
 def materialize_executor_response(
-    project_root: Path, run_id: str, task: dict[str, Any], parsed_response: dict[str, Any]
+    project_root: Path,
+    run_id: str,
+    task: dict[str, Any],
+    parsed_response: dict[str, Any],
+    *,
+    runtime_warnings: list[dict[str, str]],
 ) -> tuple[dict[str, Any], list[str]]:
     run_dir = project_root / "runs" / run_id
     collaboration_ids: list[str] = []
@@ -570,6 +699,8 @@ def materialize_executor_response(
         "open_issues": parsed_response["open_issues"],
         "follow_up_requests": follow_up_requests,
     }
+    if runtime_warnings:
+        report["runtime_warnings"] = runtime_warnings
     if parsed_response.get("context_echo") is not None:
         report["context_echo"] = parsed_response["context_echo"]
     validate_document(report, "completion-report.v1", project_root)

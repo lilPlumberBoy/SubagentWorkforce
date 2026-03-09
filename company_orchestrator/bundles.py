@@ -5,7 +5,9 @@ from typing import Any
 
 from .filesystem import read_json, write_json
 from .live import record_event
+from .parallelism import execution_mode
 from .schemas import validate_document
+from .worktree_manager import WorktreeError, merge_task_branch
 
 
 def assemble_review_bundle(
@@ -105,3 +107,78 @@ def review_bundle(project_root: Path, run_id: str, bundle_id: str) -> dict[str, 
         payload={"bundle_id": bundle_id, "rejection_reasons": bundle.get("rejection_reasons", [])},
     )
     return bundle
+
+
+def land_accepted_bundle(project_root: Path, run_id: str, bundle: dict[str, Any]) -> dict[str, Any]:
+    run_dir = project_root / "runs" / run_id
+    bundle_path = run_dir / "bundles" / f"{bundle['bundle_id']}.json"
+    task_payloads = {
+        task_id: read_json(run_dir / "tasks" / f"{task_id}.json")
+        for task_id in bundle["included_tasks"]
+    }
+    isolated_tasks = [
+        task_id
+        for task_id in sorted(bundle["included_tasks"])
+        if execution_mode(task_payloads[task_id]) == "isolated_write"
+    ]
+    if not isolated_tasks:
+        return {"status": "accepted", "bundle": bundle, "landing_results": []}
+
+    record_event(
+        project_root,
+        run_id,
+        phase=bundle["phase"],
+        activity_id=None,
+        event_type="bundle.landing_started",
+        message=f"Landing accepted bundle {bundle['bundle_id']}.",
+        payload={"bundle_id": bundle["bundle_id"], "task_ids": isolated_tasks},
+    )
+    landing_results = []
+    conflicts = []
+    for task_id in isolated_tasks:
+        try:
+            result = merge_task_branch(project_root, run_id, task_id, bundle_id=bundle["bundle_id"])
+        except WorktreeError as exc:
+            result = {
+                "status": "conflict",
+                "branch_name": None,
+                "workspace_path": None,
+                "conflict_summary_path": None,
+                "error": str(exc),
+            }
+        result["task_id"] = task_id
+        landing_results.append(result)
+        if result["status"] != "merged":
+            conflicts.append(result)
+
+    bundle["landing_results"] = landing_results
+    if conflicts:
+        bundle["status"] = "blocked"
+        reasons = [
+            f"{item['task_id']}: merge conflict while landing accepted work"
+            for item in conflicts
+        ]
+        bundle["rejection_reasons"] = reasons
+        write_json(bundle_path, bundle)
+        record_event(
+            project_root,
+            run_id,
+            phase=bundle["phase"],
+            activity_id=None,
+            event_type="bundle.merge_conflict",
+            message=f"Accepted bundle {bundle['bundle_id']} hit a merge conflict.",
+            payload={"bundle_id": bundle["bundle_id"], "conflicts": conflicts},
+        )
+        return {"status": "blocked", "bundle": bundle, "conflicts": conflicts}
+
+    write_json(bundle_path, bundle)
+    record_event(
+        project_root,
+        run_id,
+        phase=bundle["phase"],
+        activity_id=None,
+        event_type="bundle.landed",
+        message=f"Accepted bundle {bundle['bundle_id']} landed on the run integration branch.",
+        payload={"bundle_id": bundle["bundle_id"], "landing_results": landing_results},
+    )
+    return {"status": "accepted", "bundle": bundle, "landing_results": landing_results}

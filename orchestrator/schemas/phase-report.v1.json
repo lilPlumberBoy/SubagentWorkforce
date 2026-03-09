@@ -8,6 +8,7 @@
     "objective_outcomes",
     "accepted_bundles",
     "unresolved_risks",
+    "parallelism_summary",
     "proposed_role_changes",
     "recommendation",
     "human_approved"
@@ -26,13 +27,43 @@
         "additionalProperties": false,
         "properties": {
           "objective_id": {"type": "string"},
-          "status": {"type": "string", "enum": ["accepted", "pending"]},
+          "status": {"type": "string", "enum": ["accepted", "pending", "blocked"]},
           "accepted_bundles": {"type": "array", "items": {"type": "string"}}
         }
       }
     },
     "accepted_bundles": {"type": "array", "items": {"type": "string"}},
     "unresolved_risks": {"type": "array", "items": {"type": "string"}},
+    "parallelism_summary": {
+      "type": "object",
+      "required": [
+        "total_tasks_considered",
+        "tasks_run_in_parallel",
+        "tasks_serialized_by_policy",
+        "tasks_serialized_by_runtime_conflict",
+        "incidents"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "total_tasks_considered": {"type": "number"},
+        "tasks_run_in_parallel": {"type": "number"},
+        "tasks_serialized_by_policy": {"type": "number"},
+        "tasks_serialized_by_runtime_conflict": {"type": "number"},
+        "incidents": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["task_id", "reason", "artifact_path"],
+            "additionalProperties": false,
+            "properties": {
+              "task_id": {"type": "string"},
+              "reason": {"type": "string"},
+              "artifact_path": {"type": "string"}
+            }
+          }
+        }
+      }
+    },
     "proposed_role_changes": {"type": "array", "items": {"type": "string"}},
     "recommendation": {"type": "string", "enum": ["advance", "hold"]},
     "human_approved": {"type": "boolean"}

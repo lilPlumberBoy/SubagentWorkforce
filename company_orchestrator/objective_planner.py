@@ -21,6 +21,7 @@ from .executor import (
 from .filesystem import ensure_dir, read_json, write_json, write_text
 from .live import ensure_activity, plan_activity_id, record_event, update_activity
 from .objective_roots import find_objective_root
+from .parallelism import infer_execution_metadata
 from .prompts import preview_resolved_inputs, render_objective_planning_prompt
 from .schemas import SchemaValidationError, validate_document
 
@@ -179,6 +180,7 @@ def plan_objective(
         )
         raise ExecutorError(f"Objective plan was not valid JSON: {final_response}") from exc
 
+    normalize_task_execution_metadata(plan)
     try:
         validate_document(plan, "objective-plan.v1", project_root)
     except SchemaValidationError as exc:
@@ -286,6 +288,9 @@ def build_planning_prompt(prompt_text: str) -> str:
         + "Do not execute implementation work.\n"
         + "Produce small isolated tasks for the active phase only.\n"
         + "Use only worker roles from the listed objective team when assigning tasks.\n"
+        + "Every generated task must include execution_mode, parallel_policy, owned_paths, and shared_asset_ids.\n"
+        + "Use execution_mode `read_only` for analysis/reporting work and `isolated_write` for code-writing or file-writing work.\n"
+        + "Use parallel_policy `allow` only when you can justify safe isolation from other tasks; otherwise use `serialize`.\n"
         + "Every bundle in bundle_plan must reference only generated task ids.\n"
         + "For phases after discovery, each task input must be either a concrete repo-relative file path, "
         + "an explicit `Output of <task-id>` reference, or a dotted `Planning Inputs.`/`Runtime Context.` reference.\n"
@@ -319,6 +324,21 @@ def normalize_bundle_ids(plan: dict[str, Any]) -> None:
         seen.add(bundle_id)
 
 
+def normalize_task_execution_metadata(plan: dict[str, Any]) -> None:
+    phase = str(plan.get("phase", "discovery"))
+    for task in plan.get("tasks", []):
+        inferred = infer_execution_metadata(
+            phase=phase,
+            task_id=str(task.get("task_id", "")),
+            expected_outputs=task.get("expected_outputs", []),
+            existing=task,
+        )
+        task.update(inferred)
+        task.setdefault("working_directory", None)
+        task.setdefault("sandbox_mode", "read-only")
+        task.setdefault("additional_directories", [])
+
+
 def validate_objective_plan_contents(plan: dict[str, Any], objective: dict[str, Any]) -> None:
     valid_roles = set()
     for capability in objective["capabilities"]:
@@ -334,6 +354,10 @@ def validate_objective_plan_contents(plan: dict[str, Any], objective: dict[str, 
         task_ids.add(task["task_id"])
         if task["assigned_role"] not in valid_roles:
             raise ExecutorError(f"Objective plan assigned unknown worker role {task['assigned_role']}")
+        if task["execution_mode"] == "isolated_write" and not task["owned_paths"]:
+            raise ExecutorError(
+                f"Objective plan must declare owned_paths for isolated_write task {task['task_id']}"
+            )
     for bundle in plan["bundle_plan"]:
         for task_id in bundle["task_ids"]:
             if task_id not in task_ids:
@@ -351,6 +375,10 @@ def validate_objective_plan_inputs(project_root: Path, run_id: str, plan: dict[s
             "working_directory": planned_task["working_directory"],
             "sandbox_mode": planned_task["sandbox_mode"],
             "additional_directories": planned_task["additional_directories"],
+            "execution_mode": planned_task["execution_mode"],
+            "parallel_policy": planned_task["parallel_policy"],
+            "owned_paths": planned_task["owned_paths"],
+            "shared_asset_ids": planned_task["shared_asset_ids"],
             "task_id": planned_task["task_id"],
             "assigned_role": planned_task["assigned_role"],
             "manager_role": derive_manager_role(project_root, plan["objective_id"], planned_task["assigned_role"]),
@@ -412,6 +440,10 @@ def materialize_objective_plan(project_root: Path, run_id: str, plan: dict[str, 
             "working_directory": planned_task["working_directory"],
             "sandbox_mode": planned_task["sandbox_mode"],
             "additional_directories": planned_task["additional_directories"],
+            "execution_mode": planned_task["execution_mode"],
+            "parallel_policy": planned_task["parallel_policy"],
+            "owned_paths": planned_task["owned_paths"],
+            "shared_asset_ids": planned_task["shared_asset_ids"],
             "task_id": planned_task["task_id"],
             "assigned_role": planned_task["assigned_role"],
             "manager_role": derive_manager_role(project_root, objective_id, planned_task["assigned_role"]),

@@ -21,7 +21,7 @@ company-orchestrator decompose-goal run-001
 company-orchestrator suggest-teams run-001
 company-orchestrator generate-roles run-001 --approve
 company-orchestrator plan-phase run-001 --sandbox read-only
-company-orchestrator run-phase run-001 --sandbox read-only
+company-orchestrator run-phase run-001 --sandbox read-only --max-concurrency 3
 ```
 
 Start from the fill-in template at [orchestrator/templates/goal-template.md](/Users/mike/projects/personal/SubagentWorkforce/orchestrator/templates/goal-template.md). The example todo-app goal lives at [goal-draft.md](/Users/mike/projects/personal/SubagentWorkforce/apps/todo/goal-draft.md).
@@ -80,6 +80,9 @@ Objective-specific roles can live either in the generic tree above or under an a
 - `run-objective` schedules all active-phase tasks for one objective, executes ready tasks, assembles the objective bundle, and runs acceptance review.
 - `run-phase` does the same across every objective in the active phase, then writes the end-of-phase report automatically.
 - Task dependencies declared in `depends_on` are respected before execution.
+- `--max-concurrency` controls how many safe tasks the controller may run at the same time. The default is `3`.
+- Tasks that are not safe to parallelize fall back to serialized execution with a warning instead of failing the run.
+- Code-writing tasks use run-scoped git worktree isolation. Accepted work lands on a dedicated run integration branch `codex/run-<run-id>`, not directly on your current branch.
 - Manager summaries are written under `runs/<run-id>/manager-runs/`.
 
 ## Monitoring And Visualization
@@ -106,9 +109,9 @@ company-orchestrator plan-phase run-001 --sandbox read-only --watch
 company-orchestrator run-phase run-001 --sandbox read-only --watch
 ```
 
-`watch-run` shows the run header, summary counts, objective progress, active planning activities, active task activities, queued work, blocked work, and a phase-level progress bar.
+`watch-run` shows the run header, summary counts, objective progress, active planning activities, active task activities, queued work, blocked work, parallelism warnings, and a phase-level progress bar.
 
-`inspect-activity` shows the activity metadata, full rendered prompt, latest live events, and the paths to stdout, stderr, and the final output artifact.
+`inspect-activity` shows the activity metadata, full rendered prompt, latest live events, parallel fallback warnings, and the paths to stdout, stderr, workspace, branch, and the final output artifact.
 
 ## Objective Planning
 

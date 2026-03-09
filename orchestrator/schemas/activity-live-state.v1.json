@@ -15,6 +15,12 @@
     "progress_fraction",
     "queue_position",
     "runner_id",
+    "warnings",
+    "parallel_execution_requested",
+    "parallel_execution_granted",
+    "parallel_fallback_reason",
+    "workspace_path",
+    "branch_name",
     "current_activity",
     "prompt_path",
     "stdout_path",
@@ -41,6 +47,23 @@
     "progress_fraction": {"type": "number"},
     "queue_position": {"type": ["number", "null"]},
     "runner_id": {"type": ["string", "null"]},
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["code", "message"],
+        "additionalProperties": false,
+        "properties": {
+          "code": {"type": "string"},
+          "message": {"type": "string"}
+        }
+      }
+    },
+    "parallel_execution_requested": {"type": "boolean"},
+    "parallel_execution_granted": {"type": "boolean"},
+    "parallel_fallback_reason": {"type": ["string", "null"]},
+    "workspace_path": {"type": ["string", "null"]},
+    "branch_name": {"type": ["string", "null"]},
     "current_activity": {"type": ["string", "null"]},
     "prompt_path": {"type": ["string", "null"]},
     "stdout_path": {"type": ["string", "null"]},

@@ -82,6 +82,7 @@ def main() -> None:
     run_objective_parser.add_argument("--codex-path", default="codex")
     run_objective_parser.add_argument("--force", action="store_true")
     run_objective_parser.add_argument("--timeout-seconds", type=int, default=300)
+    run_objective_parser.add_argument("--max-concurrency", type=int, default=3)
     run_objective_parser.add_argument("--watch", action="store_true")
     run_objective_parser.add_argument("--watch-refresh-seconds", type=float, default=1.0)
 
@@ -91,6 +92,7 @@ def main() -> None:
     run_phase_parser.add_argument("--codex-path", default="codex")
     run_phase_parser.add_argument("--force", action="store_true")
     run_phase_parser.add_argument("--timeout-seconds", type=int, default=300)
+    run_phase_parser.add_argument("--max-concurrency", type=int, default=3)
     run_phase_parser.add_argument("--watch", action="store_true")
     run_phase_parser.add_argument("--watch-refresh-seconds", type=float, default=1.0)
 
@@ -253,6 +255,7 @@ def main() -> None:
                 codex_path=args.codex_path,
                 force=args.force,
                 timeout_seconds=args.timeout_seconds,
+                max_concurrency=args.max_concurrency,
             )
         print_result(
             run_maybe_watched(project_root, args.run_id, args.watch, args.watch_refresh_seconds, operation),
@@ -267,6 +270,7 @@ def main() -> None:
                 codex_path=args.codex_path,
                 force=args.force,
                 timeout_seconds=args.timeout_seconds,
+                max_concurrency=args.max_concurrency,
             )
         print_result(
             run_maybe_watched(project_root, args.run_id, args.watch, args.watch_refresh_seconds, operation),
