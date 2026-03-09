@@ -9,6 +9,7 @@ description = "Local-first company-style subagent orchestration scaffolding."
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{name = "Codex"}]
+dependencies = ["rich>=13.7,<14"]
 
 [project.scripts]
 company-orchestrator = "company_orchestrator.cli:main"
@@ -18,4 +19,3 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 include = ["company_orchestrator*"]
-

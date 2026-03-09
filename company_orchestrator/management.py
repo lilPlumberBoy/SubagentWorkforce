@@ -7,6 +7,7 @@ from .bundle_plans import objective_bundle_specs
 from .bundles import assemble_review_bundle, review_bundle
 from .executor import ExecutorError, execute_task
 from .filesystem import ensure_dir, read_json, write_json
+from .live import ensure_activity, initialize_live_run, record_event, update_activity
 from .reports import generate_phase_report
 
 
@@ -109,6 +110,7 @@ def schedule_tasks(
     timeout_seconds: int,
 ) -> dict[str, Any]:
     run_dir = project_root / "runs" / run_id
+    initialize_live_run(project_root, run_id)
     reports_dir = run_dir / "reports"
     tasks_by_id = {task["task_id"]: task for task in tasks}
     all_reports = {path.stem: read_json(path) for path in sorted(reports_dir.glob("*.json"))}
@@ -126,10 +128,60 @@ def schedule_tasks(
     unresolved_dependencies: dict[str, list[str]] = {}
     failures: list[dict[str, str]] = []
 
+    for task in tasks:
+        ensure_activity(
+            project_root,
+            run_id,
+            activity_id=task["task_id"],
+            kind="task_execution",
+            entity_id=task["task_id"],
+            phase=task["phase"],
+            objective_id=task["objective_id"],
+            display_name=task["task_id"],
+            assigned_role=task["assigned_role"],
+            status="waiting_dependencies",
+            progress_stage="waiting_dependencies",
+            current_activity="Waiting for scheduler.",
+            prompt_path=None,
+            stdout_path=f"runs/{run_id}/executions/{task['task_id']}.stdout.jsonl",
+            stderr_path=f"runs/{run_id}/executions/{task['task_id']}.stderr.log",
+            output_path=f"runs/{run_id}/reports/{task['task_id']}.json",
+            dependency_blockers=list(task["depends_on"]),
+        )
+        record_event(
+            project_root,
+            run_id,
+            phase=task["phase"],
+            activity_id=task["task_id"],
+            event_type="task.discovered",
+            message=f"Discovered task {task['task_id']} for phase scheduling.",
+            payload={"depends_on": list(task["depends_on"]), "objective_id": task["objective_id"]},
+        )
+
     if not force:
         for task_id in list(pending):
             if task_id in completed:
                 skipped_existing.append(task_id)
+                report = all_reports[task_id]
+                update_activity(
+                    project_root,
+                    run_id,
+                    task_id,
+                    status=report["status"],
+                    progress_stage=report["status"],
+                    current_activity="Using existing task report.",
+                    dependency_blockers=[],
+                    queue_position=None,
+                )
+                record_event(
+                    project_root,
+                    run_id,
+                    phase=tasks_by_id[task_id]["phase"],
+                    activity_id=task_id,
+                    event_type="task.skipped_existing",
+                    message=f"Skipped {task_id} because an existing completed report is present.",
+                    payload={"report_status": report["status"]},
+                )
                 pending.pop(task_id)
 
     while pending:
@@ -138,11 +190,50 @@ def schedule_tasks(
             failed_deps = [dependency for dependency in task["depends_on"] if dependency in failed or dependency in skipped_dependency]
             if failed_deps:
                 skipped_dependency[task_id] = failed_deps
+                update_activity(
+                    project_root,
+                    run_id,
+                    task_id,
+                    status="blocked",
+                    progress_stage="blocked",
+                    current_activity="Blocked by failed dependencies.",
+                    dependency_blockers=failed_deps,
+                    queue_position=None,
+                )
+                record_event(
+                    project_root,
+                    run_id,
+                    phase=task["phase"],
+                    activity_id=task_id,
+                    event_type="task.blocked",
+                    message=f"Task {task_id} is blocked by failed dependencies.",
+                    payload={"dependency_blockers": failed_deps},
+                )
                 pending.pop(task_id)
                 continue
             unmet_deps = [dependency for dependency in task["depends_on"] if dependency not in completed]
             if not unmet_deps:
                 ready.append(task)
+            else:
+                update_activity(
+                    project_root,
+                    run_id,
+                    task_id,
+                    status="waiting_dependencies",
+                    progress_stage="waiting_dependencies",
+                    current_activity="Waiting on dependency completion.",
+                    dependency_blockers=unmet_deps,
+                    queue_position=None,
+                )
+                record_event(
+                    project_root,
+                    run_id,
+                    phase=task["phase"],
+                    activity_id=task_id,
+                    event_type="task.waiting_dependencies",
+                    message=f"Task {task_id} is waiting on dependencies.",
+                    payload={"dependency_blockers": unmet_deps},
+                )
 
         if not ready:
             for task_id, task in pending.items():
@@ -151,23 +242,67 @@ def schedule_tasks(
                 ]
             break
 
-        for task in sorted(ready, key=lambda item: item["task_id"]):
+        ordered_ready = sorted(ready, key=lambda item: item["task_id"])
+        for index, queued_task in enumerate(ordered_ready, start=1):
+            update_activity(
+                project_root,
+                run_id,
+                queued_task["task_id"],
+                status="queued",
+                progress_stage="queued",
+                current_activity="Queued for execution.",
+                dependency_blockers=[],
+                queue_position=index,
+            )
+            record_event(
+                project_root,
+                run_id,
+                phase=queued_task["phase"],
+                activity_id=queued_task["task_id"],
+                event_type="task.queued",
+                message=f"Queued task {queued_task['task_id']} for execution.",
+                payload={"queue_position": index},
+            )
+
+        for task in ordered_ready:
             task_id = task["task_id"]
             pending.pop(task_id, None)
             try:
                 execution_summary = execute_task(
-                project_root,
-                run_id,
-                task_id,
-                sandbox_mode=sandbox_mode,
-                codex_path=codex_path,
-                timeout_seconds=timeout_seconds,
-            )
+                    project_root,
+                    run_id,
+                    task_id,
+                    sandbox_mode=sandbox_mode,
+                    codex_path=codex_path,
+                    timeout_seconds=timeout_seconds,
+                )
             except ExecutorError as exc:
                 failures.append({"task_id": task_id, "message": str(exc)})
                 failed.add(task_id)
+                record_event(
+                    project_root,
+                    run_id,
+                    phase=task["phase"],
+                    activity_id=task_id,
+                    event_type="task.failed",
+                    message=f"Task {task_id} failed during execution.",
+                    payload={"error": str(exc)},
+                )
                 continue
             executed.append(execution_summary)
+            update_activity(
+                project_root,
+                run_id,
+                task_id,
+                status=execution_summary["status"],
+                progress_stage=execution_summary["status"],
+                current_activity=f"Execution finished with status {execution_summary['status']}.",
+                queue_position=None,
+                dependency_blockers=[],
+                stdout_path=execution_summary.get("stdout_path"),
+                stderr_path=execution_summary.get("stderr_path"),
+                output_path=execution_summary.get("report_path"),
+            )
             if execution_summary["status"] == "ready_for_bundle_review":
                 completed.add(task_id)
             else:

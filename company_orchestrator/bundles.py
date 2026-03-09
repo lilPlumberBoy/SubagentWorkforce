@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from .filesystem import read_json, write_json
+from .live import record_event
 from .schemas import validate_document
 
 
@@ -42,12 +43,30 @@ def assemble_review_bundle(
     validate_document(payload, "review-bundle.v1", project_root)
     bundle_path = project_root / "runs" / run_id / "bundles" / f"{bundle_id}.json"
     write_json(bundle_path, payload)
+    record_event(
+        project_root,
+        run_id,
+        phase=phase,
+        activity_id=None,
+        event_type="bundle.assembled",
+        message=f"Assembled review bundle {bundle_id}.",
+        payload={"bundle_id": bundle_id, "objective_id": objective_id, "included_tasks": payload["included_tasks"]},
+    )
     return payload
 
 
 def review_bundle(project_root: Path, run_id: str, bundle_id: str) -> dict[str, Any]:
     bundle_path = project_root / "runs" / run_id / "bundles" / f"{bundle_id}.json"
     bundle = read_json(bundle_path)
+    record_event(
+        project_root,
+        run_id,
+        phase=bundle["phase"],
+        activity_id=None,
+        event_type="bundle.review_started",
+        message=f"Reviewing bundle {bundle_id}.",
+        payload={"bundle_id": bundle_id, "objective_id": bundle["objective_id"]},
+    )
     reports_dir = project_root / "runs" / run_id / "reports"
     collaboration_dir = project_root / "runs" / run_id / "collaboration"
     known_collaboration_ids = {path.stem for path in collaboration_dir.glob("*.json")}
@@ -76,4 +95,13 @@ def review_bundle(project_root: Path, run_id: str, bundle_id: str) -> dict[str, 
         bundle["status"] = "accepted"
         bundle["rejection_reasons"] = []
     write_json(bundle_path, bundle)
+    record_event(
+        project_root,
+        run_id,
+        phase=bundle["phase"],
+        activity_id=None,
+        event_type="bundle.accepted" if bundle["status"] == "accepted" else "bundle.rejected",
+        message=f"Bundle {bundle_id} {bundle['status']}.",
+        payload={"bundle_id": bundle_id, "rejection_reasons": bundle.get("rejection_reasons", [])},
+    )
     return bundle

@@ -14,9 +14,12 @@ from .executor import (
     extract_thread_id,
     extract_turn_failure,
     extract_usage,
+    handle_codex_event_line,
     parse_jsonl_events,
+    run_codex_command,
 )
 from .filesystem import ensure_dir, read_json, write_json, write_text
+from .live import ensure_activity, plan_activity_id, record_event, update_activity
 from .objective_roots import find_objective_root
 from .prompts import preview_resolved_inputs, render_objective_planning_prompt
 from .schemas import SchemaValidationError, validate_document
@@ -35,6 +38,7 @@ def plan_objective(
     run_dir = project_root / "runs" / run_id
     phase = read_json(run_dir / "phase-plan.json")["current_phase"]
     objective = find_objective(run_dir, objective_id)
+    activity_id = plan_activity_id(phase, objective_id)
     prompt_metadata = render_objective_planning_prompt(project_root, run_id, objective_id)
     prompt_text = (project_root / prompt_metadata["prompt_path"]).read_text(encoding="utf-8")
     execution_prompt = build_planning_prompt(prompt_text)
@@ -43,6 +47,7 @@ def plan_objective(
     last_message_path = plans_dir / f"{phase}-{objective_id}.last-message.json"
     stdout_path = plans_dir / f"{phase}-{objective_id}.stdout.jsonl"
     stderr_path = plans_dir / f"{phase}-{objective_id}.stderr.log"
+    plan_path = plans_dir / f"{phase}-{objective_id}.json"
 
     command = build_codex_command(
         codex_path=codex_path,
@@ -52,22 +57,86 @@ def plan_objective(
         sandbox_mode=sandbox_mode,
         additional_directories=[],
     )
+    ensure_activity(
+        project_root,
+        run_id,
+        activity_id=activity_id,
+        kind="objective_plan",
+        entity_id=objective_id,
+        phase=phase,
+        objective_id=objective_id,
+        display_name=f"Plan {objective_id}",
+        assigned_role=f"objectives.{objective_id}.objective-manager",
+        status="prompt_rendered",
+        progress_stage="prompt_rendered",
+        current_activity="Rendered objective planning prompt.",
+        prompt_path=prompt_metadata["prompt_path"],
+        stdout_path=str(stdout_path.relative_to(project_root)),
+        stderr_path=str(stderr_path.relative_to(project_root)),
+        output_path=str(plan_path.relative_to(project_root)),
+        runner_id="codex",
+    )
+    record_event(
+        project_root,
+        run_id,
+        phase=phase,
+        activity_id=activity_id,
+        event_type="planning.prompt_rendered",
+        message=f"Rendered planning prompt for objective {objective_id}.",
+        payload={"prompt_path": prompt_metadata["prompt_path"]},
+    )
+    update_activity(
+        project_root,
+        run_id,
+        activity_id,
+        status="launching",
+        progress_stage="launching",
+        current_activity="Launching objective manager.",
+    )
+    record_event(
+        project_root,
+        run_id,
+        phase=phase,
+        activity_id=activity_id,
+        event_type="planning.launching",
+        message=f"Launching planning activity for objective {objective_id}.",
+        payload={"objective_id": objective_id},
+    )
+
+    def on_stdout_line(raw_line: str) -> None:
+        handle_codex_event_line(project_root, run_id, phase, activity_id, raw_line)
+
     try:
-        completed = subprocess.run(
+        completed = run_codex_command(
             command,
-            input=execution_prompt,
-            text=True,
-            capture_output=True,
+            prompt=execution_prompt,
             cwd=project_root,
             env=build_exec_environment(),
-            check=False,
-            timeout=timeout_seconds,
+            timeout_seconds=timeout_seconds,
+            on_stdout_line=on_stdout_line,
         )
     except subprocess.TimeoutExpired as exc:
         stdout = coerce_process_text(exc.stdout)
         stderr = coerce_process_text(exc.stderr)
         write_text(stdout_path, stdout)
         write_text(stderr_path, stderr)
+        update_activity(
+            project_root,
+            run_id,
+            activity_id,
+            status="failed",
+            progress_stage="failed",
+            current_activity=f"Timed out after {timeout_seconds} seconds.",
+        )
+        record_event(
+            project_root,
+            run_id,
+            phase=phase,
+            activity_id=activity_id,
+            event_type="planning.failed",
+            message=f"Planning activity for objective {objective_id} timed out.",
+            payload={"timeout_seconds": timeout_seconds},
+        )
         raise ExecutorError(
             f"codex exec timed out after {timeout_seconds} seconds while planning objective {objective_id}"
         ) from exc
@@ -77,17 +146,50 @@ def plan_objective(
     failure = extract_turn_failure(events)
     if completed.returncode != 0 or failure is not None:
         message = failure or completed.stderr.strip() or f"codex exec exited with code {completed.returncode}"
+        update_activity(
+            project_root,
+            run_id,
+            activity_id,
+            status="failed",
+            progress_stage="failed",
+            current_activity=message,
+        )
+        record_event(
+            project_root,
+            run_id,
+            phase=phase,
+            activity_id=activity_id,
+            event_type="planning.failed",
+            message=f"Planning activity for objective {objective_id} failed.",
+            payload={"error": message},
+        )
         raise ExecutorError(message)
 
     final_response = extract_final_response(events)
     try:
         plan = json.loads(final_response)
     except json.JSONDecodeError as exc:
+        update_activity(
+            project_root,
+            run_id,
+            activity_id,
+            status="failed",
+            progress_stage="failed",
+            current_activity="Objective plan was not valid JSON.",
+        )
         raise ExecutorError(f"Objective plan was not valid JSON: {final_response}") from exc
 
     try:
         validate_document(plan, "objective-plan.v1", project_root)
     except SchemaValidationError as exc:
+        update_activity(
+            project_root,
+            run_id,
+            activity_id,
+            status="failed",
+            progress_stage="failed",
+            current_activity="Objective plan failed schema validation.",
+        )
         raise ExecutorError(f"Objective plan failed schema validation: {exc}") from exc
 
     identity_adjustments = normalize_plan_identity(plan, run_id=run_id, phase=phase, objective_id=objective_id)
@@ -112,6 +214,24 @@ def plan_objective(
         "identity_adjustments": identity_adjustments,
     }
     write_json(plans_dir / f"{phase}-{objective_id}.summary.json", summary)
+    update_activity(
+        project_root,
+        run_id,
+        activity_id,
+        status="completed",
+        progress_stage="completed",
+        current_activity=plan["summary"],
+        output_path=str(plan_path.relative_to(project_root)),
+    )
+    record_event(
+        project_root,
+        run_id,
+        phase=phase,
+        activity_id=activity_id,
+        event_type="planning.completed",
+        message=f"Planning activity for objective {objective_id} completed.",
+        payload={"plan_path": str(plan_path.relative_to(project_root))},
+    )
     return summary
 
 

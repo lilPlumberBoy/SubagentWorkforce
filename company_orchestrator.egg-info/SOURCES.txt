@@ -2,12 +2,19 @@ README.md
 pyproject.toml
 company_orchestrator/__init__.py
 company_orchestrator/__main__.py
+company_orchestrator/bundle_plans.py
 company_orchestrator/bundles.py
 company_orchestrator/changes.py
 company_orchestrator/cli.py
 company_orchestrator/collaboration.py
 company_orchestrator/constants.py
+company_orchestrator/executor.py
 company_orchestrator/filesystem.py
+company_orchestrator/live.py
+company_orchestrator/management.py
+company_orchestrator/monitoring.py
+company_orchestrator/objective_planner.py
+company_orchestrator/objective_roots.py
 company_orchestrator/planner.py
 company_orchestrator/prompts.py
 company_orchestrator/reports.py
@@ -17,5 +24,6 @@ company_orchestrator.egg-info/PKG-INFO
 company_orchestrator.egg-info/SOURCES.txt
 company_orchestrator.egg-info/dependency_links.txt
 company_orchestrator.egg-info/entry_points.txt
+company_orchestrator.egg-info/requires.txt
 company_orchestrator.egg-info/top_level.txt
 tests/test_orchestrator.py

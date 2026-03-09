@@ -6,11 +6,13 @@ from typing import Any
 from .bundle_plans import objective_bundle_specs
 from .constants import PHASES
 from .filesystem import read_json, write_json, write_text
+from .live import initialize_live_run, record_event, refresh_run_state
 from .schemas import validate_document
 
 
 def generate_phase_report(project_root: Path, run_id: str) -> tuple[dict[str, Any], Path]:
     run_dir = project_root / "runs" / run_id
+    initialize_live_run(project_root, run_id)
     phase_plan = read_json(run_dir / "phase-plan.json")
     objective_map = read_json(run_dir / "objective-map.json")
     phase = phase_plan["current_phase"]
@@ -64,6 +66,24 @@ def generate_phase_report(project_root: Path, run_id: str) -> tuple[dict[str, An
     md_path = run_dir / "phase-reports" / f"{phase}.md"
     write_json(json_path, payload)
     write_text(md_path, render_phase_report_markdown(payload))
+    record_event(
+        project_root,
+        run_id,
+        phase=phase,
+        activity_id=None,
+        event_type="phase.report_written",
+        message=f"Wrote {phase} phase report.",
+        payload={"report_path": str(json_path.relative_to(project_root))},
+    )
+    record_event(
+        project_root,
+        run_id,
+        phase=phase,
+        activity_id=None,
+        event_type="phase.recommendation_updated",
+        message=f"{phase} phase recommendation is {recommendation}.",
+        payload={"recommendation": recommendation},
+    )
     return payload, json_path
 
 
@@ -109,6 +129,7 @@ def record_human_approval(project_root: Path, run_id: str, phase: str, approved:
         report = read_json(report_path)
         report["human_approved"] = approved
         write_json(report_path, report)
+    refresh_run_state(project_root, run_id)
     return phase_plan
 
 
@@ -130,6 +151,7 @@ def advance_phase(project_root: Path, run_id: str) -> dict[str, Any]:
     if current_index == len(PHASES) - 1:
         phase_state["status"] = "complete"
         write_json(phase_plan_path, phase_plan)
+        refresh_run_state(project_root, run_id)
         return phase_plan
 
     phase_state["status"] = "complete"
@@ -139,4 +161,5 @@ def advance_phase(project_root: Path, run_id: str) -> dict[str, Any]:
         if item["phase"] == next_phase:
             item["status"] = "active"
     write_json(phase_plan_path, phase_plan)
+    refresh_run_state(project_root, run_id)
     return phase_plan

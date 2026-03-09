@@ -1,0 +1,24 @@
+{
+  "type": "object",
+  "required": [
+    "schema",
+    "timestamp",
+    "run_id",
+    "phase",
+    "activity_id",
+    "event_type",
+    "message",
+    "payload"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"type": "string", "enum": ["live-event.v1"]},
+    "timestamp": {"type": "string"},
+    "run_id": {"type": "string"},
+    "phase": {"type": "string", "enum": ["discovery", "design", "mvp-build", "polish"]},
+    "activity_id": {"type": ["string", "null"]},
+    "event_type": {"type": "string"},
+    "message": {"type": "string"},
+    "payload": {"type": ["object", "null"]}
+  }
+}

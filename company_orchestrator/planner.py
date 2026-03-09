@@ -6,6 +6,7 @@ from typing import Any
 
 from .constants import PHASES
 from .filesystem import ensure_dir, read_json, read_text, write_json, write_text
+from .live import initialize_live_run
 from .objective_roots import find_objective_root
 from .schemas import validate_document
 
@@ -31,12 +32,14 @@ def initialize_run(project_root: Path, run_id: str, goal_text: str) -> Path:
         "prompt-logs",
         "executions",
         "manager-runs",
+        "live",
     ]:
         ensure_dir(run_dir / child)
     write_text(run_dir / "goal.md", goal_text)
     write_json(run_dir / "phase-plan.json", default_phase_plan(run_id))
     write_json(run_dir / "objective-map.json", default_objective_map(run_id))
     write_json(run_dir / "team-registry.json", default_team_registry(run_id))
+    initialize_live_run(project_root, run_id)
     return run_dir
 
 

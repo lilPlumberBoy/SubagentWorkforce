@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .collaboration import create_collaboration_request
 from .filesystem import ensure_dir, read_json, read_text, write_json, write_text
+from .live import ensure_activity, record_event, update_activity
 from .prompts import render_prompt
 from .schemas import SchemaValidationError, validate_document
 
@@ -16,12 +19,86 @@ class ExecutorError(RuntimeError):
     pass
 
 
+@dataclass
+class CodexProcessResult:
+    returncode: int
+    stdout: str
+    stderr: str
+
+
 def coerce_process_text(stream: str | bytes | None) -> str:
     if stream is None:
         return ""
     if isinstance(stream, bytes):
         return stream.decode("utf-8", errors="replace")
     return stream
+
+
+def run_codex_command(
+    command: list[str],
+    *,
+    prompt: str,
+    cwd: Path,
+    env: dict[str, str],
+    timeout_seconds: int,
+    on_stdout_line: Any | None = None,
+) -> CodexProcessResult:
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+        cwd=cwd,
+        env=env,
+    )
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+
+    def consume_stdout() -> None:
+        assert process.stdout is not None
+        for raw_line in process.stdout:
+            stdout_chunks.append(raw_line)
+            if on_stdout_line is not None:
+                on_stdout_line(raw_line.rstrip("\n"))
+
+    def consume_stderr() -> None:
+        assert process.stderr is not None
+        for raw_line in process.stderr:
+            stderr_chunks.append(raw_line)
+
+    stdout_thread = threading.Thread(target=consume_stdout, daemon=True)
+    stderr_thread = threading.Thread(target=consume_stderr, daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+
+    try:
+        assert process.stdin is not None
+        process.stdin.write(prompt)
+        process.stdin.close()
+        process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired as exc:
+        process.kill()
+        process.wait()
+        stdout_thread.join(timeout=1)
+        stderr_thread.join(timeout=1)
+        raise subprocess.TimeoutExpired(
+            cmd=command,
+            timeout=timeout_seconds,
+            output="".join(stdout_chunks),
+            stderr="".join(stderr_chunks),
+        ) from exc
+
+    stdout_thread.join(timeout=1)
+    stderr_thread.join(timeout=1)
+    return CodexProcessResult(
+        returncode=process.returncode,
+        stdout="".join(stdout_chunks),
+        stderr="".join(stderr_chunks),
+    )
 
 
 def execute_task(
@@ -48,6 +125,7 @@ def execute_task(
     stdout_path = execution_dir / f"{task_id}.stdout.jsonl"
     stderr_path = execution_dir / f"{task_id}.stderr.log"
     summary_path = execution_dir / f"{task_id}.json"
+    report_path = run_dir / "reports" / f"{task_id}.json"
     working_directory = task.get("working_directory")
     command = build_codex_command(
         codex_path=codex_path,
@@ -57,22 +135,88 @@ def execute_task(
         sandbox_mode=task.get("sandbox_mode", sandbox_mode),
         additional_directories=task.get("additional_directories", []),
     )
+    ensure_activity(
+        project_root,
+        run_id,
+        activity_id=task_id,
+        kind="task_execution",
+        entity_id=task_id,
+        phase=task["phase"],
+        objective_id=task["objective_id"],
+        display_name=task_id,
+        assigned_role=task["assigned_role"],
+        status="prompt_rendered",
+        progress_stage="prompt_rendered",
+        current_activity="Rendered task prompt.",
+        prompt_path=prompt_metadata["prompt_path"],
+        stdout_path=str(stdout_path.relative_to(project_root)),
+        stderr_path=str(stderr_path.relative_to(project_root)),
+        output_path=str(report_path.relative_to(project_root)),
+        runner_id="codex",
+    )
+    record_event(
+        project_root,
+        run_id,
+        phase=task["phase"],
+        activity_id=task_id,
+        event_type="task.prompt_rendered",
+        message=f"Rendered prompt for task {task_id}.",
+        payload={"prompt_path": prompt_metadata["prompt_path"]},
+    )
+    update_activity(
+        project_root,
+        run_id,
+        task_id,
+        status="launching",
+        progress_stage="launching",
+        current_activity="Launching Codex worker.",
+        queue_position=None,
+        dependency_blockers=[],
+    )
+    record_event(
+        project_root,
+        run_id,
+        phase=task["phase"],
+        activity_id=task_id,
+        event_type="task.launching",
+        message=f"Launching task {task_id}.",
+        payload={"command": command[:4]},
+    )
+
+    def on_stdout_line(raw_line: str) -> None:
+        handle_codex_event_line(project_root, run_id, task["phase"], task_id, raw_line)
+
     try:
-        completed = subprocess.run(
+        completed = run_codex_command(
             command,
-            input=execution_prompt,
-            text=True,
-            capture_output=True,
+            prompt=execution_prompt,
             cwd=project_root,
             env=build_exec_environment(),
-            check=False,
-            timeout=timeout_seconds,
+            timeout_seconds=timeout_seconds,
+            on_stdout_line=on_stdout_line,
         )
     except subprocess.TimeoutExpired as exc:
         stdout = coerce_process_text(exc.stdout)
         stderr = coerce_process_text(exc.stderr)
         write_text(stdout_path, stdout)
         write_text(stderr_path, stderr)
+        update_activity(
+            project_root,
+            run_id,
+            task_id,
+            status="failed",
+            progress_stage="failed",
+            current_activity=f"Timed out after {timeout_seconds} seconds.",
+        )
+        record_event(
+            project_root,
+            run_id,
+            phase=task["phase"],
+            activity_id=task_id,
+            event_type="task.failed",
+            message=f"Task {task_id} timed out after {timeout_seconds} seconds.",
+            payload={"timeout_seconds": timeout_seconds},
+        )
         raise ExecutorError(f"codex exec timed out after {timeout_seconds} seconds for task {task_id}") from exc
     write_text(stdout_path, completed.stdout)
     write_text(stderr_path, completed.stderr)
@@ -81,20 +225,73 @@ def execute_task(
     failure = extract_turn_failure(events)
     if completed.returncode != 0 or failure is not None:
         message = failure or completed.stderr.strip() or f"codex exec exited with code {completed.returncode}"
+        update_activity(
+            project_root,
+            run_id,
+            task_id,
+            status="failed",
+            progress_stage="failed",
+            current_activity=message,
+        )
+        record_event(
+            project_root,
+            run_id,
+            phase=task["phase"],
+            activity_id=task_id,
+            event_type="task.failed",
+            message=f"Task {task_id} failed.",
+            payload={"error": message},
+        )
         raise ExecutorError(message)
 
     final_response = extract_final_response(events)
     try:
         parsed_response = json.loads(final_response)
     except json.JSONDecodeError as exc:
+        update_activity(
+            project_root,
+            run_id,
+            task_id,
+            status="failed",
+            progress_stage="failed",
+            current_activity="Final response was not valid JSON.",
+        )
         raise ExecutorError(f"Final response was not valid JSON: {final_response}") from exc
 
     try:
         validate_document(parsed_response, "executor-response.v1", project_root)
     except SchemaValidationError as exc:
+        update_activity(
+            project_root,
+            run_id,
+            task_id,
+            status="failed",
+            progress_stage="failed",
+            current_activity="Executor response failed schema validation.",
+        )
         raise ExecutorError(f"Executor response failed schema validation: {exc}") from exc
 
     report, collaboration_ids = materialize_executor_response(project_root, run_id, task, parsed_response)
+    update_activity(
+        project_root,
+        run_id,
+        task_id,
+        status=report["status"],
+        progress_stage=report["status"],
+        current_activity=report["summary"],
+        output_path=str(report_path.relative_to(project_root)),
+        queue_position=None,
+        dependency_blockers=[],
+    )
+    record_event(
+        project_root,
+        run_id,
+        phase=task["phase"],
+        activity_id=task_id,
+        event_type="task.completed",
+        message=f"Task {task_id} finished with status {report['status']}.",
+        payload={"status": report["status"], "report_path": str(report_path.relative_to(project_root))},
+    )
     execution_summary = {
         "task_id": task_id,
         "thread_id": extract_thread_id(events),
@@ -102,7 +299,7 @@ def execute_task(
         "stdout_path": str(stdout_path.relative_to(project_root)),
         "stderr_path": str(stderr_path.relative_to(project_root)),
         "last_message_path": str(last_message_path.relative_to(project_root)),
-        "report_path": str((run_dir / "reports" / f"{task_id}.json").relative_to(project_root)),
+        "report_path": str(report_path.relative_to(project_root)),
         "collaboration_request_ids": collaboration_ids,
         "status": report["status"],
     }
@@ -158,6 +355,121 @@ def build_execution_prompt(prompt_text: str) -> str:
     )
 
 
+def handle_codex_event_line(project_root: Path, run_id: str, phase: str, activity_id: str, raw_line: str) -> None:
+    line = raw_line.strip()
+    if not line:
+        return
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        record_event(
+            project_root,
+            run_id,
+            phase=phase,
+            activity_id=activity_id,
+            event_type="codex.stdout.raw",
+            message=truncate_text(line, 160),
+            payload={},
+        )
+        return
+    if not isinstance(event, dict):
+        return
+    event_type, message, payload, activity_updates = normalize_codex_event(event)
+    record_event(
+        project_root,
+        run_id,
+        phase=phase,
+        activity_id=activity_id,
+        event_type=event_type,
+        message=message,
+        payload=payload,
+    )
+    if activity_updates:
+        update_activity(project_root, run_id, activity_id, **activity_updates)
+
+
+def normalize_codex_event(event: dict[str, Any]) -> tuple[str, str, dict[str, Any], dict[str, Any] | None]:
+    event_type = str(event.get("type", "codex.unknown"))
+    if event_type == "thread.started":
+        thread_id = event.get("thread_id")
+        return (
+            "codex.thread.started",
+            f"Codex thread started: {thread_id}",
+            {"thread_id": thread_id},
+            {"status": "launching", "progress_stage": "launching", "current_activity": "Codex thread started."},
+        )
+    if event_type == "turn.started":
+        return (
+            "codex.turn.started",
+            "Codex turn started.",
+            {},
+            {"status": "launching", "progress_stage": "launching", "current_activity": "Codex turn started."},
+        )
+    if event_type == "turn.completed":
+        usage = event.get("usage", {})
+        return (
+            "codex.turn.completed",
+            "Codex turn completed.",
+            {"usage": usage if isinstance(usage, dict) else {}},
+            {"status": "finalizing", "progress_stage": "finalizing", "current_activity": "Codex turn completed."},
+        )
+    if event_type == "turn.failed":
+        error = event.get("error", {})
+        message = "Codex turn failed."
+        if isinstance(error, dict) and error.get("message"):
+            message = f"Codex turn failed: {error['message']}"
+        return (
+            "codex.turn.failed",
+            message,
+            {"error": error if isinstance(error, dict) else {}},
+            {"status": "failed", "progress_stage": "failed", "current_activity": message},
+        )
+    if event_type == "error":
+        message = str(event.get("message", "Codex stream error."))
+        return (
+            "codex.error",
+            message,
+            {"message": message},
+            {"status": "failed", "progress_stage": "failed", "current_activity": message},
+        )
+
+    if event_type in {"item.started", "item.completed"}:
+        item = event.get("item", {})
+        if not isinstance(item, dict):
+            return (f"codex.{event_type}", f"Codex {event_type}.", {}, None)
+        item_type = str(item.get("type", "unknown"))
+        if item_type == "command_execution":
+            command = truncate_text(str(item.get("command", "")), 160)
+            status = "running"
+            current = f"Running command: {command}" if event_type == "item.started" else f"Completed command: {command}"
+            return (
+                f"codex.{event_type}.command_execution",
+                current,
+                {
+                    "command": command,
+                    "exit_code": item.get("exit_code"),
+                    "item_id": item.get("id"),
+                },
+                {"status": status, "progress_stage": status, "current_activity": current},
+            )
+        if item_type == "agent_message":
+            text_preview = truncate_text(str(item.get("text", "")), 200)
+            return (
+                f"codex.{event_type}.agent_message",
+                "Received final agent message.",
+                {"item_id": item.get("id"), "text_preview": text_preview},
+                {"status": "finalizing", "progress_stage": "finalizing", "current_activity": "Received final agent response."},
+            )
+        return (
+            f"codex.{event_type}.{item_type}",
+            f"Codex {event_type} for {item_type}.",
+            {"item_id": item.get("id"), "item_type": item_type},
+            None,
+        )
+
+    return (f"codex.{event_type}", f"Codex event {event_type}.", {}, None)
+
+
 def parse_jsonl_events(stdout: str) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     for raw_line in stdout.splitlines():
@@ -171,6 +483,12 @@ def parse_jsonl_events(stdout: str) -> list[dict[str, Any]]:
         if isinstance(event, dict):
             events.append(event)
     return events
+
+
+def truncate_text(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    return value[: limit - 3] + "..."
 
 
 def extract_thread_id(events: list[dict[str, Any]]) -> str | None:

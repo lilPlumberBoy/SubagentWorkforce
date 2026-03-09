@@ -17,6 +17,9 @@ SCHEMA_NAMES = {
     "change-proposal.v1": "change-proposal.v1.json",
     "executor-response.v1": "executor-response.v1.json",
     "objective-plan.v1": "objective-plan.v1.json",
+    "run-live-state.v1": "run-live-state.v1.json",
+    "activity-live-state.v1": "activity-live-state.v1.json",
+    "live-event.v1": "live-event.v1.json",
 }
 
 

@@ -2,17 +2,22 @@ from __future__ import annotations
 
 import json
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from rich.console import Console
+
 from company_orchestrator.bundles import assemble_review_bundle, review_bundle
+from company_orchestrator.cli import main as cli_main
 from company_orchestrator.changes import analyze_change_request, approve_change, create_change_request, scaffold_delta_run
 from company_orchestrator.collaboration import create_collaboration_request, resolve_collaboration_request
 from company_orchestrator.executor import ExecutorError, execute_task
 from company_orchestrator.filesystem import read_json, write_json
 from company_orchestrator.management import run_phase
+from company_orchestrator.monitoring import build_activity_detail, build_run_dashboard, inspect_activity
 from company_orchestrator.objective_planner import build_planning_prompt, plan_objective, plan_phase
 from company_orchestrator.planner import generate_role_files, initialize_run, suggest_team_proposals
 from company_orchestrator.prompts import build_planning_payload, render_prompt
@@ -556,12 +561,58 @@ class OrchestratorTests(unittest.TestCase):
             ]
         )
         completed = completed_process(stdout=stdout, stderr="", returncode=0)
-        with patch("company_orchestrator.executor.subprocess.run", return_value=completed):
+        with patch("company_orchestrator.executor.run_codex_command", return_value=completed):
             summary = execute_task(self.project_root, "exec", "APP-A-SMOKE-001")
         self.assertEqual(summary["status"], "ready_for_bundle_review")
         report = read_json(self.project_root / "runs" / "exec" / "reports" / "APP-A-SMOKE-001.json")
         self.assertEqual(report["summary"], "Finished the smoke task.")
         self.assertEqual(report["context_echo"]["objective_id"], "app-a")
+
+    def test_execute_task_streams_live_activity_updates_and_events(self) -> None:
+        scaffold_smoke_test(self.project_root, "exec-live")
+        final_payload = {
+            "summary": "Finished the smoke task.",
+            "status": "ready_for_bundle_review",
+            "artifacts": [],
+            "validation_results": [],
+            "dependency_impact": [],
+            "open_issues": [],
+            "follow_up_requests": [],
+            "context_echo": None,
+            "collaboration_request": None,
+        }
+        lines = [
+            '{"type":"thread.started","thread_id":"thread-live"}',
+            '{"type":"turn.started"}',
+            json_line_event(
+                "item.started",
+                {"id": "cmd-1", "type": "command_execution", "command": "echo test"},
+            ),
+            json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(final_payload)}),
+            '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
+        ]
+
+        def side_effect(*_: object, **kwargs: object):
+            callback = kwargs["on_stdout_line"]
+            for line in lines:
+                callback(line)
+            return completed_process(stdout="\n".join(lines), stderr="", returncode=0)
+
+        with patch("company_orchestrator.executor.run_codex_command", side_effect=side_effect):
+            execute_task(self.project_root, "exec-live", "APP-A-SMOKE-001")
+
+        activity = read_json(
+            self.project_root / "runs" / "exec-live" / "live" / "activities" / "APP-A-SMOKE-001.json"
+        )
+        self.assertEqual(activity["status"], "ready_for_bundle_review")
+        self.assertEqual(activity["progress_fraction"], 1.0)
+        self.assertEqual(activity["current_activity"], "Finished the smoke task.")
+        events = (
+            self.project_root / "runs" / "exec-live" / "live" / "events.jsonl"
+        ).read_text(encoding="utf-8")
+        self.assertIn("codex.thread.started", events)
+        self.assertIn("codex.item.started.command_execution", events)
+        self.assertIn("task.completed", events)
 
     def test_execute_task_creates_collaboration_request_when_model_blocks(self) -> None:
         scaffold_smoke_test(self.project_root, "collab-exec")
@@ -590,7 +641,7 @@ class OrchestratorTests(unittest.TestCase):
             ]
         )
         completed = completed_process(stdout=stdout, stderr="", returncode=0)
-        with patch("company_orchestrator.executor.subprocess.run", return_value=completed):
+        with patch("company_orchestrator.executor.run_codex_command", return_value=completed):
             summary = execute_task(self.project_root, "collab-exec", "APP-A-SMOKE-001")
         self.assertEqual(summary["status"], "blocked")
         report = read_json(self.project_root / "runs" / "collab-exec" / "reports" / "APP-A-SMOKE-001.json")
@@ -610,7 +661,7 @@ class OrchestratorTests(unittest.TestCase):
             ]
         )
         completed = completed_process(stdout=stdout, stderr="", returncode=1)
-        with patch("company_orchestrator.executor.subprocess.run", return_value=completed):
+        with patch("company_orchestrator.executor.run_codex_command", return_value=completed):
             with self.assertRaisesRegex(ExecutorError, "Quota exceeded"):
                 execute_task(self.project_root, "failed-exec", "APP-A-SMOKE-001")
 
@@ -624,13 +675,17 @@ class OrchestratorTests(unittest.TestCase):
             output=b'{"type":"thread.started","thread_id":"thread-timeout"}\n',
             stderr=b"still running\n",
         )
-        with patch("company_orchestrator.executor.subprocess.run", side_effect=timeout_error):
+        with patch("company_orchestrator.executor.run_codex_command", side_effect=timeout_error):
             with self.assertRaisesRegex(ExecutorError, "timed out after 5 seconds"):
                 execute_task(self.project_root, "timeout-exec", "APP-A-SMOKE-001", timeout_seconds=5)
         stdout_log = (self.project_root / "runs" / "timeout-exec" / "executions" / "APP-A-SMOKE-001.stdout.jsonl").read_text()
         stderr_log = (self.project_root / "runs" / "timeout-exec" / "executions" / "APP-A-SMOKE-001.stderr.log").read_text()
         self.assertIn("thread.started", stdout_log)
         self.assertIn("still running", stderr_log)
+        activity = read_json(
+            self.project_root / "runs" / "timeout-exec" / "live" / "activities" / "APP-A-SMOKE-001.json"
+        )
+        self.assertEqual(activity["status"], "failed")
 
     def test_run_phase_executes_all_tasks_and_generates_phase_report(self) -> None:
         scaffold_smoke_test(self.project_root, "managed")
@@ -654,6 +709,8 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(phase_report["recommendation"], "advance")
         manager_summary = read_json(self.project_root / "runs" / "managed" / "manager-runs" / "phase-discovery.json")
         self.assertEqual(manager_summary["phase"], "discovery")
+        run_state = read_json(self.project_root / "runs" / "managed" / "live" / "run-state.json")
+        self.assertEqual(run_state["current_phase"], "discovery")
 
     def test_run_phase_holds_when_one_objective_is_blocked(self) -> None:
         scaffold_smoke_test(self.project_root, "held")
@@ -676,6 +733,8 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(summary["objectives"]["app-b"]["status"], "rejected")
         phase_report = read_json(self.project_root / "runs" / "held" / "phase-reports" / "discovery.json")
         self.assertEqual(phase_report["recommendation"], "hold")
+        blocked_activity = read_json(self.project_root / "runs" / "held" / "live" / "activities" / "APP-B-SMOKE-001.json")
+        self.assertEqual(blocked_activity["status"], "blocked")
 
     def test_run_phase_respects_task_dependencies(self) -> None:
         scaffold_smoke_test(self.project_root, "deps")
@@ -760,7 +819,7 @@ class OrchestratorTests(unittest.TestCase):
             ]
         )
         completed = completed_process(stdout=stdout, stderr="", returncode=0)
-        with patch("company_orchestrator.objective_planner.subprocess.run", return_value=completed):
+        with patch("company_orchestrator.objective_planner.run_codex_command", return_value=completed):
             summary = plan_objective(self.project_root, "planned", "app-a")
         self.assertEqual(summary["task_ids"], ["APP-A-DISC-001", "APP-A-DISC-002"])
         planned_task = read_json(self.project_root / "runs" / "planned" / "tasks" / "APP-A-DISC-001.json")
@@ -768,6 +827,40 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(planned_task["acceptance_role"], "objectives.app-a.acceptance-manager")
         manager_plan = read_json(self.project_root / "runs" / "planned" / "manager-plans" / "discovery-app-a.json")
         self.assertEqual(manager_plan["bundle_plan"][0]["bundle_id"], "app-a-discovery-bundle-1")
+
+    def test_plan_objective_streams_live_activity_updates_and_events(self) -> None:
+        scaffold_planning_run(self.project_root, "planned-live", ["frontend"])
+        final_payload = planned_payload_for_objective("planned-live", "app-a")
+        lines = [
+            '{"type":"thread.started","thread_id":"plan-thread-live"}',
+            '{"type":"turn.started"}',
+            json_line_event(
+                "item.started",
+                {"id": "cmd-1", "type": "command_execution", "command": "plan objective"},
+            ),
+            json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(final_payload)}),
+            '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
+        ]
+
+        def side_effect(*_: object, **kwargs: object):
+            callback = kwargs["on_stdout_line"]
+            for line in lines:
+                callback(line)
+            return completed_process(stdout="\n".join(lines), stderr="", returncode=0)
+
+        with patch("company_orchestrator.objective_planner.run_codex_command", side_effect=side_effect):
+            plan_objective(self.project_root, "planned-live", "app-a")
+
+        activity = read_json(
+            self.project_root / "runs" / "planned-live" / "live" / "activities" / "plan__discovery__app-a.json"
+        )
+        self.assertEqual(activity["status"], "completed")
+        self.assertEqual(activity["kind"], "objective_plan")
+        events = (
+            self.project_root / "runs" / "planned-live" / "live" / "events.jsonl"
+        ).read_text(encoding="utf-8")
+        self.assertIn("planning.completed", events)
+        self.assertIn("codex.item.started.command_execution", events)
 
     def test_plan_objective_normalizes_model_generated_run_id(self) -> None:
         scaffold_planning_run(self.project_root, "planned-run-id", ["frontend"])
@@ -781,7 +874,7 @@ class OrchestratorTests(unittest.TestCase):
             ]
         )
         completed = completed_process(stdout=stdout, stderr="", returncode=0)
-        with patch("company_orchestrator.objective_planner.subprocess.run", return_value=completed):
+        with patch("company_orchestrator.objective_planner.run_codex_command", return_value=completed):
             summary = plan_objective(self.project_root, "planned-run-id", "app-a")
         self.assertEqual(summary["identity_adjustments"]["run_id"]["from"], "wrong-run-id")
         self.assertEqual(summary["identity_adjustments"]["run_id"]["to"], "planned-run-id")
@@ -807,7 +900,7 @@ class OrchestratorTests(unittest.TestCase):
             ]
         )
         completed = completed_process(stdout=stdout, stderr="", returncode=0)
-        with patch("company_orchestrator.objective_planner.subprocess.run", return_value=completed):
+        with patch("company_orchestrator.objective_planner.run_codex_command", return_value=completed):
             summary = plan_objective(self.project_root, "planned-bundles", "app-a")
         self.assertEqual(summary["bundle_ids"], ["app-a-bundle-discovery-core"])
         manager_plan = read_json(self.project_root / "runs" / "planned-bundles" / "manager-plans" / "discovery-app-a.json")
@@ -826,7 +919,7 @@ class OrchestratorTests(unittest.TestCase):
             ]
         )
         completed = completed_process(stdout=stdout, stderr="", returncode=0)
-        with patch("company_orchestrator.objective_planner.subprocess.run", return_value=completed):
+        with patch("company_orchestrator.objective_planner.run_codex_command", return_value=completed):
             with self.assertRaisesRegex(ExecutorError, "unresolved input refs for task APP-A-DISC-001"):
                 plan_objective(self.project_root, "planned-unresolved", "app-a")
 
@@ -845,7 +938,7 @@ class OrchestratorTests(unittest.TestCase):
             output=b'{"type":"thread.started","thread_id":"plan-timeout"}\n',
             stderr=b"manager still reasoning\n",
         )
-        with patch("company_orchestrator.objective_planner.subprocess.run", side_effect=timeout_error):
+        with patch("company_orchestrator.objective_planner.run_codex_command", side_effect=timeout_error):
             with self.assertRaisesRegex(ExecutorError, "timed out after 7 seconds while planning objective app-a"):
                 plan_objective(self.project_root, "planned-timeout", "app-a", timeout_seconds=7)
         stdout_log = (
@@ -921,7 +1014,7 @@ class OrchestratorTests(unittest.TestCase):
             ]
         )
         completed = completed_process(stdout=stdout, stderr="", returncode=0)
-        with patch("company_orchestrator.objective_planner.subprocess.run", return_value=completed):
+        with patch("company_orchestrator.objective_planner.run_codex_command", return_value=completed):
             plan_objective(self.project_root, "planned-phase", "app-a")
 
         def side_effect(project_root: Path, run_id: str, task_id: str, **_: object):
@@ -976,7 +1069,7 @@ class OrchestratorTests(unittest.TestCase):
         scaffold_dual_planning_run(self.project_root, "plan-phase")
 
         def side_effect(*args: object, **kwargs: object):
-            prompt = str(kwargs.get("input", ""))
+            prompt = str(kwargs.get("prompt", ""))
             objective_id = "app-a" if '"objective_id": "app-a"' in prompt else "app-b"
             payload = planned_payload_for_objective("plan-phase", objective_id)
             stdout = "\n".join(
@@ -989,12 +1082,79 @@ class OrchestratorTests(unittest.TestCase):
             )
             return completed_process(stdout=stdout, stderr="", returncode=0)
 
-        with patch("company_orchestrator.objective_planner.subprocess.run", side_effect=side_effect):
+        with patch("company_orchestrator.objective_planner.run_codex_command", side_effect=side_effect):
             summary = plan_phase(self.project_root, "plan-phase")
 
         self.assertEqual(len(summary["planned_objectives"]), 2)
         self.assertTrue((self.project_root / "runs" / "plan-phase" / "tasks" / "APP-A-DISC-001.json").exists())
         self.assertTrue((self.project_root / "runs" / "plan-phase" / "tasks" / "APP-B-DISC-001.json").exists())
+
+    def test_monitoring_renderers_show_sections_and_prompt_details(self) -> None:
+        scaffold_smoke_test(self.project_root, "monitor")
+        final_payload = {
+            "summary": "Finished the smoke task.",
+            "status": "ready_for_bundle_review",
+            "artifacts": [],
+            "validation_results": [],
+            "dependency_impact": [],
+            "open_issues": [],
+            "follow_up_requests": [],
+            "context_echo": None,
+            "collaboration_request": None,
+        }
+        stdout = "\n".join(
+            [
+                '{"type":"thread.started","thread_id":"thread-monitor"}',
+                '{"type":"turn.started"}',
+                json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(final_payload)}),
+                '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
+            ]
+        )
+        completed = completed_process(stdout=stdout, stderr="", returncode=0)
+        with patch("company_orchestrator.executor.run_codex_command", return_value=completed):
+            execute_task(self.project_root, "monitor", "APP-A-SMOKE-001")
+
+        console = Console(record=True, width=140)
+        console.print(build_run_dashboard(self.project_root, "monitor"))
+        run_output = console.export_text()
+        self.assertIn("Run Status", run_output)
+        self.assertIn("Active Task Activities", run_output)
+        self.assertIn("Objective Progress", run_output)
+
+        console = Console(record=True, width=140)
+        console.print(build_activity_detail(self.project_root, "monitor", "APP-A-SMOKE-001", events=10))
+        detail_output = console.export_text()
+        self.assertIn("Prompt", detail_output)
+        self.assertIn("Task Assignment", detail_output)
+        self.assertIn("Latest Events", detail_output)
+
+    def test_inspect_activity_reports_missing_activity_cleanly(self) -> None:
+        scaffold_smoke_test(self.project_root, "missing-activity")
+        with self.assertRaises(SystemExit) as exc:
+            inspect_activity(self.project_root, "missing-activity", "does-not-exist")
+        self.assertIn("Activity does-not-exist was not found", str(exc.exception))
+
+    def test_cli_execute_task_watch_uses_watch_wrapper(self) -> None:
+        scaffold_smoke_test(self.project_root, "watch-cli")
+        expected = {"task_id": "APP-A-SMOKE-001", "status": "ready_for_bundle_review"}
+        argv = [
+            "company-orchestrator",
+            "--project-root",
+            str(self.project_root),
+            "execute-task",
+            "watch-cli",
+            "APP-A-SMOKE-001",
+            "--watch",
+        ]
+        with (
+            patch.object(sys, "argv", argv),
+            patch("company_orchestrator.cli.run_maybe_watched", return_value=expected) as wrapped,
+            patch("company_orchestrator.cli.print_result") as print_result_mock,
+        ):
+            cli_main()
+        wrapped.assert_called_once()
+        self.assertTrue(wrapped.call_args.args[2])
+        print_result_mock.assert_called_once_with(expected, leading_blank_line=True)
 
     def test_build_planning_payload_uses_immediately_previous_phase_for_detailed_reports(self) -> None:
         scaffold_planning_run(self.project_root, "polish-payload", ["frontend"])

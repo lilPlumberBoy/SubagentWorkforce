@@ -1,0 +1,63 @@
+{
+  "type": "object",
+  "required": [
+    "schema",
+    "run_id",
+    "activity_id",
+    "kind",
+    "entity_id",
+    "phase",
+    "objective_id",
+    "display_name",
+    "assigned_role",
+    "status",
+    "progress_stage",
+    "progress_fraction",
+    "queue_position",
+    "runner_id",
+    "current_activity",
+    "prompt_path",
+    "stdout_path",
+    "stderr_path",
+    "output_path",
+    "dependency_blockers",
+    "started_at",
+    "updated_at",
+    "latest_event"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"type": "string", "enum": ["activity-live-state.v1"]},
+    "run_id": {"type": "string"},
+    "activity_id": {"type": "string"},
+    "kind": {"type": "string", "enum": ["task_execution", "objective_plan"]},
+    "entity_id": {"type": "string"},
+    "phase": {"type": "string", "enum": ["discovery", "design", "mvp-build", "polish"]},
+    "objective_id": {"type": "string"},
+    "display_name": {"type": "string"},
+    "assigned_role": {"type": ["string", "null"]},
+    "status": {"type": "string"},
+    "progress_stage": {"type": "string"},
+    "progress_fraction": {"type": "number"},
+    "queue_position": {"type": ["number", "null"]},
+    "runner_id": {"type": ["string", "null"]},
+    "current_activity": {"type": ["string", "null"]},
+    "prompt_path": {"type": ["string", "null"]},
+    "stdout_path": {"type": ["string", "null"]},
+    "stderr_path": {"type": ["string", "null"]},
+    "output_path": {"type": ["string", "null"]},
+    "dependency_blockers": {"type": "array", "items": {"type": "string"}},
+    "started_at": {"type": "string"},
+    "updated_at": {"type": "string"},
+    "latest_event": {
+      "type": ["object", "null"],
+      "required": ["timestamp", "event_type", "message"],
+      "additionalProperties": false,
+      "properties": {
+        "timestamp": {"type": "string"},
+        "event_type": {"type": "string"},
+        "message": {"type": "string"}
+      }
+    }
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "type": "object",
+  "required": [
+    "schema",
+    "run_id",
+    "current_phase",
+    "active_activity_ids",
+    "queued_activity_ids",
+    "counts_by_status",
+    "counts_by_kind",
+    "updated_at"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"type": "string", "enum": ["run-live-state.v1"]},
+    "run_id": {"type": "string"},
+    "current_phase": {"type": "string", "enum": ["discovery", "design", "mvp-build", "polish"]},
+    "active_activity_ids": {"type": "array", "items": {"type": "string"}},
+    "queued_activity_ids": {"type": "array", "items": {"type": "string"}},
+    "counts_by_status": {"type": "object"},
+    "counts_by_kind": {"type": "object"},
+    "updated_at": {"type": "string"}
+  }
+}

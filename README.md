@@ -82,6 +82,34 @@ Objective-specific roles can live either in the generic tree above or under an a
 - Task dependencies declared in `depends_on` are respected before execution.
 - Manager summaries are written under `runs/<run-id>/manager-runs/`.
 
+## Monitoring And Visualization
+
+The orchestrator now writes live monitoring state under `runs/<run-id>/live/` while planning and execution are in progress.
+
+- `run-state.json` tracks the active phase plus aggregate activity counts.
+- `activities/<activity-id>.json` tracks the status, stage, progress, prompt path, and artifact paths for each planning or execution activity.
+- `events.jsonl` captures normalized lifecycle events from the scheduler, planner, executor, bundle review, and phase reporting.
+
+Use the terminal monitor to inspect a run while it is active:
+
+```bash
+company-orchestrator watch-run run-001
+company-orchestrator inspect-activity run-001 APP-A-DISC-001
+company-orchestrator inspect-activity run-001 plan:discovery:app-a --follow
+```
+
+For convenience, the main execution commands can run with the dashboard attached in the same terminal and then print their normal JSON result when they finish:
+
+```bash
+company-orchestrator execute-task run-001 APP-A-DISC-001 --watch
+company-orchestrator plan-phase run-001 --sandbox read-only --watch
+company-orchestrator run-phase run-001 --sandbox read-only --watch
+```
+
+`watch-run` shows the run header, summary counts, objective progress, active planning activities, active task activities, queued work, blocked work, and a phase-level progress bar.
+
+`inspect-activity` shows the activity metadata, full rendered prompt, latest live events, and the paths to stdout, stderr, and the final output artifact.
+
 ## Objective Planning
 
 `plan-objective` and `plan-phase` run an objective-manager through Codex to generate structured task decomposition.

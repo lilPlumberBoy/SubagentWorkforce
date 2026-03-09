@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Any, Callable
 
 from .bundles import assemble_review_bundle, review_bundle
 from .changes import analyze_change_request, approve_change, create_change_request, scaffold_delta_run
@@ -10,6 +11,7 @@ from .collaboration import create_collaboration_request, resolve_collaboration_r
 from .executor import execute_task
 from .filesystem import read_json
 from .management import run_objective, run_phase
+from .monitoring import inspect_activity, run_with_watch, watch_run
 from .objective_planner import plan_objective, plan_phase
 from .planner import decompose_goal, generate_role_files, initialize_run, promote_roles, suggest_team_proposals
 from .prompts import render_prompt
@@ -51,6 +53,8 @@ def main() -> None:
     execute_parser.add_argument("--sandbox", default="read-only")
     execute_parser.add_argument("--codex-path", default="codex")
     execute_parser.add_argument("--timeout-seconds", type=int, default=300)
+    execute_parser.add_argument("--watch", action="store_true")
+    execute_parser.add_argument("--watch-refresh-seconds", type=float, default=1.0)
 
     plan_objective_parser = subparsers.add_parser("plan-objective")
     plan_objective_parser.add_argument("run_id")
@@ -59,6 +63,8 @@ def main() -> None:
     plan_objective_parser.add_argument("--codex-path", default="codex")
     plan_objective_parser.add_argument("--replace", action="store_true")
     plan_objective_parser.add_argument("--timeout-seconds", type=int, default=300)
+    plan_objective_parser.add_argument("--watch", action="store_true")
+    plan_objective_parser.add_argument("--watch-refresh-seconds", type=float, default=1.0)
 
     plan_phase_parser = subparsers.add_parser("plan-phase")
     plan_phase_parser.add_argument("run_id")
@@ -66,6 +72,8 @@ def main() -> None:
     plan_phase_parser.add_argument("--codex-path", default="codex")
     plan_phase_parser.add_argument("--replace", action="store_true")
     plan_phase_parser.add_argument("--timeout-seconds", type=int, default=300)
+    plan_phase_parser.add_argument("--watch", action="store_true")
+    plan_phase_parser.add_argument("--watch-refresh-seconds", type=float, default=1.0)
 
     run_objective_parser = subparsers.add_parser("run-objective")
     run_objective_parser.add_argument("run_id")
@@ -74,6 +82,8 @@ def main() -> None:
     run_objective_parser.add_argument("--codex-path", default="codex")
     run_objective_parser.add_argument("--force", action="store_true")
     run_objective_parser.add_argument("--timeout-seconds", type=int, default=300)
+    run_objective_parser.add_argument("--watch", action="store_true")
+    run_objective_parser.add_argument("--watch-refresh-seconds", type=float, default=1.0)
 
     run_phase_parser = subparsers.add_parser("run-phase")
     run_phase_parser.add_argument("run_id")
@@ -81,6 +91,18 @@ def main() -> None:
     run_phase_parser.add_argument("--codex-path", default="codex")
     run_phase_parser.add_argument("--force", action="store_true")
     run_phase_parser.add_argument("--timeout-seconds", type=int, default=300)
+    run_phase_parser.add_argument("--watch", action="store_true")
+    run_phase_parser.add_argument("--watch-refresh-seconds", type=float, default=1.0)
+
+    watch_parser = subparsers.add_parser("watch-run")
+    watch_parser.add_argument("run_id")
+    watch_parser.add_argument("--refresh-seconds", type=float, default=1.0)
+
+    inspect_parser = subparsers.add_parser("inspect-activity")
+    inspect_parser.add_argument("run_id")
+    inspect_parser.add_argument("activity_id")
+    inspect_parser.add_argument("--follow", action="store_true")
+    inspect_parser.add_argument("--events", type=int, default=20)
 
     bundle_parser = subparsers.add_parser("assemble-bundle")
     bundle_parser.add_argument("run_id")
@@ -180,8 +202,7 @@ def main() -> None:
         print_json(render_prompt(project_root, args.run_id, Path(args.task_path)))
         return
     if args.command == "execute-task":
-        print_json(
-            execute_task(
+        operation = lambda: execute_task(
                 project_root,
                 args.run_id,
                 args.task_id,
@@ -189,11 +210,13 @@ def main() -> None:
                 codex_path=args.codex_path,
                 timeout_seconds=args.timeout_seconds,
             )
+        print_result(
+            run_maybe_watched(project_root, args.run_id, args.watch, args.watch_refresh_seconds, operation),
+            leading_blank_line=args.watch,
         )
         return
     if args.command == "plan-objective":
-        print_json(
-            plan_objective(
+        operation = lambda: plan_objective(
                 project_root,
                 args.run_id,
                 args.objective_id,
@@ -202,11 +225,13 @@ def main() -> None:
                 replace=args.replace,
                 timeout_seconds=args.timeout_seconds,
             )
+        print_result(
+            run_maybe_watched(project_root, args.run_id, args.watch, args.watch_refresh_seconds, operation),
+            leading_blank_line=args.watch,
         )
         return
     if args.command == "plan-phase":
-        print_json(
-            plan_phase(
+        operation = lambda: plan_phase(
                 project_root,
                 args.run_id,
                 sandbox_mode=args.sandbox,
@@ -214,11 +239,13 @@ def main() -> None:
                 replace=args.replace,
                 timeout_seconds=args.timeout_seconds,
             )
+        print_result(
+            run_maybe_watched(project_root, args.run_id, args.watch, args.watch_refresh_seconds, operation),
+            leading_blank_line=args.watch,
         )
         return
     if args.command == "run-objective":
-        print_json(
-            run_objective(
+        operation = lambda: run_objective(
                 project_root,
                 args.run_id,
                 args.objective_id,
@@ -227,11 +254,13 @@ def main() -> None:
                 force=args.force,
                 timeout_seconds=args.timeout_seconds,
             )
+        print_result(
+            run_maybe_watched(project_root, args.run_id, args.watch, args.watch_refresh_seconds, operation),
+            leading_blank_line=args.watch,
         )
         return
     if args.command == "run-phase":
-        print_json(
-            run_phase(
+        operation = lambda: run_phase(
                 project_root,
                 args.run_id,
                 sandbox_mode=args.sandbox,
@@ -239,7 +268,16 @@ def main() -> None:
                 force=args.force,
                 timeout_seconds=args.timeout_seconds,
             )
+        print_result(
+            run_maybe_watched(project_root, args.run_id, args.watch, args.watch_refresh_seconds, operation),
+            leading_blank_line=args.watch,
         )
+        return
+    if args.command == "watch-run":
+        watch_run(project_root, args.run_id, refresh_seconds=args.refresh_seconds)
+        return
+    if args.command == "inspect-activity":
+        inspect_activity(project_root, args.run_id, args.activity_id, follow=args.follow, events=args.events)
         return
     if args.command == "assemble-bundle":
         report_paths = [Path(path) for path in args.report_paths]
@@ -315,3 +353,21 @@ def main() -> None:
 
 def print_json(payload: dict[str, object]) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def print_result(payload: dict[str, object], *, leading_blank_line: bool = False) -> None:
+    if leading_blank_line:
+        print()
+    print_json(payload)
+
+
+def run_maybe_watched(
+    project_root: Path,
+    run_id: str,
+    watch: bool,
+    refresh_seconds: float,
+    operation: Callable[[], dict[str, Any]],
+) -> dict[str, Any]:
+    if not watch:
+        return operation()
+    return run_with_watch(project_root, run_id, operation, refresh_seconds=refresh_seconds)
