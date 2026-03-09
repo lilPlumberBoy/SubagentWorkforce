@@ -6,3 +6,4 @@ node_modules/
 package-lock.json
 uv.lock
 runs/
+apps/todo/backend/data/

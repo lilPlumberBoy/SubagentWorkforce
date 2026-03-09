@@ -1,0 +1,10 @@
+{
+  "apiBaseUrl": "http://127.0.0.1:3000",
+  "files": [
+    "app.js",
+    "assets/react.js",
+    "assets/react-dom.js",
+    "index.html"
+  ],
+  "generatedAt": "2026-03-09T16:16:10.615Z"
+}

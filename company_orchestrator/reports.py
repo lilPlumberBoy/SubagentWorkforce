@@ -27,30 +27,33 @@ def generate_phase_report(project_root: Path, run_id: str) -> tuple[dict[str, An
 
     outcomes = []
     for objective in objective_map["objectives"]:
-        bundle_ids = accepted_by_objective.get(objective["objective_id"], [])
+        accepted_bundle_ids = accepted_by_objective.get(objective["objective_id"], [])
         manager_plan_path = run_dir / "manager-plans" / f"{phase}-{objective['objective_id']}.json"
         if manager_plan_path.exists():
             required_bundle_specs = objective_bundle_specs(run_dir, phase, objective["objective_id"], [])
             required_bundle_ids = [bundle["bundle_id"] for bundle in required_bundle_specs]
-            status = "accepted" if required_bundle_ids and set(required_bundle_ids).issubset(set(bundle_ids)) else "pending"
+            matched_bundle_ids = [bundle_id for bundle_id in required_bundle_ids if bundle_id in accepted_bundle_ids]
+            status = "accepted" if required_bundle_ids and set(required_bundle_ids).issubset(set(accepted_bundle_ids)) else "pending"
         else:
-            status = "accepted" if bundle_ids else "pending"
+            matched_bundle_ids = accepted_bundle_ids
+            status = "accepted" if matched_bundle_ids else "pending"
         outcomes.append(
             {
                 "objective_id": objective["objective_id"],
                 "status": status,
-                "accepted_bundles": bundle_ids,
+                "accepted_bundles": matched_bundle_ids,
             }
         )
 
     recommendation = "advance" if outcomes and all(item["status"] == "accepted" for item in outcomes) else "hold"
+    accepted_bundle_ids = [bundle_id for item in outcomes for bundle_id in item["accepted_bundles"]]
     payload = {
         "schema": "phase-report.v1",
         "run_id": run_id,
         "phase": phase,
         "summary": f"{phase} phase report for {run_id}",
         "objective_outcomes": outcomes,
-        "accepted_bundles": [bundle["bundle_id"] for bundle in bundles if bundle.get("status") == "accepted"],
+        "accepted_bundles": accepted_bundle_ids,
         "unresolved_risks": [bundle["bundle_id"] for bundle in rejected],
         "proposed_role_changes": [],
         "recommendation": recommendation,

@@ -6,6 +6,7 @@ from typing import Any
 
 from .constants import PHASES
 from .filesystem import ensure_dir, read_json, read_text, write_json, write_text
+from .objective_roots import find_objective_root
 from .schemas import validate_document
 
 CAPABILITY_KEYWORDS = {
@@ -116,7 +117,7 @@ def generate_role_files(project_root: Path, run_id: str, approve: bool = False) 
     registry = read_json(run_dir / "team-registry.json")
     written: list[Path] = []
     for team in registry["teams"]:
-        objective_root = project_root / "orchestrator" / "roles" / "objectives" / team["objective_id"]
+        objective_root = find_objective_root(project_root, team["objective_id"], create=True)
         write_text(objective_root / "charter.md", objective_charter(team["objective_id"], team["capabilities"]))
         target_dir = objective_root / ("approved" if approve else "proposed")
         ensure_dir(target_dir)
@@ -130,7 +131,7 @@ def generate_role_files(project_root: Path, run_id: str, approve: bool = False) 
 
 
 def promote_roles(project_root: Path, objective_id: str) -> list[Path]:
-    objective_root = project_root / "orchestrator" / "roles" / "objectives" / objective_id
+    objective_root = find_objective_root(project_root, objective_id, create=True)
     proposed_dir = objective_root / "proposed"
     approved_dir = ensure_dir(objective_root / "approved")
     copied: list[Path] = []

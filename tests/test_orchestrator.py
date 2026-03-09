@@ -15,7 +15,7 @@ from company_orchestrator.filesystem import read_json, write_json
 from company_orchestrator.management import run_phase
 from company_orchestrator.objective_planner import build_planning_prompt, plan_objective, plan_phase
 from company_orchestrator.planner import generate_role_files, initialize_run, suggest_team_proposals
-from company_orchestrator.prompts import render_prompt
+from company_orchestrator.prompts import build_planning_payload, render_prompt
 from company_orchestrator.reports import advance_phase, generate_phase_report, record_human_approval
 from company_orchestrator.smoke import scaffold_smoke_test, simulate_context_echo_completion, verify_smoke_reports
 
@@ -41,6 +41,340 @@ class OrchestratorTests(unittest.TestCase):
         self.assertIn("orchestrator/roles/base/worker.md", metadata["files_loaded"])
         self.assertIn("orchestrator/roles/capabilities/frontend.md", metadata["files_loaded"])
         self.assertIn("orchestrator/phase-overlays/discovery.md", metadata["files_loaded"])
+
+    def test_render_prompt_resolves_planning_inputs_and_prior_outputs(self) -> None:
+        scaffold_planning_run(self.project_root, "resolved-inputs", ["frontend"])
+        prior_report = {
+            "schema": "completion-report.v1",
+            "run_id": "resolved-inputs",
+            "phase": "discovery",
+            "objective_id": "app-a",
+            "task_id": "APP-A-DISC-000",
+            "agent_role": "objectives.app-a.frontend-worker",
+            "status": "ready_for_bundle_review",
+            "summary": "Previous discovery output.",
+            "artifacts": [],
+            "validation_results": [],
+            "dependency_impact": [],
+            "open_issues": [],
+            "follow_up_requests": [],
+        }
+        write_json(self.project_root / "runs" / "resolved-inputs" / "reports" / "APP-A-DISC-000.json", prior_report)
+        task = {
+            "schema": "task-assignment.v1",
+            "run_id": "resolved-inputs",
+            "phase": "discovery",
+            "objective_id": "app-a",
+            "capability": "frontend",
+            "task_id": "APP-A-DISC-001",
+            "assigned_role": "objectives.app-a.frontend-worker",
+            "manager_role": "objectives.app-a.objective-manager",
+            "acceptance_role": "objectives.app-a.acceptance-manager",
+            "objective": "Use resolved planning context.",
+            "inputs": [
+                "Planning Inputs.goal_markdown",
+                "Planning Inputs.objective",
+                "Planning Inputs.team",
+                "Runtime Context.phase",
+                "Output of APP-A-DISC-000",
+            ],
+            "expected_outputs": [],
+            "done_when": ["resolved inputs are present"],
+            "depends_on": [],
+            "validation": [],
+            "collaboration_rules": [],
+        }
+        task_path = self.project_root / "runs" / "resolved-inputs" / "tasks" / "APP-A-DISC-001.json"
+        write_json(task_path, task)
+        metadata = render_prompt(self.project_root, "resolved-inputs", task_path)
+        prompt_text = (self.project_root / metadata["prompt_path"]).read_text()
+        self.assertIn("# Resolved Inputs", prompt_text)
+        self.assertIn("Planning Inputs.goal_markdown", prompt_text)
+        self.assertIn("Previous discovery output.", prompt_text)
+        self.assertIn('"phase": "discovery"', prompt_text)
+        prompt_log = read_json(self.project_root / "runs" / "resolved-inputs" / "prompt-logs" / "APP-A-DISC-001.json")
+        self.assertIn("Planning Inputs.goal_markdown", prompt_log["resolved_input_refs"])
+
+    def test_render_prompt_resolves_natural_language_goal_refs(self) -> None:
+        goal_text = (REPO_ROOT / "apps" / "todo" / "goal-draft.md").read_text()
+        run_dir = initialize_run(self.project_root, "natural-refs", goal_text)
+        objective_map = {
+            "schema": "objective-map.v1",
+            "run_id": "natural-refs",
+            "objectives": [
+                {
+                    "objective_id": "frontend-obj",
+                    "title": "React frontend objective",
+                    "summary": "React frontend objective",
+                    "status": "proposed",
+                    "capabilities": ["frontend"],
+                }
+            ],
+            "dependencies": [],
+        }
+        write_json(run_dir / "objective-map.json", objective_map)
+        suggest_team_proposals(self.project_root, "natural-refs")
+        generate_role_files(self.project_root, "natural-refs", approve=True)
+        prior_report = {
+            "schema": "completion-report.v1",
+            "run_id": "natural-refs",
+            "phase": "discovery",
+            "objective_id": "frontend-obj",
+            "task_id": "PREV-001",
+            "agent_role": "objectives.frontend-obj.frontend-worker",
+            "status": "ready_for_bundle_review",
+            "summary": "Previous frontend discovery output.",
+            "artifacts": [],
+            "validation_results": [],
+            "dependency_impact": [],
+            "open_issues": [],
+            "follow_up_requests": [],
+        }
+        write_json(self.project_root / "runs" / "natural-refs" / "reports" / "PREV-001.json", prior_report)
+        task = {
+            "schema": "task-assignment.v1",
+            "run_id": "natural-refs",
+            "phase": "discovery",
+            "objective_id": "frontend-obj",
+            "capability": "frontend",
+            "task_id": "FRONT-001",
+            "assigned_role": "objectives.frontend-obj.frontend-worker",
+            "manager_role": "objectives.frontend-obj.objective-manager",
+            "acceptance_role": "objectives.frontend-obj.acceptance-manager",
+            "objective": "Use natural language goal refs.",
+            "inputs": [
+                "Goal markdown sections: Objectives, Success Criteria, In Scope, Out Of Scope",
+                "Objective Details: React Web Frontend",
+                "Discovery Expectations and Known Unknowns",
+                "Objective summary and title from planning inputs",
+                "goal_markdown: Constraints",
+                "output of PREV-001",
+                "team.roles and available_roles",
+            ],
+            "expected_outputs": [],
+            "done_when": ["natural refs resolve"],
+            "depends_on": [],
+            "validation": [],
+            "collaboration_rules": [],
+        }
+        task_path = self.project_root / "runs" / "natural-refs" / "tasks" / "FRONT-001.json"
+        write_json(task_path, task)
+        metadata = render_prompt(self.project_root, "natural-refs", task_path)
+        prompt_text = (self.project_root / metadata["prompt_path"]).read_text()
+        self.assertIn("React web frontend", prompt_text)
+        self.assertIn("frontend should use React", prompt_text)
+        self.assertIn("Previous frontend discovery output.", prompt_text)
+        self.assertIn("available_roles", prompt_text)
+        self.assertNotIn('"unresolved_input_ref": "Goal markdown sections: Objectives, Success Criteria, In Scope, Out Of Scope"', prompt_text)
+
+    def test_render_prompt_resolves_design_phase_goal_refs(self) -> None:
+        goal_text = (REPO_ROOT / "apps" / "todo" / "goal-draft.md").read_text()
+        run_dir = initialize_run(self.project_root, "design-refs", goal_text)
+        phase_plan = read_json(run_dir / "phase-plan.json")
+        phase_plan["phases"][0]["status"] = "complete"
+        phase_plan["phases"][0]["human_approved"] = True
+        phase_plan["current_phase"] = "design"
+        phase_plan["phases"][1]["status"] = "active"
+        write_json(run_dir / "phase-plan.json", phase_plan)
+        objective_map = {
+            "schema": "objective-map.v1",
+            "run_id": "design-refs",
+            "objectives": [
+                {
+                    "objective_id": "frontend-obj",
+                    "title": "React frontend objective",
+                    "summary": "React frontend objective",
+                    "status": "approved",
+                    "capabilities": ["frontend"],
+                }
+            ],
+            "dependencies": [],
+        }
+        write_json(run_dir / "objective-map.json", objective_map)
+        suggest_team_proposals(self.project_root, "design-refs")
+        generate_role_files(self.project_root, "design-refs", approve=True)
+        prior_report = {
+            "schema": "completion-report.v1",
+            "run_id": "design-refs",
+            "phase": "design",
+            "objective_id": "frontend-obj",
+            "task_id": "DESIGN-000",
+            "agent_role": "objectives.frontend-obj.frontend-worker",
+            "status": "ready_for_bundle_review",
+            "summary": "Previous design output.",
+            "artifacts": [],
+            "validation_results": [],
+            "dependency_impact": [],
+            "open_issues": [],
+            "follow_up_requests": [],
+        }
+        write_json(self.project_root / "runs" / "design-refs" / "reports" / "DESIGN-000.json", prior_report)
+        task = {
+            "schema": "task-assignment.v1",
+            "run_id": "design-refs",
+            "phase": "design",
+            "objective_id": "frontend-obj",
+            "capability": "frontend",
+            "task_id": "DESIGN-001",
+            "assigned_role": "objectives.frontend-obj.frontend-worker",
+            "manager_role": "objectives.frontend-obj.objective-manager",
+            "acceptance_role": "objectives.frontend-obj.acceptance-manager",
+            "objective": "Resolve design-phase natural refs.",
+            "inputs": [
+                "Planning Inputs goal_markdown summary, objectives, success criteria, in-scope, and out-of-scope sections",
+                "Objective Details for React Web Frontend",
+                "Design Expectations for required design artifacts",
+                "Planning Inputs Design Expectations for API/interface contract",
+                "Planning Inputs success criteria, constraints, and human approval notes",
+                "Technical constraint that the frontend should use React and remain straightforward",
+                "Outputs from DESIGN-000",
+            ],
+            "expected_outputs": [],
+            "done_when": ["design refs resolve"],
+            "depends_on": [],
+            "validation": [],
+            "collaboration_rules": [],
+        }
+        task_path = self.project_root / "runs" / "design-refs" / "tasks" / "DESIGN-001.json"
+        write_json(task_path, task)
+        metadata = render_prompt(self.project_root, "design-refs", task_path)
+        prompt_text = (self.project_root / metadata["prompt_path"]).read_text()
+        self.assertIn("extremely simple todo list application", prompt_text)
+        self.assertIn("frontend should use React", prompt_text)
+        self.assertIn("API/interface contract", prompt_text)
+        self.assertIn("human approval notes", prompt_text)
+        self.assertIn("Previous design output.", prompt_text)
+        self.assertNotIn('"unresolved_input_ref": "Planning Inputs goal_markdown summary, objectives, success criteria, in-scope, and out-of-scope sections"', prompt_text)
+
+    def test_render_prompt_resolves_prior_phase_artifacts_for_mvp_inputs(self) -> None:
+        goal_text = (REPO_ROOT / "apps" / "todo" / "goal-draft.md").read_text()
+        run_dir = initialize_run(self.project_root, "mvp-refs", goal_text)
+        phase_plan = read_json(run_dir / "phase-plan.json")
+        phase_plan["phases"][0]["status"] = "complete"
+        phase_plan["phases"][0]["human_approved"] = True
+        phase_plan["phases"][1]["status"] = "complete"
+        phase_plan["phases"][1]["human_approved"] = True
+        phase_plan["phases"][2]["status"] = "active"
+        phase_plan["current_phase"] = "mvp-build"
+        write_json(run_dir / "phase-plan.json", phase_plan)
+        objective_map = {
+            "schema": "objective-map.v1",
+            "run_id": "mvp-refs",
+            "objectives": [
+                {
+                    "objective_id": "backend-obj",
+                    "title": "Backend API and persistence",
+                    "summary": "Backend API and persistence",
+                    "status": "approved",
+                    "capabilities": ["backend"],
+                }
+            ],
+            "dependencies": [],
+        }
+        write_json(run_dir / "objective-map.json", objective_map)
+        suggest_team_proposals(self.project_root, "mvp-refs")
+        generate_role_files(self.project_root, "mvp-refs", approve=True)
+        design_dir = self.project_root / "docs" / "design" / "backend-obj"
+        design_dir.mkdir(parents=True)
+        architecture_path = design_dir / "backend-architecture.md"
+        architecture_path.write_text(
+            "# Backend Architecture\n\nUse a single Node.js/Express service with SQLite persistence.",
+            encoding="utf-8",
+        )
+        gates_path = design_dir / "design-review-gates.md"
+        gates_path.write_text("# Review Gates\n\nRun backend CRUD validation before acceptance.", encoding="utf-8")
+        design_report = {
+            "schema": "completion-report.v1",
+            "run_id": "mvp-refs",
+            "phase": "design",
+            "objective_id": "backend-obj",
+            "task_id": "DESIGN-BE-001",
+            "agent_role": "objectives.backend-obj.backend-worker",
+            "status": "ready_for_bundle_review",
+            "summary": "Approved backend design package for MVP persistence and API behavior.",
+            "artifacts": [
+                {"path": "docs/design/backend-obj/backend-architecture.md", "status": "created"},
+                {"path": "docs/design/backend-obj/design-review-gates.md", "status": "created"},
+            ],
+            "validation_results": [],
+            "dependency_impact": [],
+            "open_issues": [],
+            "follow_up_requests": [],
+        }
+        write_json(run_dir / "reports" / "DESIGN-BE-001.json", design_report)
+        task = {
+            "schema": "task-assignment.v1",
+            "run_id": "mvp-refs",
+            "phase": "mvp-build",
+            "objective_id": "backend-obj",
+            "capability": "backend",
+            "task_id": "MVP-BE-001",
+            "assigned_role": "objectives.backend-obj.backend-worker",
+            "manager_role": "objectives.backend-obj.backend-manager",
+            "acceptance_role": "objectives.backend-obj.acceptance-manager",
+            "objective": "Use approved design artifacts.",
+            "inputs": [
+                "Approved backend design package for todo API and persistence",
+                "Review gates for MVP build",
+            ],
+            "expected_outputs": [],
+            "done_when": ["prior phase artifacts resolve"],
+            "depends_on": [],
+            "validation": [],
+            "collaboration_rules": [],
+        }
+        task_path = run_dir / "tasks" / "MVP-BE-001.json"
+        write_json(task_path, task)
+        metadata = render_prompt(self.project_root, "mvp-refs", task_path)
+        prompt_text = (self.project_root / metadata["prompt_path"]).read_text()
+        self.assertIn("docs/design/backend-obj/backend-architecture.md", prompt_text)
+        self.assertIn("Node.js/Express service with SQLite persistence", prompt_text)
+        self.assertIn("docs/design/backend-obj/design-review-gates.md", prompt_text)
+        self.assertNotIn('"unresolved_input_ref": "Approved backend design package for todo API and persistence"', prompt_text)
+        self.assertNotIn('"unresolved_input_ref": "Review gates for MVP build"', prompt_text)
+
+    def test_build_planning_payload_compacts_prior_report_evidence(self) -> None:
+        scaffold_planning_run(self.project_root, "compact-planning", ["frontend"])
+        long_evidence = " ".join(["evidence"] * 200)
+        report = {
+            "schema": "completion-report.v1",
+            "run_id": "compact-planning",
+            "phase": "discovery",
+            "objective_id": "app-a",
+            "task_id": "APP-A-DISC-001",
+            "agent_role": "objectives.app-a.frontend-worker",
+            "status": "ready_for_bundle_review",
+            "summary": "A" * 400,
+            "artifacts": [
+                {"path": "docs/design/app-a/spec.md", "status": "created"},
+            ],
+            "validation_results": [
+                {"id": "long-evidence", "status": "passed", "evidence": long_evidence},
+            ],
+            "dependency_impact": [long_evidence],
+            "open_issues": [long_evidence],
+            "follow_up_requests": [],
+        }
+        docs_dir = self.project_root / "docs" / "design" / "app-a"
+        docs_dir.mkdir(parents=True)
+        (docs_dir / "spec.md").write_text("# Spec\n", encoding="utf-8")
+        write_json(self.project_root / "runs" / "compact-planning" / "reports" / "APP-A-DISC-001.json", report)
+
+        phase_plan = read_json(self.project_root / "runs" / "compact-planning" / "phase-plan.json")
+        phase_plan["phases"][0]["status"] = "complete"
+        phase_plan["phases"][0]["human_approved"] = True
+        phase_plan["phases"][1]["status"] = "active"
+        phase_plan["current_phase"] = "design"
+        write_json(self.project_root / "runs" / "compact-planning" / "phase-plan.json", phase_plan)
+
+        payload = build_planning_payload(self.project_root, "compact-planning", "app-a")
+        prior_report = payload["prior_phase_reports"][0]
+
+        self.assertIn("artifacts", prior_report)
+        self.assertNotIn("validation_results", prior_report)
+        self.assertLessEqual(len(prior_report["summary"]), 240)
+        self.assertLessEqual(len(prior_report["open_issues_preview"][0]), 160)
+        self.assertLessEqual(len(prior_report["dependency_impact_preview"][0]), 160)
 
     def test_phase_lock_rejects_future_phase_task(self) -> None:
         run_dir = initialize_run(self.project_root, "phase-lock", "# Goal\n\n## Objectives\n- App A")
@@ -131,6 +465,27 @@ class OrchestratorTests(unittest.TestCase):
         resolve_collaboration_request(self.project_root, "bundle", "CR-001")
         accepted = review_bundle(self.project_root, "bundle", "APP-A-BUNDLE-001")
         self.assertEqual(accepted["status"], "accepted")
+
+    def test_bundle_review_ignores_prose_follow_up_requests(self) -> None:
+        scaffold_smoke_test(self.project_root, "bundle-prose")
+        simulate_context_echo_completion(self.project_root, "bundle-prose", "APP-A-SMOKE-001")
+        report_path = self.project_root / "runs" / "bundle-prose" / "reports" / "APP-A-SMOKE-001.json"
+        report = read_json(report_path)
+        report["follow_up_requests"] = [
+            "Manager should confirm the MVP boundary before design.",
+            "Acceptance should review the handoff bundle for simplicity.",
+        ]
+        write_json(report_path, report)
+        assemble_review_bundle(
+            self.project_root,
+            "bundle-prose",
+            "APP-A-BUNDLE-001",
+            [report_path],
+            "objectives.app-a.objective-manager",
+            "objectives.app-a.acceptance-manager",
+        )
+        bundle = review_bundle(self.project_root, "bundle-prose", "APP-A-BUNDLE-001")
+        self.assertEqual(bundle["status"], "accepted")
 
     def test_phase_report_requires_human_approval_before_advancing(self) -> None:
         scaffold_smoke_test(self.project_root, "advance")
@@ -433,6 +788,48 @@ class OrchestratorTests(unittest.TestCase):
         manager_plan = read_json(self.project_root / "runs" / "planned-run-id" / "manager-plans" / "discovery-app-a.json")
         self.assertEqual(manager_plan["run_id"], "planned-run-id")
 
+    def test_plan_objective_prefixes_bundle_ids_with_objective_id(self) -> None:
+        scaffold_planning_run(self.project_root, "planned-bundles", ["frontend"])
+        final_payload = planned_payload_for_objective("planned-bundles", "app-a")
+        final_payload["bundle_plan"] = [
+            {
+                "bundle_id": "bundle-discovery-core",
+                "task_ids": ["APP-A-DISC-001"],
+                "summary": "Unscoped bundle id from model",
+            }
+        ]
+        stdout = "\n".join(
+            [
+                '{"type":"thread.started","thread_id":"plan-thread-bundle-id"}',
+                '{"type":"turn.started"}',
+                json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(final_payload)}),
+                '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}'
+            ]
+        )
+        completed = completed_process(stdout=stdout, stderr="", returncode=0)
+        with patch("company_orchestrator.objective_planner.subprocess.run", return_value=completed):
+            summary = plan_objective(self.project_root, "planned-bundles", "app-a")
+        self.assertEqual(summary["bundle_ids"], ["app-a-bundle-discovery-core"])
+        manager_plan = read_json(self.project_root / "runs" / "planned-bundles" / "manager-plans" / "discovery-app-a.json")
+        self.assertEqual(manager_plan["bundle_plan"][0]["bundle_id"], "app-a-bundle-discovery-core")
+
+    def test_plan_objective_rejects_unresolved_generated_inputs(self) -> None:
+        scaffold_planning_run(self.project_root, "planned-unresolved", ["frontend"])
+        final_payload = planned_payload_for_objective("planned-unresolved", "app-a")
+        final_payload["tasks"][0]["inputs"] = ["Completely imaginary planning input"]
+        stdout = "\n".join(
+            [
+                '{"type":"thread.started","thread_id":"plan-thread-unresolved"}',
+                '{"type":"turn.started"}',
+                json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(final_payload)}),
+                '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}'
+            ]
+        )
+        completed = completed_process(stdout=stdout, stderr="", returncode=0)
+        with patch("company_orchestrator.objective_planner.subprocess.run", return_value=completed):
+            with self.assertRaisesRegex(ExecutorError, "unresolved input refs for task APP-A-DISC-001"):
+                plan_objective(self.project_root, "planned-unresolved", "app-a")
+
     def test_planning_prompt_forbids_repo_exploration(self) -> None:
         prompt = build_planning_prompt("base prompt")
         self.assertIn("Do not inspect the repository", prompt)
@@ -543,6 +940,38 @@ class OrchestratorTests(unittest.TestCase):
         phase_report = read_json(self.project_root / "runs" / "planned-phase" / "phase-reports" / "discovery.json")
         self.assertEqual(phase_report["accepted_bundles"], ["app-a-discovery-bundle-1", "app-a-discovery-bundle-2"])
 
+    def test_phase_report_ignores_stale_bundle_ids_not_in_manager_plan(self) -> None:
+        scaffold_planning_run(self.project_root, "stale-bundles", ["frontend"])
+        plan = planned_payload_for_objective("stale-bundles", "app-a")
+        plan["bundle_plan"] = [
+            {
+                "bundle_id": "app-a-required-bundle",
+                "task_ids": ["APP-A-DISC-001"],
+                "summary": "Required bundle",
+            }
+        ]
+        write_json(self.project_root / "runs" / "stale-bundles" / "manager-plans" / "discovery-app-a.json", plan)
+        required_bundle = {
+            "schema": "review-bundle.v1",
+            "run_id": "stale-bundles",
+            "phase": "discovery",
+            "objective_id": "app-a",
+            "bundle_id": "app-a-required-bundle",
+            "assembled_by": "objectives.app-a.objective-manager",
+            "reviewed_by": "objectives.app-a.acceptance-manager",
+            "included_tasks": ["APP-A-DISC-001"],
+            "status": "accepted",
+            "required_checks": [],
+            "rejection_reasons": [],
+        }
+        stale_bundle = dict(required_bundle)
+        stale_bundle["bundle_id"] = "stale-old-bundle"
+        write_json(self.project_root / "runs" / "stale-bundles" / "bundles" / "app-a-required-bundle.json", required_bundle)
+        write_json(self.project_root / "runs" / "stale-bundles" / "bundles" / "stale-old-bundle.json", stale_bundle)
+        report, _ = generate_phase_report(self.project_root, "stale-bundles")
+        self.assertEqual(report["objective_outcomes"][0]["accepted_bundles"], ["app-a-required-bundle"])
+        self.assertEqual(report["accepted_bundles"], ["app-a-required-bundle"])
+
     def test_plan_phase_runs_all_objective_managers(self) -> None:
         scaffold_dual_planning_run(self.project_root, "plan-phase")
 
@@ -566,6 +995,58 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(len(summary["planned_objectives"]), 2)
         self.assertTrue((self.project_root / "runs" / "plan-phase" / "tasks" / "APP-A-DISC-001.json").exists())
         self.assertTrue((self.project_root / "runs" / "plan-phase" / "tasks" / "APP-B-DISC-001.json").exists())
+
+    def test_build_planning_payload_uses_immediately_previous_phase_for_detailed_reports(self) -> None:
+        scaffold_planning_run(self.project_root, "polish-payload", ["frontend"])
+        run_dir = self.project_root / "runs" / "polish-payload"
+        phase_plan = read_json(run_dir / "phase-plan.json")
+        phase_plan["current_phase"] = "polish"
+        phase_plan["phases"][0]["status"] = "complete"
+        phase_plan["phases"][0]["human_approved"] = True
+        phase_plan["phases"][1]["status"] = "complete"
+        phase_plan["phases"][1]["human_approved"] = True
+        phase_plan["phases"][2]["status"] = "complete"
+        phase_plan["phases"][2]["human_approved"] = True
+        phase_plan["phases"][3]["status"] = "active"
+        write_json(run_dir / "phase-plan.json", phase_plan)
+
+        reports = [
+            ("discovery", "DISC-001"),
+            ("design", "DESIGN-001"),
+            ("mvp-build", "MVP-001"),
+        ]
+        for phase, task_id in reports:
+            report = {
+                "schema": "completion-report.v1",
+                "run_id": "polish-payload",
+                "phase": phase,
+                "objective_id": "app-a",
+                "task_id": task_id,
+                "agent_role": "objectives.app-a.frontend-worker",
+                "status": "ready_for_bundle_review",
+                "summary": f"{phase} handoff",
+                "artifacts": [{"path": f"docs/{phase}.md", "status": "created"}],
+                "validation_results": [{"id": f"{phase}-check", "status": "passed", "evidence": "ok"}],
+                "dependency_impact": [f"{phase} dependency"],
+                "open_issues": [f"{phase} issue"],
+                "follow_up_requests": [],
+            }
+            write_json(run_dir / "reports" / f"{task_id}.json", report)
+            artifact_path = self.project_root / "docs" / f"{phase}.md"
+            artifact_path.parent.mkdir(parents=True, exist_ok=True)
+            artifact_path.write_text(f"# {phase}\n", encoding="utf-8")
+
+        payload = build_planning_payload(self.project_root, "polish-payload", "app-a")
+
+        self.assertEqual([item["phase"] for item in payload["prior_phase_reports"]], ["mvp-build"])
+        self.assertEqual(
+            payload["approved_inputs_catalog"]["report_paths"],
+            [
+                "runs/polish-payload/reports/DISC-001.json",
+                "runs/polish-payload/reports/DESIGN-001.json",
+                "runs/polish-payload/reports/MVP-001.json",
+            ],
+        )
 
 
 if __name__ == "__main__":

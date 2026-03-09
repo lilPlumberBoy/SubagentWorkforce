@@ -24,6 +24,13 @@ company-orchestrator plan-phase run-001 --sandbox read-only
 company-orchestrator run-phase run-001 --sandbox read-only
 ```
 
+Start from the fill-in template at [orchestrator/templates/goal-template.md](/Users/mike/projects/personal/SubagentWorkforce/orchestrator/templates/goal-template.md). The example todo-app goal lives at [goal-draft.md](/Users/mike/projects/personal/SubagentWorkforce/apps/todo/goal-draft.md).
+
+- Keep the `## Objectives` heading exactly as written.
+- Put one objective per bullet.
+- Use concrete wording in those bullets so capability inference has something useful to work with.
+- Add real detail in the later sections so discovery workers can identify boundaries, unknowns, risks, and dependencies without inventing facts.
+
 Scaffold and verify the minimal communication test:
 
 ```bash
@@ -54,6 +61,8 @@ Prompts are assembled in this order:
 6. The rendered `task-assignment.v1` JSON
 
 Every render writes a prompt log under `runs/<run-id>/prompt-logs/`.
+
+Objective-specific roles can live either in the generic tree above or under an app-local tree such as `apps/<app>/orchestrator/roles/objectives/<objective-id>/...`.
 
 ## Executor Adapter
 
@@ -88,6 +97,59 @@ Every render writes a prompt log under `runs/<run-id>/prompt-logs/`.
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+## Todo Runtime
+
+Run the integrated todo MVP locally with one command:
+
+```bash
+npm run todo-runtime:start
+```
+
+The runtime starts the backend first, then a small frontend host that serves the React todo page and points it at the backend API without source edits. The wiring externalizes the live backend URL into the frontend runtime and applies the backend allow-origin setting for that frontend origin automatically.
+
+Optional runtime environment variables:
+- `TODO_BACKEND_HOST` defaults to `127.0.0.1`
+- `TODO_BACKEND_PORT` defaults to `3000`
+- `TODO_FRONTEND_HOST` defaults to `127.0.0.1`
+- `TODO_FRONTEND_PORT` defaults to `4173`
+- `TODO_BACKEND_DB_PATH` defaults to `apps/todo/backend/data/todos.sqlite`
+
+The command prints one JSON line with the backend URL, frontend URL, and resolved database path, then keeps both servers running until interrupted.
+
+Runtime-specific validation commands:
+
+```bash
+npm run validate:todo-e2e-smoke
+npm run validate:todo-release-readiness
+npm run validate:todo-review-evidence
+npm run validate:todo-runtime-connectivity
+npm run validate:todo-runtime-startup
+```
+
+Review bundle notes for the integrated todo MVP live in [mvp-integration-review-evidence.md](/Users/mike/projects/personal/SubagentWorkforce/apps/todo/docs/design/objectives/basic-application-integration-and-delivery-workflow-connecting-frontend-and-backend/mvp-integration-review-evidence.md).
+
+Polish-phase release handoff notes live in:
+- [frontend release readiness](/Users/mike/projects/personal/SubagentWorkforce/apps/todo/docs/polish/react-web-frontend-for-creating-viewing-completing-editing-and-deleting-todo-items/frontend-release-readiness.md)
+- [backend operations handoff](/Users/mike/projects/personal/SubagentWorkforce/apps/todo/docs/polish/simple-backend-api-and-persistence-layer-for-storing-todo-items/backend-operations-handoff.md)
+- [integration release checklist](/Users/mike/projects/personal/SubagentWorkforce/apps/todo/docs/polish/basic-application-integration-and-delivery-workflow-connecting-frontend-and-backend/release-checklist.md)
+
+## App Layout
+
+Generic orchestration assets stay at the repo root:
+- `company_orchestrator/`
+- `orchestrator/`
+- `runs/`
+- `tests/`
+
+App-specific assets for the todo example now live under:
+- `apps/todo/backend/`
+- `apps/todo/frontend/`
+- `apps/todo/runtime/`
+- `apps/todo/scripts/`
+- `apps/todo/docs/`
+- `apps/todo/orchestrator/`
+- `apps/todo/goal-draft.md`
 
 ## Current Scope
 

@@ -50,6 +50,7 @@ def review_bundle(project_root: Path, run_id: str, bundle_id: str) -> dict[str, 
     bundle = read_json(bundle_path)
     reports_dir = project_root / "runs" / run_id / "reports"
     collaboration_dir = project_root / "runs" / run_id / "collaboration"
+    known_collaboration_ids = {path.stem for path in collaboration_dir.glob("*.json")}
     failures: list[str] = []
 
     for task_id in bundle["included_tasks"]:
@@ -60,6 +61,8 @@ def review_bundle(project_root: Path, run_id: str, bundle_id: str) -> dict[str, 
             if result["status"] != "passed":
                 failures.append(f"{task_id}: validation {result['id']} did not pass")
         for request_id in report.get("follow_up_requests", []):
+            if request_id not in known_collaboration_ids:
+                continue
             request_path = collaboration_dir / f"{request_id}.json"
             if request_path.exists():
                 request = read_json(request_path)

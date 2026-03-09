@@ -1,5 +1,33 @@
 {
   "dependencies": {
-    "@openai/codex-sdk": "^0.111.0"
+    "@openai/codex-sdk": "^0.111.0",
+    "express": "^5.1.0",
+    "jsdom": "^24.1.3",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "scripts": {
+    "lint": "node --no-warnings apps/todo/scripts/lint.js",
+    "test": "node --no-warnings --test apps/todo/backend/test/*.test.js apps/todo/frontend/test/*.test.js apps/todo/runtime/test/*.test.js",
+    "build": "node --no-warnings apps/todo/scripts/build-runtime.js",
+    "todo-backend:start": "node --no-warnings apps/todo/backend/scripts/start.js",
+    "todo-backend:bootstrap": "node --no-warnings apps/todo/backend/scripts/bootstrap.js",
+    "todo-runtime:start": "node --no-warnings apps/todo/runtime/scripts/start.js",
+    "validate:todo-backend": "node --no-warnings --test apps/todo/backend/test/bootstrap.test.js apps/todo/backend/test/repository.test.js apps/todo/backend/test/contract.test.js apps/todo/backend/test/persistence.test.js",
+    "validate:todo-backend-contract": "node --no-warnings --test apps/todo/backend/test/contract.test.js",
+    "validate:todo-backend-bootstrap": "node --no-warnings --test apps/todo/backend/test/bootstrap.test.js",
+    "validate:todo-backend-persistence": "node --no-warnings --test apps/todo/backend/test/bootstrap.test.js apps/todo/backend/test/persistence.test.js",
+    "validate:todo-backend-repository": "node --no-warnings --test apps/todo/backend/test/repository.test.js",
+    "validate:todo-frontend-client": "node --no-warnings --test apps/todo/frontend/test/client.contract.test.js",
+    "validate:todo-frontend-client-errors": "node --no-warnings --test apps/todo/frontend/test/client.errors.test.js",
+    "validate:todo-frontend-editing": "node --no-warnings --test apps/todo/frontend/test/app.editing.test.js",
+    "validate:todo-frontend-flows": "node --no-warnings --test apps/todo/frontend/test/app.flows.test.js",
+    "validate:todo-frontend-reload": "node --no-warnings --test apps/todo/frontend/test/app.reload.test.js",
+    "validate:todo-frontend-review-evidence": "node --no-warnings --test apps/todo/frontend/test/review-evidence.test.js",
+    "validate:todo-e2e-smoke": "node --no-warnings --test apps/todo/runtime/test/e2e-smoke.test.js",
+    "validate:todo-release-readiness": "npm run lint && CI=1 npm test && npm run build && npm run validate:todo-e2e-smoke",
+    "validate:todo-review-evidence": "node --no-warnings --test apps/todo/runtime/test/review-evidence.test.js",
+    "validate:todo-runtime-connectivity": "node --no-warnings --test apps/todo/runtime/test/connectivity.test.js",
+    "validate:todo-runtime-startup": "node --no-warnings --test apps/todo/runtime/test/startup.test.js"
   }
 }

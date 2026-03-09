@@ -17,7 +17,8 @@ from .executor import (
     parse_jsonl_events,
 )
 from .filesystem import ensure_dir, read_json, write_json, write_text
-from .prompts import render_objective_planning_prompt
+from .objective_roots import find_objective_root
+from .prompts import preview_resolved_inputs, render_objective_planning_prompt
 from .schemas import SchemaValidationError, validate_document
 
 
@@ -90,8 +91,10 @@ def plan_objective(
         raise ExecutorError(f"Objective plan failed schema validation: {exc}") from exc
 
     identity_adjustments = normalize_plan_identity(plan, run_id=run_id, phase=phase, objective_id=objective_id)
+    normalize_bundle_ids(plan)
 
     validate_objective_plan_contents(plan, objective)
+    validate_objective_plan_inputs(project_root, run_id, plan)
     materialize_objective_plan(project_root, run_id, plan, replace=replace)
 
     summary = {
@@ -164,6 +167,10 @@ def build_planning_prompt(prompt_text: str) -> str:
         + "Produce small isolated tasks for the active phase only.\n"
         + "Use only worker roles from the listed objective team when assigning tasks.\n"
         + "Every bundle in bundle_plan must reference only generated task ids.\n"
+        + "For phases after discovery, each task input must be either a concrete repo-relative file path, "
+        + "an explicit `Output of <task-id>` reference, or a dotted `Planning Inputs.`/`Runtime Context.` reference.\n"
+        + "When prior-phase reports or artifacts are available in Planning Inputs, prefer referencing those exact paths "
+        + "instead of vague English placeholders such as 'approved design package'.\n"
     )
 
 
@@ -177,6 +184,19 @@ def normalize_plan_identity(
         adjustments["run_id"] = {"from": str(plan["run_id"]), "to": run_id}
         plan["run_id"] = run_id
     return adjustments
+
+
+def normalize_bundle_ids(plan: dict[str, Any]) -> None:
+    objective_id = plan["objective_id"]
+    seen: set[str] = set()
+    for bundle in plan["bundle_plan"]:
+        bundle_id = bundle["bundle_id"]
+        if not bundle_id.startswith(f"{objective_id}-"):
+            bundle_id = f"{objective_id}-{bundle_id}"
+            bundle["bundle_id"] = bundle_id
+        if bundle_id in seen:
+            raise ExecutorError(f"Objective plan duplicated bundle id {bundle_id}")
+        seen.add(bundle_id)
 
 
 def validate_objective_plan_contents(plan: dict[str, Any], objective: dict[str, Any]) -> None:
@@ -198,6 +218,51 @@ def validate_objective_plan_contents(plan: dict[str, Any], objective: dict[str, 
         for task_id in bundle["task_ids"]:
             if task_id not in task_ids:
                 raise ExecutorError(f"Bundle {bundle['bundle_id']} referenced unknown task {task_id}")
+
+
+def validate_objective_plan_inputs(project_root: Path, run_id: str, plan: dict[str, Any]) -> None:
+    for planned_task in plan["tasks"]:
+        preview_task = {
+            "schema": "task-assignment.v1",
+            "run_id": run_id,
+            "phase": plan["phase"],
+            "objective_id": plan["objective_id"],
+            "capability": planned_task["capability"],
+            "working_directory": planned_task["working_directory"],
+            "sandbox_mode": planned_task["sandbox_mode"],
+            "additional_directories": planned_task["additional_directories"],
+            "task_id": planned_task["task_id"],
+            "assigned_role": planned_task["assigned_role"],
+            "manager_role": derive_manager_role(project_root, plan["objective_id"], planned_task["assigned_role"]),
+            "acceptance_role": f"objectives.{plan['objective_id']}.acceptance-manager",
+            "objective": planned_task["objective"],
+            "inputs": planned_task["inputs"],
+            "expected_outputs": planned_task["expected_outputs"],
+            "done_when": planned_task["done_when"],
+            "depends_on": planned_task["depends_on"],
+            "validation": planned_task["validation"],
+            "collaboration_rules": planned_task["collaboration_rules"],
+        }
+        unresolved = sorted(collect_unresolved_input_refs(preview_resolved_inputs(project_root, run_id, preview_task)))
+        if unresolved:
+            raise ExecutorError(
+                f"Objective plan produced unresolved input refs for task {planned_task['task_id']}: "
+                + ", ".join(unresolved)
+            )
+
+
+def collect_unresolved_input_refs(value: Any) -> set[str]:
+    unresolved: set[str] = set()
+    if isinstance(value, dict):
+        unresolved_ref = value.get("unresolved_input_ref")
+        if isinstance(unresolved_ref, str):
+            unresolved.add(unresolved_ref)
+        for nested in value.values():
+            unresolved.update(collect_unresolved_input_refs(nested))
+    elif isinstance(value, list):
+        for nested in value:
+            unresolved.update(collect_unresolved_input_refs(nested))
+    return unresolved
 
 
 def materialize_objective_plan(project_root: Path, run_id: str, plan: dict[str, Any], *, replace: bool) -> None:
@@ -248,7 +313,7 @@ def derive_manager_role(project_root: Path, objective_id: str, assigned_role: st
     if role_name == "general-worker":
         return f"objectives.{objective_id}.objective-manager"
     candidate_role_name = role_name.replace("-worker", "-manager")
-    candidate_path = project_root / "orchestrator" / "roles" / "objectives" / objective_id / "approved" / f"{candidate_role_name}.md"
+    candidate_path = find_objective_root(project_root, objective_id) / "approved" / f"{candidate_role_name}.md"
     if candidate_path.exists():
         return f"objectives.{objective_id}.{candidate_role_name}"
     return f"objectives.{objective_id}.objective-manager"
