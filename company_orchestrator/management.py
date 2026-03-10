@@ -8,9 +8,10 @@ from typing import Any
 from .bundle_plans import objective_bundle_specs
 from .bundles import assemble_review_bundle, land_accepted_bundle, review_bundle
 from .executor import ExecutorError, TaskExecutionRuntime, execute_task
-from .filesystem import ensure_dir, read_json, write_json
-from .live import ensure_activity, initialize_live_run, record_event, update_activity
+from .filesystem import ensure_dir, load_optional_json, read_json, write_json
+from .live import activity_path, ensure_activity, initialize_live_run, record_event, update_activity
 from .parallelism import classify_parallel_safety, parallel_requested, warning
+from .recovery import reconcile_for_command
 from .reports import generate_phase_report
 
 
@@ -24,6 +25,7 @@ def run_phase(
     timeout_seconds: int = 300,
     max_concurrency: int = 3,
 ) -> dict[str, Any]:
+    reconcile_for_command(project_root, run_id, apply=True)
     run_dir = project_root / "runs" / run_id
     phase = active_phase(run_dir)
     tasks = phase_tasks(run_dir, phase)
@@ -65,6 +67,7 @@ def run_objective(
     timeout_seconds: int = 300,
     max_concurrency: int = 3,
 ) -> dict[str, Any]:
+    reconcile_for_command(project_root, run_id, apply=True)
     run_dir = project_root / "runs" / run_id
     phase = active_phase(run_dir)
     tasks = [task for task in phase_tasks(run_dir, phase) if task["objective_id"] == objective_id]
@@ -117,6 +120,7 @@ def schedule_tasks(
     timeout_seconds: int,
     max_concurrency: int,
 ) -> dict[str, Any]:
+    reconcile_for_command(project_root, run_id, apply=True)
     run_dir = project_root / "runs" / run_id
     initialize_live_run(project_root, run_id)
     reports_dir = run_dir / "reports"
@@ -214,35 +218,37 @@ def schedule_tasks(
         pending.pop(task["task_id"], None)
 
     for task in tasks:
-        ensure_activity(
-            project_root,
-            run_id,
-            activity_id=task["task_id"],
-            kind="task_execution",
-            entity_id=task["task_id"],
-            phase=task["phase"],
-            objective_id=task["objective_id"],
-            display_name=task["task_id"],
-            assigned_role=task["assigned_role"],
-            status="waiting_dependencies",
-            progress_stage="waiting_dependencies",
-            current_activity="Waiting for scheduler.",
-            prompt_path=None,
-            stdout_path=f"runs/{run_id}/executions/{task['task_id']}.stdout.jsonl",
-            stderr_path=f"runs/{run_id}/executions/{task['task_id']}.stderr.log",
-            output_path=f"runs/{run_id}/reports/{task['task_id']}.json",
-            dependency_blockers=list(task["depends_on"]),
-            parallel_execution_requested=parallel_requested(task),
-        )
-        record_event(
-            project_root,
-            run_id,
-            phase=task["phase"],
-            activity_id=task["task_id"],
-            event_type="task.discovered",
-            message=f"Discovered task {task['task_id']} for phase scheduling.",
-            payload={"depends_on": list(task["depends_on"]), "objective_id": task["objective_id"]},
-        )
+        existing_activity = load_optional_json(activity_path(run_dir, task["task_id"]))
+        if existing_activity is None:
+            ensure_activity(
+                project_root,
+                run_id,
+                activity_id=task["task_id"],
+                kind="task_execution",
+                entity_id=task["task_id"],
+                phase=task["phase"],
+                objective_id=task["objective_id"],
+                display_name=task["task_id"],
+                assigned_role=task["assigned_role"],
+                status="waiting_dependencies",
+                progress_stage="waiting_dependencies",
+                current_activity="Waiting for scheduler.",
+                prompt_path=None,
+                stdout_path=f"runs/{run_id}/executions/{task['task_id']}.stdout.jsonl",
+                stderr_path=f"runs/{run_id}/executions/{task['task_id']}.stderr.log",
+                output_path=f"runs/{run_id}/reports/{task['task_id']}.json",
+                dependency_blockers=list(task["depends_on"]),
+                parallel_execution_requested=parallel_requested(task),
+            )
+            record_event(
+                project_root,
+                run_id,
+                phase=task["phase"],
+                activity_id=task["task_id"],
+                event_type="task.discovered",
+                message=f"Discovered task {task['task_id']} for phase scheduling.",
+                payload={"depends_on": list(task["depends_on"]), "objective_id": task["objective_id"]},
+            )
 
     if not force:
         for task_id in list(pending):

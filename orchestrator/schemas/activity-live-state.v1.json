@@ -21,6 +21,14 @@
     "parallel_fallback_reason",
     "workspace_path",
     "branch_name",
+    "attempt",
+    "status_reason",
+    "interrupted_at",
+    "recovered_at",
+    "recovery_action",
+    "superseded_by",
+    "process_metadata",
+    "artifact_reconciliation",
     "current_activity",
     "prompt_path",
     "stdout_path",
@@ -36,7 +44,7 @@
     "schema": {"type": "string", "enum": ["activity-live-state.v1"]},
     "run_id": {"type": "string"},
     "activity_id": {"type": "string"},
-    "kind": {"type": "string", "enum": ["task_execution", "objective_plan"]},
+    "kind": {"type": "string", "enum": ["task_execution", "objective_plan", "capability_plan"]},
     "entity_id": {"type": "string"},
     "phase": {"type": "string", "enum": ["discovery", "design", "mvp-build", "polish"]},
     "objective_id": {"type": "string"},
@@ -47,6 +55,32 @@
     "progress_fraction": {"type": "number"},
     "queue_position": {"type": ["number", "null"]},
     "runner_id": {"type": ["string", "null"]},
+    "attempt": {"type": "number"},
+    "status_reason": {"type": ["string", "null"]},
+    "interrupted_at": {"type": ["string", "null"]},
+    "recovered_at": {"type": ["string", "null"]},
+    "recovery_action": {"type": ["string", "null"]},
+    "superseded_by": {"type": ["string", "null"]},
+    "process_metadata": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["pid", "started_at", "command", "cwd"],
+      "properties": {
+        "pid": {"type": ["number", "null"]},
+        "started_at": {"type": ["string", "null"]},
+        "command": {"type": ["string", "null"]},
+        "cwd": {"type": ["string", "null"]}
+      }
+    },
+    "artifact_reconciliation": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["status", "details"],
+      "properties": {
+        "status": {"type": "string"},
+        "details": {"type": "array", "items": {"type": "string"}}
+      }
+    },
     "warnings": {
       "type": "array",
       "items": {

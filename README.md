@@ -113,14 +113,33 @@ company-orchestrator run-phase run-001 --sandbox read-only --watch
 
 `inspect-activity` shows the activity metadata, full rendered prompt, latest live events, parallel fallback warnings, and the paths to stdout, stderr, workspace, branch, and the final output artifact.
 
+Recovery-aware monitoring is also built in:
+
+- activities can be marked `interrupted`, `recovering`, `recovered`, or `abandoned`
+- interrupted and recovered work appears in dedicated dashboard sections
+- activity detail views show attempt count, status reason, and recovery action
+- normal long-running commands reconcile stale state before starting new work
+
+Operator recovery commands:
+
+```bash
+company-orchestrator reconcile-run run-001
+company-orchestrator reconcile-run run-001 --apply
+company-orchestrator resume-phase run-001 --sandbox read-only --max-concurrency 3
+company-orchestrator retry-activity run-001 APP-A-DISC-001 --sandbox read-only
+```
+
+`reconcile-run` is a dry run by default and reports what would be reclassified. `resume-phase` applies reconciliation and continues safe incomplete work for the active phase. `retry-activity` starts a new attempt for a specific interrupted activity while preserving attempt lineage in the live dashboard and event history.
+
 ## Objective Planning
 
-`plan-objective` and `plan-phase` run an objective-manager through Codex to generate structured task decomposition.
+`plan-objective` and `plan-phase` now run a two-stage planning flow through Codex:
 
-- The manager returns `objective-plan.v1`.
-- Python validates the plan, writes it under `runs/<run-id>/manager-plans/`, and materializes the generated `task-assignment.v1` files.
-- The objective manager also defines `bundle_plan`, and `run-phase` now honors that bundle structure during acceptance review.
-- Planning prompts are intended to be self-contained. The objective manager should use the injected runtime context and planning inputs directly rather than exploring the repository.
+- The objective manager returns an `objective-outline.v1` describing capability lanes and cross-lane coordination.
+- One capability manager per lane then returns `capability-plan.v1` task bundles for that lane.
+- Python aggregates those capability plans into the final `objective-plan.v1`, validates it, writes it under `runs/<run-id>/manager-plans/`, and materializes the generated `task-assignment.v1` files.
+- `run-phase` continues to honor the resulting `bundle_plan` during deterministic acceptance review.
+- Planning prompts are intended to be self-contained. Objective and capability managers should use the injected runtime context and planning inputs directly rather than exploring the repository.
 - Use `--replace` if you want a new manager plan to overwrite the current objective's tasks for the active phase.
 
 ## Running Tests
@@ -184,4 +203,4 @@ App-specific assets for the todo example now live under:
 
 ## Current Scope
 
-This repo now includes a live Codex CLI executor path, Codex-powered objective-manager planning for task decomposition, and deterministic manager orchestration for task scheduling, bundle assembly, acceptance review, and phase-report generation. Acceptance remains deterministic Python logic; it is not yet a live Codex reviewer.
+This repo now includes a live Codex CLI executor path, Codex-powered objective-manager and capability-manager planning for task decomposition, parallel-safe task execution with worktree isolation, live monitoring, and deterministic manager orchestration for task scheduling, bundle assembly, acceptance review, and phase-report generation. Acceptance remains deterministic Python logic; it is not yet a live Codex reviewer.

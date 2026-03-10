@@ -9,6 +9,7 @@
     "accepted_bundles",
     "unresolved_risks",
     "parallelism_summary",
+    "recovery_summary",
     "proposed_role_changes",
     "recommendation",
     "human_approved"
@@ -57,6 +58,35 @@
             "additionalProperties": false,
             "properties": {
               "task_id": {"type": "string"},
+              "reason": {"type": "string"},
+              "artifact_path": {"type": "string"}
+            }
+          }
+        }
+      }
+    },
+    "recovery_summary": {
+      "type": "object",
+      "required": [
+        "interrupted_activities",
+        "recovered_activities",
+        "abandoned_attempts",
+        "incidents"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "interrupted_activities": {"type": "number"},
+        "recovered_activities": {"type": "number"},
+        "abandoned_attempts": {"type": "number"},
+        "incidents": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["activity_id", "status", "reason"],
+            "additionalProperties": false,
+            "properties": {
+              "activity_id": {"type": "string"},
+              "status": {"type": "string"},
               "reason": {"type": "string"},
               "artifact_path": {"type": "string"}
             }

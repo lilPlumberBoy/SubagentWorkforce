@@ -15,6 +15,7 @@ from .monitoring import inspect_activity, run_with_watch, watch_run
 from .objective_planner import plan_objective, plan_phase
 from .planner import decompose_goal, generate_role_files, initialize_run, promote_roles, suggest_team_proposals
 from .prompts import render_prompt
+from .recovery import reconcile_run
 from .reports import advance_phase, generate_phase_report, record_human_approval
 from .schemas import validate_document
 from .smoke import scaffold_smoke_test, simulate_context_echo_completion, verify_smoke_reports
@@ -105,6 +106,29 @@ def main() -> None:
     inspect_parser.add_argument("activity_id")
     inspect_parser.add_argument("--follow", action="store_true")
     inspect_parser.add_argument("--events", type=int, default=20)
+
+    reconcile_parser = subparsers.add_parser("reconcile-run")
+    reconcile_parser.add_argument("run_id")
+    reconcile_parser.add_argument("--apply", action="store_true")
+
+    resume_parser = subparsers.add_parser("resume-phase")
+    resume_parser.add_argument("run_id")
+    resume_parser.add_argument("--sandbox", default="read-only")
+    resume_parser.add_argument("--codex-path", default="codex")
+    resume_parser.add_argument("--force", action="store_true")
+    resume_parser.add_argument("--timeout-seconds", type=int, default=300)
+    resume_parser.add_argument("--max-concurrency", type=int, default=3)
+    resume_parser.add_argument("--watch", action="store_true")
+    resume_parser.add_argument("--watch-refresh-seconds", type=float, default=1.0)
+
+    retry_parser = subparsers.add_parser("retry-activity")
+    retry_parser.add_argument("run_id")
+    retry_parser.add_argument("activity_id")
+    retry_parser.add_argument("--sandbox", default="read-only")
+    retry_parser.add_argument("--codex-path", default="codex")
+    retry_parser.add_argument("--timeout-seconds", type=int, default=300)
+    retry_parser.add_argument("--watch", action="store_true")
+    retry_parser.add_argument("--watch-refresh-seconds", type=float, default=1.0)
 
     bundle_parser = subparsers.add_parser("assemble-bundle")
     bundle_parser.add_argument("run_id")
@@ -283,6 +307,38 @@ def main() -> None:
     if args.command == "inspect-activity":
         inspect_activity(project_root, args.run_id, args.activity_id, follow=args.follow, events=args.events)
         return
+    if args.command == "reconcile-run":
+        print_json(reconcile_run(project_root, args.run_id, apply=args.apply))
+        return
+    if args.command == "resume-phase":
+        operation = lambda: run_phase(
+                project_root,
+                args.run_id,
+                sandbox_mode=args.sandbox,
+                codex_path=args.codex_path,
+                force=args.force,
+                timeout_seconds=args.timeout_seconds,
+                max_concurrency=args.max_concurrency,
+            )
+        print_result(
+            run_maybe_watched(project_root, args.run_id, args.watch, args.watch_refresh_seconds, operation),
+            leading_blank_line=args.watch,
+        )
+        return
+    if args.command == "retry-activity":
+        operation = lambda: retry_activity(
+                project_root,
+                args.run_id,
+                args.activity_id,
+                sandbox_mode=args.sandbox,
+                codex_path=args.codex_path,
+                timeout_seconds=args.timeout_seconds,
+            )
+        print_result(
+            run_maybe_watched(project_root, args.run_id, args.watch, args.watch_refresh_seconds, operation),
+            leading_blank_line=args.watch,
+        )
+        return
     if args.command == "assemble-bundle":
         report_paths = [Path(path) for path in args.report_paths]
         print_json(
@@ -375,3 +431,35 @@ def run_maybe_watched(
     if not watch:
         return operation()
     return run_with_watch(project_root, run_id, operation, refresh_seconds=refresh_seconds)
+
+
+def retry_activity(
+    project_root: Path,
+    run_id: str,
+    activity_id: str,
+    *,
+    sandbox_mode: str,
+    codex_path: str,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    activity = read_json(project_root / "runs" / run_id / "live" / "activities" / f"{activity_id.replace(':', '__')}.json")
+    if activity["kind"] == "task_execution":
+        return execute_task(
+            project_root,
+            run_id,
+            activity["activity_id"],
+            sandbox_mode=sandbox_mode,
+            codex_path=codex_path,
+            timeout_seconds=timeout_seconds,
+            allow_recovery_blocked=True,
+        )
+    return plan_objective(
+        project_root,
+        run_id,
+        activity["objective_id"],
+        sandbox_mode=sandbox_mode,
+        codex_path=codex_path,
+        replace=False,
+        timeout_seconds=timeout_seconds,
+        allow_recovery_blocked=True,
+    )

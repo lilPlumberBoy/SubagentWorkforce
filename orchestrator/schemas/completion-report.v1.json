@@ -65,6 +65,16 @@
         }
       }
     },
+    "runtime_recovery": {
+      "type": "object",
+      "required": ["attempt", "recovery_action", "workspace_reused"],
+      "additionalProperties": false,
+      "properties": {
+        "attempt": {"type": "number"},
+        "recovery_action": {"type": ["string", "null"]},
+        "workspace_reused": {"type": "boolean"}
+      }
+    },
     "context_echo": {
       "type": "object",
       "required": ["role_id", "objective_id", "phase", "prompt_layers", "schema"],

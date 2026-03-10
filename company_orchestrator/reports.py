@@ -8,6 +8,7 @@ from .constants import PHASES
 from .filesystem import read_json, write_json, write_text
 from .live import initialize_live_run, record_event, refresh_run_state
 from .parallelism import summarize_parallelism_for_phase
+from .recovery import summarize_recovery_for_phase
 from .schemas import validate_document
 from .worktree_manager import WorktreeError, cleanup_phase_task_worktrees
 
@@ -73,6 +74,7 @@ def generate_phase_report(project_root: Path, run_id: str) -> tuple[dict[str, An
         if task["phase"] == phase:
             phase_tasks.append(task)
     parallelism_summary = summarize_parallelism_for_phase(run_dir, phase, phase_tasks)
+    recovery_summary = summarize_recovery_for_phase(project_root, run_id, phase)
     payload = {
         "schema": "phase-report.v1",
         "run_id": run_id,
@@ -82,6 +84,7 @@ def generate_phase_report(project_root: Path, run_id: str) -> tuple[dict[str, An
         "accepted_bundles": accepted_bundle_ids,
         "unresolved_risks": [bundle["bundle_id"] for bundle in rejected] + [bundle["bundle_id"] for bundle in blocked],
         "parallelism_summary": parallelism_summary,
+        "recovery_summary": recovery_summary,
         "proposed_role_changes": [],
         "recommendation": recommendation,
         "human_approved": False,
@@ -151,6 +154,20 @@ def render_phase_report_markdown(report: dict[str, Any]) -> str:
         lines.append("- incidents:")
         for incident in report["parallelism_summary"]["incidents"]:
             lines.append(f"  - {incident['task_id']}: {incident['reason']} ({incident['artifact_path']})")
+    else:
+        lines.append("- incidents: none")
+    lines.extend(
+        [
+            "",
+            "## Recovery Summary",
+            f"- interrupted activities: {report['recovery_summary']['interrupted_activities']}",
+            f"- recovered activities: {report['recovery_summary']['recovered_activities']}",
+            f"- abandoned attempts: {report['recovery_summary']['abandoned_attempts']}",
+        ]
+    )
+    if report["recovery_summary"]["incidents"]:
+        for incident in report["recovery_summary"]["incidents"]:
+            lines.append(f"- {incident['activity_id']}: {incident['status']} ({incident['reason']})")
     else:
         lines.append("- incidents: none")
     return "\n".join(lines)

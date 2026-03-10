@@ -124,6 +124,71 @@ def render_objective_planning_prompt(project_root: Path, run_id: str, objective_
     return metadata
 
 
+def render_capability_planning_prompt(
+    project_root: Path,
+    run_id: str,
+    objective_id: str,
+    capability: str,
+    objective_outline: dict[str, Any],
+) -> dict[str, Any]:
+    run_dir = project_root / "runs" / run_id
+    phase = read_json(run_dir / "phase-plan.json")["current_phase"]
+    files_loaded: list[str] = []
+    parts: list[str] = []
+
+    def add(path: Path) -> None:
+        parts.append(read_text(path))
+        files_loaded.append(str(path.relative_to(project_root)))
+
+    add(project_root / "orchestrator" / "roles" / "base" / "company.md")
+    add(project_root / "orchestrator" / "roles" / "base" / "manager.md")
+    add(project_root / "orchestrator" / "roles" / "base" / "capability-manager.md")
+
+    capability_path = project_root / "orchestrator" / "roles" / "capabilities" / f"{capability}.md"
+    if capability != "general" and capability_path.exists():
+        add(capability_path)
+
+    objective_root = find_objective_root(project_root, objective_id)
+    add(objective_root / "charter.md")
+    lane = next(item for item in objective_outline["capability_lanes"] if item["capability"] == capability)
+    role_name = lane["assigned_manager_role"].split(".")[-1]
+    role_path = objective_root / "approved" / f"{role_name}.md"
+    if role_path.exists():
+        add(role_path)
+
+    add(project_root / "orchestrator" / "phase-overlays" / f"{phase}.md")
+
+    planning_payload = build_capability_planning_payload(project_root, run_id, objective_id, capability, objective_outline)
+    runtime_context = build_capability_planning_runtime_context(
+        objective_id=objective_id,
+        phase=phase,
+        capability=capability,
+        lane=lane,
+        team=planning_payload["team"],
+        files_loaded=files_loaded,
+    )
+    prompt_text = "\n\n".join(
+        parts
+        + [
+            "# Runtime Context\n\n```json\n" + json.dumps(runtime_context, indent=2, sort_keys=True) + "\n```",
+            "# Capability Planning Inputs\n\n```json\n" + json.dumps(planning_payload, indent=2, sort_keys=True) + "\n```",
+        ]
+    )
+    prompt_path = run_dir / "manager-plans" / f"{phase}-{objective_id}-{capability}.prompt.md"
+    log_path = run_dir / "manager-plans" / f"{phase}-{objective_id}-{capability}.prompt.json"
+    write_text(prompt_path, prompt_text)
+    metadata = {
+        "run_id": run_id,
+        "phase": phase,
+        "objective_id": objective_id,
+        "capability": capability,
+        "files_loaded": files_loaded,
+        "prompt_path": str(prompt_path.relative_to(project_root)),
+    }
+    write_json(log_path, metadata)
+    return metadata
+
+
 def build_task_runtime_context(
     project_root: Path,
     run_id: str,
@@ -156,11 +221,36 @@ def build_planning_runtime_context(
 ) -> dict[str, Any]:
     return {
         "prompt_layers_loaded": files_loaded,
-        "planning_schema": "objective-plan.v1",
+        "planning_schema": "objective-outline.v1",
         "objective_id": objective_id,
         "phase": phase,
         "available_roles": [f"objectives.{objective_id}.{role['role_id']}" for role in team["roles"]],
         "worker_roles": [f"objectives.{objective_id}.{role['role_id']}" for role in team["roles"] if role["role_kind"] == "worker"],
+    }
+
+
+def build_capability_planning_runtime_context(
+    *,
+    objective_id: str,
+    phase: str,
+    capability: str,
+    lane: dict[str, Any],
+    team: dict[str, Any],
+    files_loaded: list[str],
+) -> dict[str, Any]:
+    return {
+        "prompt_layers_loaded": files_loaded,
+        "planning_schema": "capability-plan.v1",
+        "objective_id": objective_id,
+        "phase": phase,
+        "capability": capability,
+        "assigned_manager_role": lane["assigned_manager_role"],
+        "available_roles": [f"objectives.{objective_id}.{role['role_id']}" for role in team["roles"]],
+        "worker_roles": [
+            f"objectives.{objective_id}.{role['role_id']}"
+            for role in team["roles"]
+            if role["role_kind"] == "worker" and role.get("capability", "general") in {capability, "general"}
+        ],
     }
 
 
@@ -193,6 +283,33 @@ def build_planning_payload(project_root: Path, run_id: str, objective_id: str) -
             "artifact_paths": [item["path"] for item in prior_phase_artifacts],
             "phase_report_paths": prior_phase_phase_reports,
         },
+    }
+
+
+def build_capability_planning_payload(
+    project_root: Path,
+    run_id: str,
+    objective_id: str,
+    capability: str,
+    objective_outline: dict[str, Any],
+) -> dict[str, Any]:
+    planning_payload = build_planning_payload(project_root, run_id, objective_id)
+    lane = next(item for item in objective_outline["capability_lanes"] if item["capability"] == capability)
+    existing_capability_tasks = [
+        task
+        for task in planning_payload["existing_phase_tasks"]
+        if task.get("capability") in {capability, None}
+    ]
+    return {
+        "goal_markdown": planning_payload["goal_markdown"],
+        "objective": planning_payload["objective"],
+        "team": planning_payload["team"],
+        "objective_outline": objective_outline,
+        "capability_lane": lane,
+        "existing_capability_tasks": existing_capability_tasks,
+        "prior_phase_reports": planning_payload["prior_phase_reports"],
+        "prior_phase_artifacts": planning_payload["prior_phase_artifacts"],
+        "approved_inputs_catalog": planning_payload["approved_inputs_catalog"],
     }
 
 

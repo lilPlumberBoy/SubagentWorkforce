@@ -15,12 +15,16 @@ PROGRESS_BY_STAGE = {
     "prompt_rendered": 0.2,
     "launching": 0.3,
     "running": 0.6,
+    "recovering": 0.7,
     "finalizing": 0.85,
     "ready_for_bundle_review": 1.0,
     "blocked": 1.0,
     "needs_revision": 1.0,
     "completed": 1.0,
     "failed": 1.0,
+    "interrupted": 1.0,
+    "recovered": 1.0,
+    "abandoned": 1.0,
     "accepted": 1.0,
     "rejected": 1.0,
     "skipped_existing": 1.0,
@@ -32,6 +36,9 @@ TERMINAL_ACTIVITY_STATUSES = {
     "needs_revision",
     "completed",
     "failed",
+    "interrupted",
+    "recovered",
+    "abandoned",
     "accepted",
     "rejected",
     "skipped_existing",
@@ -81,6 +88,10 @@ def plan_activity_id(phase: str, objective_id: str) -> str:
     return f"plan:{phase}:{objective_id}"
 
 
+def capability_plan_activity_id(phase: str, objective_id: str, capability: str) -> str:
+    return f"plan:{phase}:{objective_id}:{capability}"
+
+
 def activity_path(run_dir: Path, activity_id: str) -> Path:
     return run_dir / "live" / "activities" / f"{activity_id.replace(':', '__')}.json"
 
@@ -114,13 +125,26 @@ def ensure_activity(
     parallel_fallback_reason: str | None = None,
     workspace_path: str | None = None,
     branch_name: str | None = None,
+    attempt: int | None = None,
+    status_reason: str | None = None,
+    interrupted_at: str | None = None,
+    recovered_at: str | None = None,
+    recovery_action: str | None = None,
+    superseded_by: str | None = None,
+    process_metadata: dict[str, Any] | None = None,
+    artifact_reconciliation: dict[str, Any] | None = None,
+    begin_attempt: bool = False,
 ) -> dict[str, Any]:
     run_dir = project_root / "runs" / run_id
     with run_lock(run_id):
         ensure_dir(run_dir / "live" / "activities")
         activity_file = activity_path(run_dir, activity_id)
-        existing = load_optional_json(activity_file)
+        existing_payload = load_optional_json(activity_file)
+        existing = normalize_activity_payload(existing_payload) if existing_payload is not None else None
         started_at = existing["started_at"] if existing else now_timestamp()
+        attempt_value = int(existing.get("attempt", 1)) if existing else 1
+        if begin_attempt:
+            attempt_value = (int(existing.get("attempt", 1)) + 1) if existing else 1
         payload = {
             "schema": "activity-live-state.v1",
             "run_id": run_id,
@@ -136,6 +160,18 @@ def ensure_activity(
             "progress_fraction": progress_fraction if progress_fraction is not None else progress_for_stage(progress_stage or status),
             "queue_position": queue_position,
             "runner_id": runner_id,
+            "attempt": attempt if attempt is not None else attempt_value,
+            "status_reason": status_reason if status_reason is not None else (existing.get("status_reason") if existing else None),
+            "interrupted_at": interrupted_at if interrupted_at is not None else (existing.get("interrupted_at") if existing else None),
+            "recovered_at": recovered_at if recovered_at is not None else (existing.get("recovered_at") if existing else None),
+            "recovery_action": recovery_action if recovery_action is not None else (existing.get("recovery_action") if existing else None),
+            "superseded_by": superseded_by if superseded_by is not None else (existing.get("superseded_by") if existing else None),
+            "process_metadata": process_metadata if process_metadata is not None else (existing.get("process_metadata") if existing else None),
+            "artifact_reconciliation": (
+                artifact_reconciliation
+                if artifact_reconciliation is not None
+                else (existing.get("artifact_reconciliation") if existing else None)
+            ),
             "warnings": warnings if warnings is not None else (existing.get("warnings", []) if existing else []),
             "parallel_execution_requested": (
                 parallel_execution_requested
@@ -178,9 +214,13 @@ def update_activity(
 ) -> dict[str, Any]:
     run_dir = project_root / "runs" / run_id
     with run_lock(run_id):
-        payload = read_json(activity_path(run_dir, activity_id))
+        payload = normalize_activity_payload(read_json(activity_path(run_dir, activity_id)))
         payload.update({key: value for key, value in updates.items() if value is not None or key in updates})
         payload["updated_at"] = now_timestamp()
+        if "status" in updates and payload["status"] == "interrupted" and not payload.get("interrupted_at"):
+            payload["interrupted_at"] = payload["updated_at"]
+        if "status" in updates and payload["status"] == "recovered" and not payload.get("recovered_at"):
+            payload["recovered_at"] = payload["updated_at"]
         if "status" in updates and "progress_stage" not in updates:
             payload["progress_stage"] = payload["status"]
         progress_stage = payload.get("progress_stage") or payload["status"]
@@ -275,7 +315,7 @@ def append_activity_warning(
     message: str,
 ) -> dict[str, Any]:
     with run_lock(run_id):
-        payload = read_json(activity_path(project_root / "runs" / run_id, activity_id))
+        payload = normalize_activity_payload(read_json(activity_path(project_root / "runs" / run_id, activity_id)))
         warnings = list(payload.get("warnings", []))
         warning = {"code": code, "message": message}
         if warning not in warnings:
@@ -288,11 +328,71 @@ def append_activity_warning(
         return payload
 
 
+def mark_activity_interrupted(
+    project_root: Path,
+    run_id: str,
+    activity_id: str,
+    *,
+    reason: str,
+    artifact_reconciliation: dict[str, Any] | None = None,
+    recovery_action: str | None = None,
+) -> dict[str, Any]:
+    return update_activity(
+        project_root,
+        run_id,
+        activity_id,
+        status="interrupted",
+        progress_stage="interrupted",
+        status_reason=reason,
+        interrupted_at=now_timestamp(),
+        recovery_action=recovery_action,
+        artifact_reconciliation=artifact_reconciliation,
+    )
+
+
+def mark_activity_recovered(
+    project_root: Path,
+    run_id: str,
+    activity_id: str,
+    *,
+    reason: str,
+    recovery_action: str,
+    artifact_reconciliation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return update_activity(
+        project_root,
+        run_id,
+        activity_id,
+        status="recovered",
+        progress_stage="recovered",
+        status_reason=reason,
+        recovered_at=now_timestamp(),
+        recovery_action=recovery_action,
+        artifact_reconciliation=artifact_reconciliation,
+        current_activity=reason,
+    )
+
+
+def process_alive(process_metadata: dict[str, Any] | None) -> bool:
+    if not process_metadata:
+        return False
+    pid = process_metadata.get("pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        import os
+
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
 def list_activities(project_root: Path, run_id: str, *, phase: str | None = None) -> list[dict[str, Any]]:
     run_dir = project_root / "runs" / run_id
     activities = []
     for path in sorted((run_dir / "live" / "activities").glob("*.json")):
-        payload = read_json(path)
+        payload = normalize_activity_payload(read_json(path))
         if phase is None or payload["phase"] == phase:
             activities.append(payload)
     return activities
@@ -306,7 +406,7 @@ def read_run_state(project_root: Path, run_id: str) -> dict[str, Any]:
 
 
 def read_activity(project_root: Path, run_id: str, activity_id: str) -> dict[str, Any]:
-    return read_json(activity_path(project_root / "runs" / run_id, activity_id))
+    return normalize_activity_payload(read_json(activity_path(project_root / "runs" / run_id, activity_id)))
 
 
 def read_events(project_root: Path, run_id: str, *, activity_id: str | None = None) -> list[dict[str, Any]]:
@@ -332,3 +432,26 @@ def read_json_line(line: str) -> dict[str, Any]:
 
 def progress_for_stage(stage: str) -> float:
     return PROGRESS_BY_STAGE.get(stage, PROGRESS_BY_STAGE.get("running", 0.6))
+
+
+def is_terminal_activity_status(status: str) -> bool:
+    return status in TERMINAL_ACTIVITY_STATUSES
+
+
+def normalize_activity_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(payload)
+    normalized.setdefault("attempt", 1)
+    normalized.setdefault("status_reason", None)
+    normalized.setdefault("interrupted_at", None)
+    normalized.setdefault("recovered_at", None)
+    normalized.setdefault("recovery_action", None)
+    normalized.setdefault("superseded_by", None)
+    normalized.setdefault("process_metadata", None)
+    normalized.setdefault("artifact_reconciliation", None)
+    normalized.setdefault("warnings", [])
+    normalized.setdefault("parallel_execution_requested", False)
+    normalized.setdefault("parallel_execution_granted", False)
+    normalized.setdefault("parallel_fallback_reason", None)
+    normalized.setdefault("workspace_path", None)
+    normalized.setdefault("branch_name", None)
+    return normalized

@@ -90,13 +90,22 @@ def build_run_dashboard(project_root: Path, run_id: str):
     run_state = read_run_state(project_root, run_id)
     current_phase = run_state["current_phase"]
     activities = list_activities(project_root, run_id, phase=current_phase)
-    active_plans = [activity for activity in activities if activity["kind"] == "objective_plan" and is_active(activity)]
+    active_plans = [
+        activity
+        for activity in activities
+        if activity["kind"] in {"objective_plan", "capability_plan"} and is_active(activity)
+    ]
     active_tasks = [activity for activity in activities if activity["kind"] == "task_execution" and is_active(activity)]
     queued_tasks = [activity for activity in activities if activity["kind"] == "task_execution" and activity["status"] == "queued"]
     blocked_tasks = [
         activity
         for activity in activities
         if activity["kind"] == "task_execution" and activity["status"] in {"waiting_dependencies", "blocked"}
+    ]
+    interrupted_activities = [
+        activity
+        for activity in activities
+        if activity["status"] in {"interrupted", "recovered", "abandoned"}
     ]
     objective_map = load_optional_json(project_root / "runs" / run_id / "objective-map.json") or {"objectives": []}
     objectives = objective_map.get("objectives", [])
@@ -109,8 +118,11 @@ def build_run_dashboard(project_root: Path, run_id: str):
         build_activity_table("Active Task Activities", active_tasks),
         build_activity_table("Queued Tasks", queued_tasks),
         build_activity_table("Blocked Tasks", blocked_tasks),
+        build_activity_table("Interrupted / Recovered Activities", interrupted_activities),
         build_warning_rollup_panel(activities),
+        build_recovery_rollup_panel(activities),
         build_phase_progress_panel(objectives, activities),
+        build_activity_history_panel(activities),
     ]
     return Group(*renderables)
 
@@ -166,7 +178,7 @@ def build_objective_progress_table(objectives: list[dict[str, Any]], activities:
         objective_id = objective["objective_id"]
         fraction = objective_progress_fraction(objective_id, activities)
         statuses = summarize_objective_statuses(objective_id, activities)
-        table.add_row(objective_id, progress_renderable(fraction), statuses)
+        table.add_row(display_label(objective_id), progress_renderable(fraction), statuses)
     return table
 
 
@@ -184,9 +196,9 @@ def build_activity_table(title: str, activities: list[dict[str, Any]]) -> Table:
     for activity in sorted(activities, key=activity_sort_key):
         warnings_text = "; ".join(item["message"] for item in activity.get("warnings", [])) or "-"
         table.add_row(
-            activity["activity_id"],
-            activity["objective_id"],
-            activity["status"],
+            display_label(activity["activity_id"], activity.get("attempt", 1)),
+            display_label(activity["objective_id"]),
+            status_label(activity),
             warnings_text,
             progress_renderable(activity["progress_fraction"]),
             activity.get("current_activity") or "-",
@@ -202,8 +214,13 @@ def build_activity_summary_panel(activity: dict[str, Any]) -> Panel:
         f"Phase: {activity['phase']}",
         f"Role: {activity.get('assigned_role') or '-'}",
         f"Status: {activity['status']}",
+        f"Attempt: {activity.get('attempt', 1)}",
         f"Stage: {activity['progress_stage']}",
         f"Progress: {percent_text(activity['progress_fraction'])}",
+        f"Status reason: {activity.get('status_reason') or '-'}",
+        f"Recovery action: {activity.get('recovery_action') or '-'}",
+        f"Interrupted at: {activity.get('interrupted_at') or '-'}",
+        f"Recovered at: {activity.get('recovered_at') or '-'}",
         f"Parallel requested: {activity.get('parallel_execution_requested', False)}",
         f"Parallel granted: {activity.get('parallel_execution_granted', False)}",
         f"Fallback reason: {activity.get('parallel_fallback_reason') or '-'}",
@@ -255,6 +272,41 @@ def build_warning_rollup_panel(activities: list[dict[str, Any]]) -> Panel:
     return Panel("\n".join(warning_lines), title="Parallelism Warnings", border_style="red")
 
 
+def build_recovery_rollup_panel(activities: list[dict[str, Any]]) -> Panel:
+    lines = []
+    for activity in sorted(activities, key=activity_sort_key):
+        if activity["status"] not in {"interrupted", "recovered", "abandoned"}:
+            continue
+        lines.append(
+            f"- {display_label(activity['activity_id'], activity.get('attempt', 1))}: "
+            f"{activity['status']} ({activity.get('status_reason') or activity.get('recovery_action') or '-'})"
+        )
+    if not lines:
+        lines = ["- none"]
+    return Panel("\n".join(lines), title="Recovery Actions", border_style="yellow")
+
+
+def build_activity_history_panel(activities: list[dict[str, Any]]) -> Panel:
+    terminal = sorted(
+        [
+            activity
+            for activity in activities
+            if activity["status"] in {"completed", "recovered", "interrupted", "abandoned", "failed"}
+        ],
+        key=lambda item: item["updated_at"],
+        reverse=True,
+    )[:12]
+    lines = []
+    for activity in terminal:
+        lines.append(
+            f"- {display_label(activity['activity_id'], activity.get('attempt', 1))}: "
+            f"{activity['status']} at {activity['updated_at']}"
+        )
+    if not lines:
+        lines = ["- none"]
+    return Panel("\n".join(lines), title="Activity History", border_style="green")
+
+
 def load_prompt_text(project_root: Path, prompt_path: str | None) -> str:
     if not prompt_path:
         return "No prompt path recorded."
@@ -294,7 +346,21 @@ def percent_text(fraction: float) -> str:
 
 
 def is_active(activity: dict[str, Any]) -> bool:
-    return activity["status"] not in {"queued", "waiting_dependencies", "ready_for_bundle_review", "blocked", "needs_revision", "completed", "failed", "accepted", "rejected", "skipped_existing"}
+    return activity["status"] not in {
+        "queued",
+        "waiting_dependencies",
+        "ready_for_bundle_review",
+        "blocked",
+        "needs_revision",
+        "completed",
+        "failed",
+        "accepted",
+        "rejected",
+        "skipped_existing",
+        "interrupted",
+        "recovered",
+        "abandoned",
+    }
 
 
 def activity_sort_key(activity: dict[str, Any]) -> tuple[int, str]:
@@ -302,3 +368,15 @@ def activity_sort_key(activity: dict[str, Any]) -> tuple[int, str]:
     if queue_position is None:
         return (999999, activity["activity_id"])
     return (int(queue_position), activity["activity_id"])
+
+
+def display_label(value: str, attempt: int | None = None) -> str:
+    if attempt is None:
+        return value
+    return f"[{attempt}] {value}"
+
+
+def status_label(activity: dict[str, Any]) -> str:
+    if activity.get("status_reason"):
+        return f"{activity['status']} ({activity['status_reason']})"
+    return activity["status"]

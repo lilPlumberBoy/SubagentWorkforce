@@ -23,8 +23,10 @@ from company_orchestrator.monitoring import build_activity_detail, build_run_das
 from company_orchestrator.objective_planner import build_planning_prompt, plan_objective, plan_phase
 from company_orchestrator.planner import generate_role_files, initialize_run, suggest_team_proposals
 from company_orchestrator.prompts import build_planning_payload, render_prompt
+from company_orchestrator.recovery import RecoveryBlockedError, reconcile_run
 from company_orchestrator.reports import advance_phase, generate_phase_report, record_human_approval
 from company_orchestrator.smoke import scaffold_smoke_test, simulate_context_echo_completion, verify_smoke_reports
+from company_orchestrator.live import ensure_activity, read_activity, record_event, update_activity
 from company_orchestrator.worktree_manager import commit_task_workspace, ensure_run_integration_workspace, ensure_task_workspace
 from company_orchestrator.bundles import land_accepted_bundle
 
@@ -954,12 +956,14 @@ class OrchestratorTests(unittest.TestCase):
 
     def test_plan_objective_materializes_tasks_from_manager_plan(self) -> None:
         scaffold_planning_run(self.project_root, "planned", ["frontend"])
-        final_payload = {
-            "schema": "objective-plan.v1",
+        objective_outline = objective_outline_for_objective("planned", "app-a", ["frontend"])
+        capability_plan = {
+            "schema": "capability-plan.v1",
             "run_id": "planned",
             "phase": "discovery",
             "objective_id": "app-a",
-            "summary": "Discovery plan for app-a",
+            "capability": "frontend",
+            "summary": "Frontend discovery plan for app-a",
             "tasks": [
                 {
                     "task_id": "APP-A-DISC-001",
@@ -969,6 +973,10 @@ class OrchestratorTests(unittest.TestCase):
                     "inputs": ["runs/planned/goal.md"],
                     "expected_outputs": ["boundary notes"],
                     "done_when": ["boundary is described"],
+                    "execution_mode": "read_only",
+                    "parallel_policy": "allow",
+                    "owned_paths": [],
+                    "shared_asset_ids": [],
                     "depends_on": [],
                     "validation": [{"id": "manager-check", "command": "review-boundary-notes"}],
                     "collaboration_rules": [],
@@ -984,6 +992,10 @@ class OrchestratorTests(unittest.TestCase):
                     "inputs": ["runs/planned/goal.md"],
                     "expected_outputs": ["dependency notes"],
                     "done_when": ["dependencies are listed"],
+                    "execution_mode": "read_only",
+                    "parallel_policy": "allow",
+                    "owned_paths": [],
+                    "shared_asset_ids": [],
                     "depends_on": ["APP-A-DISC-001"],
                     "validation": [{"id": "manager-check", "command": "review-dependency-notes"}],
                     "collaboration_rules": [],
@@ -994,7 +1006,7 @@ class OrchestratorTests(unittest.TestCase):
             ],
             "bundle_plan": [
                 {
-                    "bundle_id": "app-a-discovery-bundle-1",
+                    "bundle_id": "discovery-bundle-1",
                     "task_ids": ["APP-A-DISC-001", "APP-A-DISC-002"],
                     "summary": "Complete app-a discovery package"
                 }
@@ -1002,16 +1014,33 @@ class OrchestratorTests(unittest.TestCase):
             "dependency_notes": ["Task 2 depends on task 1"],
             "collaboration_edges": []
         }
-        stdout = "\n".join(
-            [
-                '{"type":"thread.started","thread_id":"plan-thread-123"}',
-                '{"type":"turn.started"}',
-                json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(final_payload)}),
-                '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}'
-            ]
-        )
-        completed = completed_process(stdout=stdout, stderr="", returncode=0)
-        with patch("company_orchestrator.objective_planner.run_codex_command", return_value=completed):
+        responses = [
+            completed_process(
+                stdout="\n".join(
+                    [
+                        '{"type":"thread.started","thread_id":"plan-thread-123"}',
+                        '{"type":"turn.started"}',
+                        json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(objective_outline)}),
+                        '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}'
+                    ]
+                ),
+                stderr="",
+                returncode=0,
+            ),
+            completed_process(
+                stdout="\n".join(
+                    [
+                        '{"type":"thread.started","thread_id":"frontend-thread-123"}',
+                        '{"type":"turn.started"}',
+                        json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(capability_plan)}),
+                        '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}'
+                    ]
+                ),
+                stderr="",
+                returncode=0,
+            ),
+        ]
+        with patch("company_orchestrator.objective_planner.run_codex_command", side_effect=responses):
             summary = plan_objective(self.project_root, "planned", "app-a")
         self.assertEqual(summary["task_ids"], ["APP-A-DISC-001", "APP-A-DISC-002"])
         planned_task = read_json(self.project_root / "runs" / "planned" / "tasks" / "APP-A-DISC-001.json")
@@ -1022,23 +1051,37 @@ class OrchestratorTests(unittest.TestCase):
 
     def test_plan_objective_streams_live_activity_updates_and_events(self) -> None:
         scaffold_planning_run(self.project_root, "planned-live", ["frontend"])
-        final_payload = planned_payload_for_objective("planned-live", "app-a")
-        lines = [
+        objective_outline = objective_outline_for_objective("planned-live", "app-a", ["frontend"])
+        capability_plan = capability_plan_for_objective("planned-live", "app-a", "frontend")
+        objective_lines = [
             '{"type":"thread.started","thread_id":"plan-thread-live"}',
             '{"type":"turn.started"}',
             json_line_event(
                 "item.started",
                 {"id": "cmd-1", "type": "command_execution", "command": "plan objective"},
             ),
-            json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(final_payload)}),
+            json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(objective_outline)}),
             '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
         ]
+        capability_stdout = "\n".join(
+            [
+                '{"type":"thread.started","thread_id":"capability-thread-live"}',
+                '{"type":"turn.started"}',
+                json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(capability_plan)}),
+                '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
+            ]
+        )
+        call_count = {"value": 0}
 
         def side_effect(*_: object, **kwargs: object):
+            index = call_count["value"]
+            call_count["value"] += 1
             callback = kwargs["on_stdout_line"]
-            for line in lines:
-                callback(line)
-            return completed_process(stdout="\n".join(lines), stderr="", returncode=0)
+            if index == 0:
+                for line in objective_lines:
+                    callback(line)
+                return completed_process(stdout="\n".join(objective_lines), stderr="", returncode=0)
+            return completed_process(stdout=capability_stdout, stderr="", returncode=0)
 
         with patch("company_orchestrator.objective_planner.run_codex_command", side_effect=side_effect):
             plan_objective(self.project_root, "planned-live", "app-a")
@@ -1056,17 +1099,35 @@ class OrchestratorTests(unittest.TestCase):
 
     def test_plan_objective_normalizes_model_generated_run_id(self) -> None:
         scaffold_planning_run(self.project_root, "planned-run-id", ["frontend"])
-        final_payload = planned_payload_for_objective("wrong-run-id", "app-a")
-        stdout = "\n".join(
-            [
-                '{"type":"thread.started","thread_id":"plan-thread-run-id"}',
-                '{"type":"turn.started"}',
-                json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(final_payload)}),
-                '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}'
-            ]
-        )
-        completed = completed_process(stdout=stdout, stderr="", returncode=0)
-        with patch("company_orchestrator.objective_planner.run_codex_command", return_value=completed):
+        objective_outline = objective_outline_for_objective("wrong-run-id", "app-a", ["frontend"])
+        capability_plan = capability_plan_for_objective("planned-run-id", "app-a", "frontend")
+        responses = [
+            completed_process(
+                stdout="\n".join(
+                    [
+                        '{"type":"thread.started","thread_id":"plan-thread-run-id"}',
+                        '{"type":"turn.started"}',
+                        json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(objective_outline)}),
+                        '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}'
+                    ]
+                ),
+                stderr="",
+                returncode=0,
+            ),
+            completed_process(
+                stdout="\n".join(
+                    [
+                        '{"type":"thread.started","thread_id":"capability-thread-run-id"}',
+                        '{"type":"turn.started"}',
+                        json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(capability_plan)}),
+                        '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}'
+                    ]
+                ),
+                stderr="",
+                returncode=0,
+            ),
+        ]
+        with patch("company_orchestrator.objective_planner.run_codex_command", side_effect=responses):
             summary = plan_objective(self.project_root, "planned-run-id", "app-a")
         self.assertEqual(summary["identity_adjustments"]["run_id"]["from"], "wrong-run-id")
         self.assertEqual(summary["identity_adjustments"]["run_id"]["to"], "planned-run-id")
@@ -1075,44 +1136,152 @@ class OrchestratorTests(unittest.TestCase):
 
     def test_plan_objective_prefixes_bundle_ids_with_objective_id(self) -> None:
         scaffold_planning_run(self.project_root, "planned-bundles", ["frontend"])
-        final_payload = planned_payload_for_objective("planned-bundles", "app-a")
-        final_payload["bundle_plan"] = [
+        objective_outline = objective_outline_for_objective("planned-bundles", "app-a", ["frontend"])
+        capability_plan = capability_plan_for_objective("planned-bundles", "app-a", "frontend")
+        capability_plan["bundle_plan"] = [
             {
                 "bundle_id": "bundle-discovery-core",
-                "task_ids": ["APP-A-DISC-001"],
+                "task_ids": ["APP-A-FRONTEND-001"],
                 "summary": "Unscoped bundle id from model",
             }
         ]
-        stdout = "\n".join(
-            [
-                '{"type":"thread.started","thread_id":"plan-thread-bundle-id"}',
-                '{"type":"turn.started"}',
-                json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(final_payload)}),
-                '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}'
-            ]
-        )
-        completed = completed_process(stdout=stdout, stderr="", returncode=0)
-        with patch("company_orchestrator.objective_planner.run_codex_command", return_value=completed):
+        responses = [
+            completed_process(
+                stdout="\n".join(
+                    [
+                        '{"type":"thread.started","thread_id":"plan-thread-bundle-id"}',
+                        '{"type":"turn.started"}',
+                        json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(objective_outline)}),
+                        '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}'
+                    ]
+                ),
+                stderr="",
+                returncode=0,
+            ),
+            completed_process(
+                stdout="\n".join(
+                    [
+                        '{"type":"thread.started","thread_id":"capability-thread-bundle-id"}',
+                        '{"type":"turn.started"}',
+                        json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(capability_plan)}),
+                        '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}'
+                    ]
+                ),
+                stderr="",
+                returncode=0,
+            ),
+        ]
+        with patch("company_orchestrator.objective_planner.run_codex_command", side_effect=responses):
             summary = plan_objective(self.project_root, "planned-bundles", "app-a")
         self.assertEqual(summary["bundle_ids"], ["app-a-bundle-discovery-core"])
         manager_plan = read_json(self.project_root / "runs" / "planned-bundles" / "manager-plans" / "discovery-app-a.json")
         self.assertEqual(manager_plan["bundle_plan"][0]["bundle_id"], "app-a-bundle-discovery-core")
 
+    def test_plan_objective_aggregates_capability_manager_plans(self) -> None:
+        scaffold_planning_run(self.project_root, "planned-capability", ["frontend", "backend"])
+        objective_outline = objective_outline_for_objective("planned-capability", "app-a", ["frontend", "backend"])
+        frontend_plan = capability_plan_for_objective("planned-capability", "app-a", "frontend")
+        backend_plan = capability_plan_for_objective("planned-capability", "app-a", "backend")
+        responses = [
+            completed_process(
+                stdout="\n".join(
+                    [
+                        '{"type":"thread.started","thread_id":"objective-thread"}',
+                        '{"type":"turn.started"}',
+                        json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(objective_outline)}),
+                        '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
+                    ]
+                ),
+                stderr="",
+                returncode=0,
+            ),
+            completed_process(
+                stdout="\n".join(
+                    [
+                        '{"type":"thread.started","thread_id":"frontend-thread"}',
+                        '{"type":"turn.started"}',
+                        json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(frontend_plan)}),
+                        '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
+                    ]
+                ),
+                stderr="",
+                returncode=0,
+            ),
+            completed_process(
+                stdout="\n".join(
+                    [
+                        '{"type":"thread.started","thread_id":"backend-thread"}',
+                        '{"type":"turn.started"}',
+                        json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(backend_plan)}),
+                        '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
+                    ]
+                ),
+                stderr="",
+                returncode=0,
+            ),
+        ]
+        with patch("company_orchestrator.objective_planner.run_codex_command", side_effect=responses):
+            summary = plan_objective(self.project_root, "planned-capability", "app-a")
+        self.assertEqual(summary["planning_mode"], "capability_managed")
+        self.assertEqual(len(summary["capability_summaries"]), 2)
+        task_ids = summary["task_ids"]
+        self.assertIn("APP-A-FRONTEND-001", task_ids)
+        self.assertIn("APP-A-BACKEND-001", task_ids)
+        manager_plan = read_json(
+            self.project_root / "runs" / "planned-capability" / "manager-plans" / "discovery-app-a.json"
+        )
+        self.assertEqual(manager_plan["schema"], "objective-plan.v1")
+        self.assertEqual(
+            {task["task_id"] for task in manager_plan["tasks"]},
+            {"APP-A-FRONTEND-001", "APP-A-BACKEND-001"},
+        )
+        outline = read_json(
+            self.project_root / "runs" / "planned-capability" / "manager-plans" / "discovery-app-a.outline.json"
+        )
+        self.assertEqual(len(outline["capability_lanes"]), 2)
+        capability_activity = read_json(
+            self.project_root
+            / "runs"
+            / "planned-capability"
+            / "live"
+            / "activities"
+            / "plan__discovery__app-a__frontend.json"
+        )
+        self.assertEqual(capability_activity["kind"], "capability_plan")
+
     def test_plan_objective_rejects_unresolved_generated_inputs(self) -> None:
         scaffold_planning_run(self.project_root, "planned-unresolved", ["frontend"])
-        final_payload = planned_payload_for_objective("planned-unresolved", "app-a")
-        final_payload["tasks"][0]["inputs"] = ["Completely imaginary planning input"]
-        stdout = "\n".join(
-            [
-                '{"type":"thread.started","thread_id":"plan-thread-unresolved"}',
-                '{"type":"turn.started"}',
-                json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(final_payload)}),
-                '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}'
-            ]
-        )
-        completed = completed_process(stdout=stdout, stderr="", returncode=0)
-        with patch("company_orchestrator.objective_planner.run_codex_command", return_value=completed):
-            with self.assertRaisesRegex(ExecutorError, "unresolved input refs for task APP-A-DISC-001"):
+        objective_outline = objective_outline_for_objective("planned-unresolved", "app-a", ["frontend"])
+        capability_plan = capability_plan_for_objective("planned-unresolved", "app-a", "frontend")
+        capability_plan["tasks"][0]["inputs"] = ["Completely imaginary planning input"]
+        responses = [
+            completed_process(
+                stdout="\n".join(
+                    [
+                        '{"type":"thread.started","thread_id":"plan-thread-unresolved"}',
+                        '{"type":"turn.started"}',
+                        json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(objective_outline)}),
+                        '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}'
+                    ]
+                ),
+                stderr="",
+                returncode=0,
+            ),
+            completed_process(
+                stdout="\n".join(
+                    [
+                        '{"type":"thread.started","thread_id":"capability-thread-unresolved"}',
+                        '{"type":"turn.started"}',
+                        json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(capability_plan)}),
+                        '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}'
+                    ]
+                ),
+                stderr="",
+                returncode=0,
+            ),
+        ]
+        with patch("company_orchestrator.objective_planner.run_codex_command", side_effect=responses):
+            with self.assertRaisesRegex(ExecutorError, "unresolved input refs for task APP-A-FRONTEND-001"):
                 plan_objective(self.project_root, "planned-unresolved", "app-a")
 
     def test_planning_prompt_forbids_repo_exploration(self) -> None:
@@ -1144,12 +1313,14 @@ class OrchestratorTests(unittest.TestCase):
 
     def test_run_phase_uses_manager_generated_bundle_plan(self) -> None:
         scaffold_planning_run(self.project_root, "planned-phase", ["frontend"])
-        final_payload = {
-            "schema": "objective-plan.v1",
+        objective_outline = objective_outline_for_objective("planned-phase", "app-a", ["frontend"])
+        capability_plan = {
+            "schema": "capability-plan.v1",
             "run_id": "planned-phase",
             "phase": "discovery",
             "objective_id": "app-a",
-            "summary": "Discovery plan for app-a",
+            "capability": "frontend",
+            "summary": "Discovery capability plan for app-a",
             "tasks": [
                 {
                     "task_id": "APP-A-DISC-001",
@@ -1159,6 +1330,10 @@ class OrchestratorTests(unittest.TestCase):
                     "inputs": [],
                     "expected_outputs": ["note 1"],
                     "done_when": ["task one complete"],
+                    "execution_mode": "read_only",
+                    "parallel_policy": "allow",
+                    "owned_paths": [],
+                    "shared_asset_ids": [],
                     "depends_on": [],
                     "validation": [{"id": "manager-check", "command": "check-1"}],
                     "collaboration_rules": [],
@@ -1174,6 +1349,10 @@ class OrchestratorTests(unittest.TestCase):
                     "inputs": [],
                     "expected_outputs": ["note 2"],
                     "done_when": ["task two complete"],
+                    "execution_mode": "read_only",
+                    "parallel_policy": "allow",
+                    "owned_paths": [],
+                    "shared_asset_ids": [],
                     "depends_on": [],
                     "validation": [{"id": "manager-check", "command": "check-2"}],
                     "collaboration_rules": [],
@@ -1184,12 +1363,12 @@ class OrchestratorTests(unittest.TestCase):
             ],
             "bundle_plan": [
                 {
-                    "bundle_id": "app-a-discovery-bundle-1",
+                    "bundle_id": "discovery-bundle-1",
                     "task_ids": ["APP-A-DISC-001"],
                     "summary": "First discovery bundle"
                 },
                 {
-                    "bundle_id": "app-a-discovery-bundle-2",
+                    "bundle_id": "discovery-bundle-2",
                     "task_ids": ["APP-A-DISC-002"],
                     "summary": "Second discovery bundle"
                 }
@@ -1197,16 +1376,33 @@ class OrchestratorTests(unittest.TestCase):
             "dependency_notes": [],
             "collaboration_edges": []
         }
-        stdout = "\n".join(
-            [
-                '{"type":"thread.started","thread_id":"plan-thread-456"}',
-                '{"type":"turn.started"}',
-                json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(final_payload)}),
-                '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}'
-            ]
-        )
-        completed = completed_process(stdout=stdout, stderr="", returncode=0)
-        with patch("company_orchestrator.objective_planner.run_codex_command", return_value=completed):
+        responses = [
+            completed_process(
+                stdout="\n".join(
+                    [
+                        '{"type":"thread.started","thread_id":"plan-thread-456"}',
+                        '{"type":"turn.started"}',
+                        json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(objective_outline)}),
+                        '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}'
+                    ]
+                ),
+                stderr="",
+                returncode=0,
+            ),
+            completed_process(
+                stdout="\n".join(
+                    [
+                        '{"type":"thread.started","thread_id":"capability-thread-456"}',
+                        '{"type":"turn.started"}',
+                        json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(capability_plan)}),
+                        '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}'
+                    ]
+                ),
+                stderr="",
+                returncode=0,
+            ),
+        ]
+        with patch("company_orchestrator.objective_planner.run_codex_command", side_effect=responses):
             plan_objective(self.project_root, "planned-phase", "app-a")
 
         def side_effect(project_root: Path, run_id: str, task_id: str, **_: object):
@@ -1263,7 +1459,12 @@ class OrchestratorTests(unittest.TestCase):
         def side_effect(*args: object, **kwargs: object):
             prompt = str(kwargs.get("prompt", ""))
             objective_id = "app-a" if '"objective_id": "app-a"' in prompt else "app-b"
-            payload = planned_payload_for_objective("plan-phase", objective_id)
+            if '"planning_schema": "objective-outline.v1"' in prompt:
+                capabilities = ["frontend"] if objective_id == "app-a" else ["backend"]
+                payload = objective_outline_for_objective("plan-phase", objective_id, capabilities)
+            else:
+                capability = "frontend" if '"capability": "frontend"' in prompt else "backend"
+                payload = capability_plan_for_objective("plan-phase", objective_id, capability)
             stdout = "\n".join(
                 [
                     '{"type":"thread.started","thread_id":"plan-thread"}',
@@ -1278,8 +1479,8 @@ class OrchestratorTests(unittest.TestCase):
             summary = plan_phase(self.project_root, "plan-phase")
 
         self.assertEqual(len(summary["planned_objectives"]), 2)
-        self.assertTrue((self.project_root / "runs" / "plan-phase" / "tasks" / "APP-A-DISC-001.json").exists())
-        self.assertTrue((self.project_root / "runs" / "plan-phase" / "tasks" / "APP-B-DISC-001.json").exists())
+        self.assertTrue((self.project_root / "runs" / "plan-phase" / "tasks" / "APP-A-FRONTEND-001.json").exists())
+        self.assertTrue((self.project_root / "runs" / "plan-phase" / "tasks" / "APP-B-BACKEND-001.json").exists())
 
     def test_monitoring_renderers_show_sections_and_prompt_details(self) -> None:
         scaffold_smoke_test(self.project_root, "monitor")
@@ -1398,6 +1599,231 @@ class OrchestratorTests(unittest.TestCase):
                 "runs/polish-payload/reports/DESIGN-001.json",
                 "runs/polish-payload/reports/MVP-001.json",
             ],
+        )
+
+    def test_reconcile_run_marks_stale_task_interrupted_when_process_is_missing(self) -> None:
+        scaffold_smoke_test(self.project_root, "recover-stale")
+        ensure_activity(
+            self.project_root,
+            "recover-stale",
+            activity_id="APP-A-SMOKE-001",
+            kind="task_execution",
+            entity_id="APP-A-SMOKE-001",
+            phase="discovery",
+            objective_id="app-a",
+            display_name="APP-A-SMOKE-001",
+            assigned_role="objectives.app-a.frontend-worker",
+            status="finalizing",
+            progress_stage="finalizing",
+            current_activity="Codex turn completed.",
+            prompt_path="runs/recover-stale/prompt-logs/APP-A-SMOKE-001.prompt.md",
+            stdout_path="runs/recover-stale/executions/APP-A-SMOKE-001.stdout.jsonl",
+            stderr_path="runs/recover-stale/executions/APP-A-SMOKE-001.stderr.log",
+            output_path="runs/recover-stale/reports/APP-A-SMOKE-001.json",
+            dependency_blockers=[],
+            process_metadata={"pid": 999999, "started_at": "2026-03-10T00:00:00Z", "command": "codex exec", "cwd": str(self.project_root)},
+        )
+        summary = reconcile_run(self.project_root, "recover-stale", apply=True)
+        activity = read_activity(self.project_root, "recover-stale", "APP-A-SMOKE-001")
+        self.assertEqual(activity["status"], "interrupted")
+        self.assertIn("Process missing", activity["status_reason"])
+        self.assertEqual(summary["activities"][0]["status"], "interrupted")
+
+    def test_reconcile_run_marks_stale_task_recovered_from_existing_report(self) -> None:
+        scaffold_smoke_test(self.project_root, "recover-report")
+        write_managed_report(
+            self.project_root,
+            "recover-report",
+            "APP-A-SMOKE-001",
+            status="ready_for_bundle_review",
+            summary="Recovered from persisted report.",
+        )
+        ensure_activity(
+            self.project_root,
+            "recover-report",
+            activity_id="APP-A-SMOKE-001",
+            kind="task_execution",
+            entity_id="APP-A-SMOKE-001",
+            phase="discovery",
+            objective_id="app-a",
+            display_name="APP-A-SMOKE-001",
+            assigned_role="objectives.app-a.frontend-worker",
+            status="finalizing",
+            progress_stage="finalizing",
+            current_activity="Codex turn completed.",
+            prompt_path="runs/recover-report/prompt-logs/APP-A-SMOKE-001.prompt.md",
+            stdout_path="runs/recover-report/executions/APP-A-SMOKE-001.stdout.jsonl",
+            stderr_path="runs/recover-report/executions/APP-A-SMOKE-001.stderr.log",
+            output_path="runs/recover-report/reports/APP-A-SMOKE-001.json",
+            dependency_blockers=[],
+            process_metadata={"pid": 999999, "started_at": "2026-03-10T00:00:00Z", "command": "codex exec", "cwd": str(self.project_root)},
+        )
+        reconcile_run(self.project_root, "recover-report", apply=True)
+        activity = read_activity(self.project_root, "recover-report", "APP-A-SMOKE-001")
+        self.assertEqual(activity["status"], "recovered")
+        self.assertEqual(activity["recovery_action"], "validated_artifact")
+
+    def test_plan_objective_reuses_valid_outline_and_capability_plan_artifacts(self) -> None:
+        scaffold_planning_run(self.project_root, "recover-plan", ["frontend"])
+        plans_dir = self.project_root / "runs" / "recover-plan" / "manager-plans"
+        write_json(
+            plans_dir / "discovery-app-a.outline.json",
+            objective_outline_for_objective("recover-plan", "app-a", ["frontend"]),
+        )
+        write_json(
+            plans_dir / "discovery-app-a-frontend.json",
+            capability_plan_for_objective("recover-plan", "app-a", "frontend"),
+        )
+        with patch("company_orchestrator.objective_planner.run_codex_command") as planner:
+            summary = plan_objective(self.project_root, "recover-plan", "app-a")
+        planner.assert_not_called()
+        self.assertEqual(summary["recovery_action"], "reused_valid_outline")
+        self.assertEqual(summary["capability_summaries"][0]["recovery_action"], "reused_valid_capability_plan")
+        self.assertTrue((self.project_root / "runs" / "recover-plan" / "tasks" / "APP-A-FRONTEND-001.json").exists())
+
+    def test_execute_task_retry_reuses_existing_isolated_worktree(self) -> None:
+        init_git_repo(self.project_root)
+        scaffold_planning_run(self.project_root, "retry-write", ["frontend"])
+        task = {
+            "schema": "task-assignment.v1",
+            "run_id": "retry-write",
+            "phase": "discovery",
+            "objective_id": "app-a",
+            "capability": "frontend",
+            "working_directory": None,
+            "sandbox_mode": "read-only",
+            "additional_directories": [],
+            "execution_mode": "isolated_write",
+            "parallel_policy": "serialize",
+            "owned_paths": ["docs/retry.md"],
+            "shared_asset_ids": [],
+            "task_id": "WRITE-001",
+            "assigned_role": "objectives.app-a.frontend-worker",
+            "manager_role": "objectives.app-a.frontend-manager",
+            "acceptance_role": "objectives.app-a.acceptance-manager",
+            "objective": "Write something in an isolated workspace.",
+            "inputs": [],
+            "expected_outputs": ["docs/retry.md"],
+            "done_when": ["task complete"],
+            "depends_on": [],
+            "validation": [],
+            "collaboration_rules": [],
+        }
+        write_json(self.project_root / "runs" / "retry-write" / "tasks" / "WRITE-001.json", task)
+        final_payload = {
+            "summary": "Finished the isolated write task.",
+            "status": "ready_for_bundle_review",
+            "artifacts": [{"path": "docs/retry.md", "status": "updated"}],
+            "validation_results": [],
+            "dependency_impact": [],
+            "open_issues": [],
+            "follow_up_requests": [],
+            "context_echo": None,
+            "collaboration_request": None,
+        }
+        stdout = "\n".join(
+            [
+                '{"type":"thread.started","thread_id":"thread-write"}',
+                '{"type":"turn.started"}',
+                json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(final_payload)}),
+                '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
+            ]
+        )
+        completed = completed_process(stdout=stdout, stderr="", returncode=0)
+        with patch("company_orchestrator.executor.run_codex_command", return_value=completed):
+            execute_task(self.project_root, "retry-write", "WRITE-001")
+
+        (self.project_root / "runs" / "retry-write" / "reports" / "WRITE-001.json").unlink()
+        update_activity(
+            self.project_root,
+            "retry-write",
+            "WRITE-001",
+            status="interrupted",
+            progress_stage="interrupted",
+            status_reason="Simulated interruption for retry.",
+        )
+
+        with patch("company_orchestrator.executor.run_codex_command", return_value=completed):
+            summary = execute_task(self.project_root, "retry-write", "WRITE-001")
+
+        self.assertEqual(summary["attempt"], 2)
+        self.assertEqual(summary["recovery_action"], "reused_workspace")
+        self.assertTrue(summary["workspace_reused"])
+
+    def test_run_phase_stops_when_recovery_detects_blocked_bundle_landing(self) -> None:
+        init_git_repo(self.project_root)
+        scaffold_planning_run(self.project_root, "blocked-recovery", ["frontend"])
+        write_json(
+            self.project_root / "runs" / "blocked-recovery" / "tasks" / "WRITE-001.json",
+            {
+                "schema": "task-assignment.v1",
+                "run_id": "blocked-recovery",
+                "phase": "discovery",
+                "objective_id": "app-a",
+                "capability": "frontend",
+                "working_directory": None,
+                "sandbox_mode": "read-only",
+                "additional_directories": [],
+                "execution_mode": "isolated_write",
+                "parallel_policy": "serialize",
+                "owned_paths": ["docs/conflict.md"],
+                "shared_asset_ids": [],
+                "task_id": "WRITE-001",
+                "assigned_role": "objectives.app-a.frontend-worker",
+                "manager_role": "objectives.app-a.frontend-manager",
+                "acceptance_role": "objectives.app-a.acceptance-manager",
+                "objective": "Write a conflict file.",
+                "inputs": [],
+                "expected_outputs": ["docs/conflict.md"],
+                "done_when": ["task complete"],
+                "depends_on": [],
+                "validation": [],
+                "collaboration_rules": [],
+            },
+        )
+        write_json(
+            self.project_root / "runs" / "blocked-recovery" / "bundles" / "blocked-bundle.json",
+            {
+                "schema": "review-bundle.v1",
+                "run_id": "blocked-recovery",
+                "phase": "discovery",
+                "objective_id": "app-a",
+                "bundle_id": "blocked-bundle",
+                "assembled_by": "objectives.app-a.frontend-manager",
+                "reviewed_by": "objectives.app-a.acceptance-manager",
+                "included_tasks": ["WRITE-001"],
+                "status": "accepted",
+                "required_checks": [],
+            },
+        )
+
+        with self.assertRaises(RecoveryBlockedError):
+            run_phase(self.project_root, "blocked-recovery")
+
+        recovery_summary = read_json(self.project_root / "runs" / "blocked-recovery" / "recovery" / "blocked-bundle.json")
+        self.assertEqual(recovery_summary["status"], "interrupted")
+
+    def test_phase_report_recovery_summary_includes_blocked_bundle_incidents(self) -> None:
+        scaffold_smoke_test(self.project_root, "recovery-report")
+        record_event(
+            self.project_root,
+            "recovery-report",
+            phase="discovery",
+            activity_id=None,
+            event_type="bundle.recovery_blocked",
+            message="Bundle landing requires recovery.",
+            payload={"bundle_id": "bundle-1", "recovery_path": "runs/recovery-report/recovery/bundle-1.json"},
+        )
+        report, _ = generate_phase_report(self.project_root, "recovery-report")
+        incidents = report["recovery_summary"]["incidents"]
+        self.assertIn(
+            {
+                "activity_id": "bundle:bundle-1",
+                "status": "blocked",
+                "reason": "Bundle landing requires recovery.",
+                "artifact_path": "runs/recovery-report/recovery/bundle-1.json",
+            },
+            incidents,
         )
 
 
@@ -1549,6 +1975,77 @@ def planned_payload_for_objective(run_id: str, objective_id: str) -> dict[str, o
         ],
         "dependency_notes": [],
         "collaboration_edges": []
+    }
+
+
+def objective_outline_for_objective(run_id: str, objective_id: str, capabilities: list[str]) -> dict[str, object]:
+    return {
+        "schema": "objective-outline.v1",
+        "run_id": run_id,
+        "phase": "discovery",
+        "objective_id": objective_id,
+        "summary": f"Capability-managed discovery plan for {objective_id}",
+        "capability_lanes": [
+            {
+                "capability": capability,
+                "assigned_manager_role": (
+                    f"objectives.{objective_id}.{capability}-manager"
+                    if capability != "general"
+                    else f"objectives.{objective_id}.objective-manager"
+                ),
+                "objective": f"Plan {capability} discovery work for {objective_id}",
+                "inputs": ["Planning Inputs.goal_markdown"],
+                "expected_outputs": [f"{capability} discovery plan"],
+                "done_when": [f"{capability} discovery tasks are planned"],
+                "depends_on": [],
+                "planning_notes": [f"Stay within the {capability} lane."],
+                "collaboration_rules": [],
+            }
+            for capability in capabilities
+        ],
+        "dependency_notes": [],
+        "collaboration_edges": [],
+    }
+
+
+def capability_plan_for_objective(run_id: str, objective_id: str, capability: str) -> dict[str, object]:
+    return {
+        "schema": "capability-plan.v1",
+        "run_id": run_id,
+        "phase": "discovery",
+        "objective_id": objective_id,
+        "capability": capability,
+        "summary": f"{capability} capability plan for {objective_id}",
+        "tasks": [
+            {
+                "task_id": f"{objective_id.upper()}-{capability.upper()}-001",
+                "capability": capability,
+                "assigned_role": f"objectives.{objective_id}.{capability}-worker",
+                "execution_mode": "read_only",
+                "parallel_policy": "allow",
+                "owned_paths": [],
+                "shared_asset_ids": [],
+                "objective": f"Plan {capability} work for {objective_id}",
+                "inputs": ["Planning Inputs.goal_markdown"],
+                "expected_outputs": [f"{capability} notes"],
+                "done_when": [f"{capability} work is described"],
+                "depends_on": [],
+                "validation": [{"id": "manager-check", "command": f"check-{capability}"}],
+                "collaboration_rules": [],
+                "working_directory": None,
+                "additional_directories": [],
+                "sandbox_mode": "read-only",
+            }
+        ],
+        "bundle_plan": [
+            {
+                "bundle_id": f"{capability}-bundle",
+                "task_ids": [f"{objective_id.upper()}-{capability.upper()}-001"],
+                "summary": f"{capability} bundle",
+            }
+        ],
+        "dependency_notes": [],
+        "collaboration_edges": [],
     }
 
 

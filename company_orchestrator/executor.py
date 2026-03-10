@@ -10,8 +10,9 @@ from typing import Any
 
 from .collaboration import create_collaboration_request
 from .filesystem import ensure_dir, read_json, read_text, write_json, write_text
-from .live import append_activity_warning, ensure_activity, record_event, update_activity
+from .live import append_activity_warning, ensure_activity, now_timestamp, record_event, update_activity
 from .prompts import render_prompt
+from .recovery import prepare_activity_retry, reconcile_for_command
 from .schemas import SchemaValidationError, validate_document
 from .worktree_manager import WorkspaceInfo, WorktreeError, commit_task_workspace, ensure_task_workspace
 
@@ -36,6 +37,9 @@ class TaskExecutionRuntime:
     branch_name: str | None = None
     workspace_path: str | None = None
     commit_sha: str | None = None
+    attempt: int = 1
+    recovery_action: str | None = None
+    workspace_reused: bool = False
 
 
 def coerce_process_text(stream: str | bytes | None) -> str:
@@ -54,6 +58,7 @@ def run_codex_command(
     env: dict[str, str],
     timeout_seconds: int,
     on_stdout_line: Any | None = None,
+    on_process_started: Any | None = None,
 ) -> CodexProcessResult:
     process = subprocess.Popen(
         command,
@@ -67,6 +72,8 @@ def run_codex_command(
         cwd=cwd,
         env=env,
     )
+    if on_process_started is not None:
+        on_process_started(process)
     stdout_chunks: list[str] = []
     stderr_chunks: list[str] = []
 
@@ -122,13 +129,24 @@ def execute_task(
     codex_path: str = "codex",
     timeout_seconds: int = 300,
     runtime: TaskExecutionRuntime | None = None,
+    allow_recovery_blocked: bool = False,
 ) -> dict[str, Any]:
+    reconcile_for_command(project_root, run_id, apply=True, allow_blocked=allow_recovery_blocked)
     run_dir = project_root / "runs" / run_id
     task_path = run_dir / "tasks" / f"{task_id}.json"
     if not task_path.exists():
         raise ExecutorError(f"Task {task_id} does not exist for run {run_id}")
 
     task = read_json(task_path)
+    runtime = runtime or TaskExecutionRuntime()
+    previous_activity = prepare_activity_retry(
+        project_root,
+        run_id,
+        task_id,
+        reason="Starting a new execution attempt.",
+    )
+    if previous_activity is not None:
+        runtime.attempt = int(previous_activity.get("attempt", 1)) + 1
     runtime = prepare_task_runtime(project_root, run_id, task, runtime=runtime)
     prompt_metadata = render_prompt(project_root, run_id, task_path)
     prompt_text = read_text(project_root / prompt_metadata["prompt_path"])
@@ -149,7 +167,7 @@ def execute_task(
         sandbox_mode=task.get("sandbox_mode", sandbox_mode),
         additional_directories=task.get("additional_directories", []),
     )
-    ensure_activity(
+    activity_state = ensure_activity(
         project_root,
         run_id,
         activity_id=task_id,
@@ -173,6 +191,9 @@ def execute_task(
         parallel_fallback_reason=runtime.parallel_fallback_reason,
         workspace_path=runtime.workspace_path,
         branch_name=runtime.branch_name,
+        attempt=runtime.attempt,
+        recovery_action=runtime.recovery_action,
+        begin_attempt=previous_activity is not None,
     )
     for warning in runtime.runtime_warnings:
         append_activity_warning(
@@ -224,6 +245,19 @@ def execute_task(
     def on_stdout_line(raw_line: str) -> None:
         handle_codex_event_line(project_root, run_id, task["phase"], task_id, raw_line)
 
+    def on_process_started(process: subprocess.Popen[str]) -> None:
+        update_activity(
+            project_root,
+            run_id,
+            task_id,
+            process_metadata={
+                "pid": process.pid,
+                "started_at": activity_state["updated_at"],
+                "command": " ".join(command),
+                "cwd": str(project_root),
+            },
+        )
+
     try:
         completed = run_codex_command(
             command,
@@ -232,6 +266,7 @@ def execute_task(
             env=build_exec_environment(),
             timeout_seconds=timeout_seconds,
             on_stdout_line=on_stdout_line,
+            on_process_started=on_process_started,
         )
     except subprocess.TimeoutExpired as exc:
         stdout = coerce_process_text(exc.stdout)
@@ -251,6 +286,7 @@ def execute_task(
             parallel_fallback_reason=runtime.parallel_fallback_reason,
             workspace_path=runtime.workspace_path,
             branch_name=runtime.branch_name,
+            process_metadata=None,
         )
         record_event(
             project_root,
@@ -282,6 +318,7 @@ def execute_task(
             parallel_fallback_reason=runtime.parallel_fallback_reason,
             workspace_path=runtime.workspace_path,
             branch_name=runtime.branch_name,
+            process_metadata=None,
         )
         record_event(
             project_root,
@@ -311,6 +348,7 @@ def execute_task(
             parallel_fallback_reason=runtime.parallel_fallback_reason,
             workspace_path=runtime.workspace_path,
             branch_name=runtime.branch_name,
+            process_metadata=None,
         )
         raise ExecutorError(f"Final response was not valid JSON: {final_response}") from exc
 
@@ -339,16 +377,22 @@ def execute_task(
         task,
         parsed_response,
         runtime_warnings=runtime.runtime_warnings,
+        runtime_recovery={
+            "attempt": runtime.attempt,
+            "recovery_action": runtime.recovery_action,
+            "workspace_reused": runtime.workspace_reused,
+        },
     )
     if task.get("execution_mode", "read_only") == "isolated_write" and report["status"] == "ready_for_bundle_review":
         commit_result = commit_isolated_workspace(runtime, task_id)
         runtime.commit_sha = commit_result.get("commit_sha")
+    activity_status = "recovered" if runtime.attempt > 1 or runtime.recovery_action else report["status"]
     update_activity(
         project_root,
         run_id,
         task_id,
-        status=report["status"],
-        progress_stage=report["status"],
+        status=activity_status,
+        progress_stage=activity_status,
         current_activity=report["summary"],
         output_path=str(report_path.relative_to(project_root)),
         queue_position=None,
@@ -359,6 +403,9 @@ def execute_task(
         parallel_fallback_reason=runtime.parallel_fallback_reason,
         workspace_path=runtime.workspace_path,
         branch_name=runtime.branch_name,
+        process_metadata=None,
+        recovered_at=now_timestamp() if activity_status == "recovered" else None,
+        recovery_action=runtime.recovery_action,
     )
     record_event(
         project_root,
@@ -370,12 +417,15 @@ def execute_task(
         payload={
             "status": report["status"],
             "report_path": str(report_path.relative_to(project_root)),
+            "attempt": runtime.attempt,
             "parallel_execution_requested": runtime.parallel_execution_requested,
             "parallel_execution_granted": runtime.parallel_execution_granted,
             "parallel_fallback_reason": runtime.parallel_fallback_reason,
             "branch_name": runtime.branch_name,
             "workspace_path": runtime.workspace_path,
             "commit_sha": runtime.commit_sha,
+            "recovery_action": runtime.recovery_action,
+            "workspace_reused": runtime.workspace_reused,
         },
     )
     execution_summary = {
@@ -395,6 +445,9 @@ def execute_task(
         "branch_name": runtime.branch_name,
         "workspace_path": runtime.workspace_path,
         "commit_sha": runtime.commit_sha,
+        "attempt": runtime.attempt,
+        "recovery_action": runtime.recovery_action,
+        "workspace_reused": runtime.workspace_reused,
     }
     write_json(summary_path, execution_summary)
     return execution_summary
@@ -410,12 +463,18 @@ def prepare_task_runtime(
     resolved = runtime or TaskExecutionRuntime()
     if task.get("execution_mode", "read_only") != "isolated_write":
         return resolved
+    existing_workspace = task_workspace_exists(project_root, run_id, task["task_id"])
     try:
         workspace = ensure_task_workspace(project_root, run_id, task["task_id"])
     except WorktreeError as exc:
         raise ExecutorError(str(exc)) from exc
     resolved.branch_name = workspace.branch_name
     resolved.workspace_path = str(workspace.workspace_path)
+    resolved.workspace_reused = existing_workspace
+    if existing_workspace:
+        resolved.recovery_action = resolved.recovery_action or "reused_workspace"
+    elif resolved.attempt > 1:
+        resolved.recovery_action = resolved.recovery_action or "recreated_workspace"
     return resolved
 
 
@@ -662,6 +721,7 @@ def materialize_executor_response(
     parsed_response: dict[str, Any],
     *,
     runtime_warnings: list[dict[str, str]],
+    runtime_recovery: dict[str, Any] | None,
 ) -> tuple[dict[str, Any], list[str]]:
     run_dir = project_root / "runs" / run_id
     collaboration_ids: list[str] = []
@@ -701,11 +761,17 @@ def materialize_executor_response(
     }
     if runtime_warnings:
         report["runtime_warnings"] = runtime_warnings
+    if runtime_recovery is not None:
+        report["runtime_recovery"] = runtime_recovery
     if parsed_response.get("context_echo") is not None:
         report["context_echo"] = parsed_response["context_echo"]
     validate_document(report, "completion-report.v1", project_root)
     write_json(run_dir / "reports" / f"{task['task_id']}.json", report)
     return report, collaboration_ids
+
+
+def task_workspace_exists(project_root: Path, run_id: str, task_id: str) -> bool:
+    return (project_root / ".orchestrator-worktrees" / run_id / "tasks" / task_id).exists()
 
 
 def next_collaboration_request_id(run_dir: Path, task_id: str) -> str:
