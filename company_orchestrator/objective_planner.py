@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +29,28 @@ from .recovery import prepare_activity_retry, reconcile_for_command
 from .schemas import SchemaValidationError, validate_document
 
 
+class PlanningLimiter:
+    def __init__(self, max_concurrency: int) -> None:
+        self.max_concurrency = max(1, max_concurrency)
+        self._semaphore = threading.BoundedSemaphore(self.max_concurrency)
+        self._lock = threading.Lock()
+        self._waiting = 0
+
+    def acquire(self) -> int | None:
+        if self._semaphore.acquire(blocking=False):
+            return None
+        with self._lock:
+            self._waiting += 1
+            queue_position = self._waiting
+        self._semaphore.acquire()
+        with self._lock:
+            self._waiting = max(0, self._waiting - 1)
+        return queue_position
+
+    def release(self) -> None:
+        self._semaphore.release()
+
+
 def plan_objective(
     project_root: Path,
     run_id: str,
@@ -36,13 +60,18 @@ def plan_objective(
     codex_path: str = "codex",
     replace: bool = False,
     timeout_seconds: int = 300,
+    max_concurrency: int = 3,
     allow_recovery_blocked: bool = False,
+    skip_reconcile: bool = False,
+    planning_limiter: PlanningLimiter | None = None,
 ) -> dict[str, Any]:
-    reconcile_for_command(project_root, run_id, apply=True, allow_blocked=allow_recovery_blocked)
+    if not skip_reconcile:
+        reconcile_for_command(project_root, run_id, apply=True, allow_blocked=allow_recovery_blocked)
     run_dir = project_root / "runs" / run_id
     phase = read_json(run_dir / "phase-plan.json")["current_phase"]
     plans_dir = ensure_dir(run_dir / "manager-plans")
     objective = find_objective(run_dir, objective_id)
+    planning_limiter = planning_limiter or PlanningLimiter(max_concurrency)
     objective_result: dict[str, Any] = {
         "events": [],
         "stdout_path": None,
@@ -75,6 +104,7 @@ def plan_objective(
             sandbox_mode=sandbox_mode,
             codex_path=codex_path,
             timeout_seconds=timeout_seconds,
+            planning_limiter=planning_limiter,
         )
         outline, identity_adjustments = normalize_objective_outline(
             project_root,
@@ -87,22 +117,19 @@ def plan_objective(
         write_json(outline_path, outline)
     else:
         objective_result["recovery_action"] = "reused_valid_outline"
-    capability_summaries = []
-    capability_plans = []
-    for lane in outline["capability_lanes"]:
-        capability_summary, capability_plan = plan_capability(
-            project_root,
-            run_id,
-            objective_id,
-            lane["capability"],
-            objective_outline=outline,
-            replace=replace,
-            sandbox_mode=sandbox_mode,
-            codex_path=codex_path,
-            timeout_seconds=timeout_seconds,
-        )
-        capability_summaries.append(capability_summary)
-        capability_plans.append(capability_plan)
+    capability_summaries, capability_plans = plan_capabilities_for_objective(
+        project_root,
+        run_id,
+        objective_id,
+        outline["capability_lanes"],
+        objective_outline=outline,
+        replace=replace,
+        sandbox_mode=sandbox_mode,
+        codex_path=codex_path,
+        timeout_seconds=timeout_seconds,
+        max_concurrency=max_concurrency,
+        planning_limiter=planning_limiter,
+    )
     plan = aggregate_capability_plans(
         project_root,
         run_id,
@@ -134,6 +161,7 @@ def plan_objective(
         "capability_summaries": capability_summaries,
         "attempt": objective_result["attempt"],
         "recovery_action": objective_result["recovery_action"],
+        "max_concurrency": max_concurrency,
     }
     write_json(plans_dir / f"{phase}-{objective_id}.summary.json", summary)
     activity_status = "recovered" if objective_result["attempt"] > 1 or objective_result["recovery_action"] else "completed"
@@ -179,27 +207,142 @@ def plan_phase(
     codex_path: str = "codex",
     replace: bool = False,
     timeout_seconds: int = 300,
+    max_concurrency: int = 3,
 ) -> dict[str, Any]:
     reconcile_for_command(project_root, run_id, apply=True)
     run_dir = project_root / "runs" / run_id
     phase = read_json(run_dir / "phase-plan.json")["current_phase"]
     objective_map = read_json(run_dir / "objective-map.json")
+    planning_limiter = PlanningLimiter(max_concurrency)
     summaries = []
-    for objective in objective_map["objectives"]:
-        summaries.append(
-            plan_objective(
-                project_root,
-                run_id,
-                objective["objective_id"],
-                sandbox_mode=sandbox_mode,
-                codex_path=codex_path,
-                replace=replace,
-                timeout_seconds=timeout_seconds,
+    objective_ids = [objective["objective_id"] for objective in objective_map["objectives"]]
+    if max_concurrency <= 1 or len(objective_ids) <= 1:
+        for objective_id in objective_ids:
+            summaries.append(
+                plan_objective(
+                    project_root,
+                    run_id,
+                    objective_id,
+                    sandbox_mode=sandbox_mode,
+                    codex_path=codex_path,
+                    replace=replace,
+                    timeout_seconds=timeout_seconds,
+                    max_concurrency=max_concurrency,
+                    skip_reconcile=True,
+                    planning_limiter=planning_limiter,
+                )
             )
-        )
-    payload = {"run_id": run_id, "phase": phase, "planned_objectives": summaries}
+    else:
+        summaries_by_objective: dict[str, dict[str, Any]] = {}
+        first_error: BaseException | None = None
+        with ThreadPoolExecutor(max_workers=min(len(objective_ids), max_concurrency)) as pool:
+            futures = {
+                pool.submit(
+                    plan_objective,
+                    project_root,
+                    run_id,
+                    objective_id,
+                    sandbox_mode=sandbox_mode,
+                    codex_path=codex_path,
+                    replace=replace,
+                    timeout_seconds=timeout_seconds,
+                    max_concurrency=max_concurrency,
+                    skip_reconcile=True,
+                    planning_limiter=planning_limiter,
+                ): objective_id
+                for objective_id in objective_ids
+            }
+            for future in as_completed(futures):
+                objective_id = futures[future]
+                try:
+                    summaries_by_objective[objective_id] = future.result()
+                except BaseException as exc:  # pragma: no cover - exercised in failure tests via raise below
+                    if first_error is None:
+                        first_error = exc
+        if first_error is not None:
+            raise first_error
+        summaries = [summaries_by_objective[objective_id] for objective_id in objective_ids]
+    payload = {
+        "run_id": run_id,
+        "phase": phase,
+        "planned_objectives": summaries,
+        "max_concurrency": max_concurrency,
+    }
     write_json(run_dir / "manager-plans" / f"{phase}-phase-plan-summary.json", payload)
     return payload
+
+
+def plan_capabilities_for_objective(
+    project_root: Path,
+    run_id: str,
+    objective_id: str,
+    lanes: list[dict[str, Any]],
+    *,
+    objective_outline: dict[str, Any],
+    replace: bool,
+    sandbox_mode: str,
+    codex_path: str,
+    timeout_seconds: int,
+    max_concurrency: int,
+    planning_limiter: PlanningLimiter,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if max_concurrency <= 1 or len(lanes) <= 1:
+        capability_summaries = []
+        capability_plans = []
+        for lane in lanes:
+            capability_summary, capability_plan = plan_capability(
+                project_root,
+                run_id,
+                objective_id,
+                lane["capability"],
+                objective_outline=objective_outline,
+                replace=replace,
+                sandbox_mode=sandbox_mode,
+                codex_path=codex_path,
+                timeout_seconds=timeout_seconds,
+                planning_limiter=planning_limiter,
+            )
+            capability_summaries.append(capability_summary)
+            capability_plans.append(capability_plan)
+        return capability_summaries, capability_plans
+
+    lane_order = [lane["capability"] for lane in lanes]
+    summaries_by_capability: dict[str, dict[str, Any]] = {}
+    plans_by_capability: dict[str, dict[str, Any]] = {}
+    first_error: BaseException | None = None
+    with ThreadPoolExecutor(max_workers=min(len(lane_order), max_concurrency)) as pool:
+        futures = {
+            pool.submit(
+                plan_capability,
+                project_root,
+                run_id,
+                objective_id,
+                capability,
+                objective_outline=objective_outline,
+                replace=replace,
+                sandbox_mode=sandbox_mode,
+                codex_path=codex_path,
+                timeout_seconds=timeout_seconds,
+                planning_limiter=planning_limiter,
+            ): capability
+            for capability in lane_order
+        }
+        for future in as_completed(futures):
+            capability = futures[future]
+            try:
+                summary, plan = future.result()
+            except BaseException as exc:  # pragma: no cover - exercised in failure tests via raise below
+                if first_error is None:
+                    first_error = exc
+            else:
+                summaries_by_capability[capability] = summary
+                plans_by_capability[capability] = plan
+    if first_error is not None:
+        raise first_error
+    return (
+        [summaries_by_capability[capability] for capability in lane_order],
+        [plans_by_capability[capability] for capability in lane_order],
+    )
 
 
 def plan_capability(
@@ -213,6 +356,7 @@ def plan_capability(
     sandbox_mode: str,
     codex_path: str,
     timeout_seconds: int,
+    planning_limiter: PlanningLimiter,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     run_dir = project_root / "runs" / run_id
     phase = read_json(run_dir / "phase-plan.json")["current_phase"]
@@ -254,6 +398,7 @@ def plan_capability(
             sandbox_mode=sandbox_mode,
             codex_path=codex_path,
             timeout_seconds=timeout_seconds,
+            planning_limiter=planning_limiter,
         )
         plan, identity_adjustments = normalize_capability_plan(
             project_root,
@@ -338,6 +483,7 @@ def execute_planning_activity(
     sandbox_mode: str,
     codex_path: str,
     timeout_seconds: int,
+    planning_limiter: PlanningLimiter,
 ) -> dict[str, Any]:
     run_dir = project_root / "runs" / run_id
     plans_dir = ensure_dir(run_dir / "manager-plans")
@@ -391,115 +537,139 @@ def execute_planning_activity(
         message=f"Rendered planning prompt for {failure_label}.",
         payload={"prompt_path": prompt_metadata["prompt_path"]},
     )
-    update_activity(
-        project_root,
-        run_id,
-        activity_id,
-        status="launching",
-        progress_stage="launching",
-        current_activity="Launching planning manager.",
-    )
-    record_event(
-        project_root,
-        run_id,
-        phase=phase,
-        activity_id=activity_id,
-        event_type="planning.launching",
-        message=f"Launching planning activity for {failure_label}.",
-        payload={"entity_id": entity_id},
-    )
-
-    def on_stdout_line(raw_line: str) -> None:
-        handle_codex_event_line(project_root, run_id, phase, activity_id, raw_line)
-
-    def on_process_started(process: subprocess.Popen[str]) -> None:
-        update_activity(
-            project_root,
-            run_id,
-            activity_id,
-            process_metadata={
-                "pid": process.pid,
-                "started_at": activity_state["updated_at"],
-                "command": " ".join(command),
-                "cwd": str(project_root),
-            },
-        )
-
+    queue_position = planning_limiter.acquire()
     try:
-        completed = run_codex_command(
-            command,
-            prompt=execution_prompt,
-            cwd=project_root,
-            env=build_exec_environment(),
-            timeout_seconds=timeout_seconds,
-            on_stdout_line=on_stdout_line,
-            on_process_started=on_process_started,
-        )
-    except subprocess.TimeoutExpired as exc:
-        stdout = coerce_process_text(exc.stdout)
-        stderr = coerce_process_text(exc.stderr)
-        write_text(stdout_path, stdout)
-        write_text(stderr_path, stderr)
+        if queue_position is not None:
+            update_activity(
+                project_root,
+                run_id,
+                activity_id,
+                status="queued",
+                progress_stage="queued",
+                current_activity="Waiting for planning slot.",
+                queue_position=queue_position,
+            )
+            record_event(
+                project_root,
+                run_id,
+                phase=phase,
+                activity_id=activity_id,
+                event_type="planning.queued",
+                message=f"Queued planning activity for {failure_label}.",
+                payload={"entity_id": entity_id, "queue_position": queue_position},
+            )
         update_activity(
             project_root,
             run_id,
             activity_id,
-            status="failed",
-            progress_stage="failed",
-            current_activity=f"Timed out after {timeout_seconds} seconds.",
-            process_metadata=None,
+            status="launching",
+            progress_stage="launching",
+            current_activity="Launching planning manager.",
+            queue_position=None,
         )
         record_event(
             project_root,
             run_id,
             phase=phase,
             activity_id=activity_id,
-            event_type="planning.failed",
-            message=f"Planning activity for {failure_label} timed out.",
-            payload={"timeout_seconds": timeout_seconds},
+            event_type="planning.launching",
+            message=f"Launching planning activity for {failure_label}.",
+            payload={"entity_id": entity_id},
         )
-        raise ExecutorError(f"codex exec timed out after {timeout_seconds} seconds while planning {failure_label}") from exc
 
-    write_text(stdout_path, completed.stdout)
-    write_text(stderr_path, completed.stderr)
-    events = parse_jsonl_events(completed.stdout)
-    failure = extract_turn_failure(events)
-    if completed.returncode != 0 or failure is not None:
-        message = failure or completed.stderr.strip() or f"codex exec exited with code {completed.returncode}"
-        update_activity(
-            project_root,
-            run_id,
-            activity_id,
-            status="failed",
-            progress_stage="failed",
-            current_activity=message,
-            process_metadata=None,
-        )
-        record_event(
-            project_root,
-            run_id,
-            phase=phase,
-            activity_id=activity_id,
-            event_type="planning.failed",
-            message=f"Planning activity for {failure_label} failed.",
-            payload={"error": message},
-        )
-        raise ExecutorError(message)
+        def on_stdout_line(raw_line: str) -> None:
+            handle_codex_event_line(project_root, run_id, phase, activity_id, raw_line)
 
-    final_response = extract_final_response(events)
-    try:
-        payload = json.loads(final_response)
-    except json.JSONDecodeError as exc:
-        update_activity(
-            project_root,
-            run_id,
-            activity_id,
-            status="failed",
-            progress_stage="failed",
-            current_activity="Planning response was not valid JSON.",
-            process_metadata=None,
-        )
-        raise ExecutorError(f"Planning response was not valid JSON: {final_response}") from exc
+        def on_process_started(process: subprocess.Popen[str]) -> None:
+            update_activity(
+                project_root,
+                run_id,
+                activity_id,
+                process_metadata={
+                    "pid": process.pid,
+                    "started_at": activity_state["updated_at"],
+                    "command": " ".join(command),
+                    "cwd": str(project_root),
+                },
+            )
+
+        try:
+            completed = run_codex_command(
+                command,
+                prompt=execution_prompt,
+                cwd=project_root,
+                env=build_exec_environment(),
+                timeout_seconds=timeout_seconds,
+                on_stdout_line=on_stdout_line,
+                on_process_started=on_process_started,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout = coerce_process_text(exc.stdout)
+            stderr = coerce_process_text(exc.stderr)
+            write_text(stdout_path, stdout)
+            write_text(stderr_path, stderr)
+            update_activity(
+                project_root,
+                run_id,
+                activity_id,
+                status="failed",
+                progress_stage="failed",
+                current_activity=f"Timed out after {timeout_seconds} seconds.",
+                process_metadata=None,
+            )
+            record_event(
+                project_root,
+                run_id,
+                phase=phase,
+                activity_id=activity_id,
+                event_type="planning.failed",
+                message=f"Planning activity for {failure_label} timed out.",
+                payload={"timeout_seconds": timeout_seconds},
+            )
+            raise ExecutorError(f"codex exec timed out after {timeout_seconds} seconds while planning {failure_label}") from exc
+
+        write_text(stdout_path, completed.stdout)
+        write_text(stderr_path, completed.stderr)
+        events = parse_jsonl_events(completed.stdout)
+        failure = extract_turn_failure(events)
+        if completed.returncode != 0 or failure is not None:
+            message = failure or completed.stderr.strip() or f"codex exec exited with code {completed.returncode}"
+            update_activity(
+                project_root,
+                run_id,
+                activity_id,
+                status="failed",
+                progress_stage="failed",
+                current_activity=message,
+                process_metadata=None,
+            )
+            record_event(
+                project_root,
+                run_id,
+                phase=phase,
+                activity_id=activity_id,
+                event_type="planning.failed",
+                message=f"Planning activity for {failure_label} failed.",
+                payload={"error": message},
+            )
+            raise ExecutorError(message)
+
+        final_response = extract_final_response(events)
+        try:
+            payload = json.loads(final_response)
+        except json.JSONDecodeError as exc:
+            update_activity(
+                project_root,
+                run_id,
+                activity_id,
+                status="failed",
+                progress_stage="failed",
+                current_activity="Planning response was not valid JSON.",
+                process_metadata=None,
+            )
+            raise ExecutorError(f"Planning response was not valid JSON: {final_response}") from exc
+    finally:
+        planning_limiter.release()
 
     return {
         "payload": payload,

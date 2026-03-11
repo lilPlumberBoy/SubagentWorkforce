@@ -7,6 +7,7 @@ import threading
 from typing import Any
 
 from .filesystem import append_jsonl, ensure_dir, load_optional_json, read_json, write_json_atomic
+from .objective_roots import find_objective_app_root
 from .schemas import validate_document
 
 PROGRESS_BY_STAGE = {
@@ -43,6 +44,8 @@ TERMINAL_ACTIVITY_STATUSES = {
     "rejected",
     "skipped_existing",
 }
+
+HISTORY_ACTIVITY_STATUSES = TERMINAL_ACTIVITY_STATUSES | {"ready_for_bundle_review"}
 
 _RUN_LOCKS: dict[str, threading.RLock] = {}
 _RUN_LOCKS_GUARD = threading.Lock()
@@ -202,6 +205,7 @@ def ensure_activity(
         }
         validate_document(payload, "activity-live-state.v1", project_root)
         write_json_atomic(activity_file, payload)
+        record_history_transition(project_root, run_id, payload, existing)
         refresh_run_state(project_root, run_id)
         return payload
 
@@ -214,7 +218,8 @@ def update_activity(
 ) -> dict[str, Any]:
     run_dir = project_root / "runs" / run_id
     with run_lock(run_id):
-        payload = normalize_activity_payload(read_json(activity_path(run_dir, activity_id)))
+        previous = normalize_activity_payload(read_json(activity_path(run_dir, activity_id)))
+        payload = dict(previous)
         payload.update({key: value for key, value in updates.items() if value is not None or key in updates})
         payload["updated_at"] = now_timestamp()
         if "status" in updates and payload["status"] == "interrupted" and not payload.get("interrupted_at"):
@@ -228,6 +233,7 @@ def update_activity(
         payload["progress_fraction"] = updates.get("progress_fraction", progress_for_stage(progress_stage))
         validate_document(payload, "activity-live-state.v1", project_root)
         write_json_atomic(activity_path(run_dir, activity_id), payload)
+        record_history_transition(project_root, run_id, payload, previous)
         refresh_run_state(project_root, run_id)
         return payload
 
@@ -424,6 +430,19 @@ def read_events(project_root: Path, run_id: str, *, activity_id: str | None = No
     return events
 
 
+def read_activity_history(project_root: Path, run_id: str) -> list[dict[str, Any]]:
+    history_path = project_root / "runs" / run_id / "live" / "activity-history.jsonl"
+    if not history_path.exists():
+        return []
+    entries: list[dict[str, Any]] = []
+    for line in history_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        entries.append(read_json_line(stripped))
+    return entries
+
+
 def read_json_line(line: str) -> dict[str, Any]:
     import json
 
@@ -455,3 +474,33 @@ def normalize_activity_payload(payload: dict[str, Any]) -> dict[str, Any]:
     normalized.setdefault("workspace_path", None)
     normalized.setdefault("branch_name", None)
     return normalized
+
+
+def record_history_transition(
+    project_root: Path,
+    run_id: str,
+    payload: dict[str, Any],
+    previous: dict[str, Any] | None,
+) -> None:
+    if payload["status"] not in HISTORY_ACTIVITY_STATUSES:
+        return
+    if previous is not None and previous.get("status") == payload["status"] and int(previous.get("attempt", 1)) == int(payload.get("attempt", 1)):
+        return
+    history_entry = {
+        "timestamp": payload["updated_at"],
+        "run_id": run_id,
+        "phase": payload["phase"],
+        "objective_id": payload["objective_id"],
+        "activity_id": payload["activity_id"],
+        "kind": payload["kind"],
+        "display_name": payload["display_name"],
+        "status": payload["status"],
+        "attempt": int(payload.get("attempt", 1)),
+        "status_reason": payload.get("status_reason"),
+        "recovery_action": payload.get("recovery_action"),
+        "current_activity": payload.get("current_activity"),
+    }
+    append_jsonl(project_root / "runs" / run_id / "live" / "activity-history.jsonl", history_entry)
+    app_root = find_objective_app_root(project_root, payload["objective_id"])
+    if app_root is not None:
+        append_jsonl(app_root / "orchestrator" / "activity-logs" / f"{run_id}.jsonl", history_entry)

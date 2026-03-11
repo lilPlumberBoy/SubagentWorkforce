@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 import threading
+import hashlib
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
@@ -13,7 +14,7 @@ from rich.table import Table
 from rich.text import Text
 
 from .filesystem import load_optional_json, read_text
-from .live import list_activities, read_activity, read_events, read_run_state
+from .live import list_activities, read_activity, read_activity_history, read_events, read_run_state
 
 T = TypeVar("T")
 
@@ -90,10 +91,12 @@ def build_run_dashboard(project_root: Path, run_id: str):
     run_state = read_run_state(project_root, run_id)
     current_phase = run_state["current_phase"]
     activities = list_activities(project_root, run_id, phase=current_phase)
+    history = read_activity_history(project_root, run_id)
     active_plans = [
         activity
         for activity in activities
-        if activity["kind"] in {"objective_plan", "capability_plan"} and is_active(activity)
+        if activity["kind"] in {"objective_plan", "capability_plan"}
+        and activity["status"] not in {"completed", "failed", "interrupted", "recovered", "abandoned"}
     ]
     active_tasks = [activity for activity in activities if activity["kind"] == "task_execution" and is_active(activity)]
     queued_tasks = [activity for activity in activities if activity["kind"] == "task_execution" and activity["status"] == "queued"]
@@ -109,20 +112,21 @@ def build_run_dashboard(project_root: Path, run_id: str):
     ]
     objective_map = load_optional_json(project_root / "runs" / run_id / "objective-map.json") or {"objectives": []}
     objectives = objective_map.get("objectives", [])
+    objective_lookup = build_objective_lookup(objectives)
 
     renderables = [
         build_run_header(run_id, run_state),
         build_counts_table(run_state),
-        build_objective_progress_table(objectives, activities),
-        build_activity_table("Active Planning Activities", active_plans),
-        build_activity_table("Active Task Activities", active_tasks),
-        build_activity_table("Queued Tasks", queued_tasks),
-        build_activity_table("Blocked Tasks", blocked_tasks),
-        build_activity_table("Interrupted / Recovered Activities", interrupted_activities),
-        build_warning_rollup_panel(activities),
+        build_objective_progress_table(objectives, activities, objective_lookup),
+        build_activity_table("Active Planning Activities", active_plans, objective_lookup),
+        build_activity_table("Active Task Activities", active_tasks, objective_lookup),
+        build_activity_table("Queued Tasks", queued_tasks, objective_lookup),
+        build_activity_table("Blocked Tasks", blocked_tasks, objective_lookup),
+        build_activity_table("Interrupted / Recovered Activities", interrupted_activities, objective_lookup),
+        build_warning_rollup_panel(activities, objective_lookup),
         build_recovery_rollup_panel(activities),
         build_phase_progress_panel(objectives, activities),
-        build_activity_history_panel(activities),
+        build_activity_history_panel(history, objective_lookup),
     ]
     return Group(*renderables)
 
@@ -166,7 +170,11 @@ def build_phase_progress_panel(objectives: list[dict[str, Any]], activities: lis
     return Panel(progress_renderable(phase_fraction), title=f"Phase Progress ({percent_text(phase_fraction)})", border_style="magenta")
 
 
-def build_objective_progress_table(objectives: list[dict[str, Any]], activities: list[dict[str, Any]]) -> Table:
+def build_objective_progress_table(
+    objectives: list[dict[str, Any]],
+    activities: list[dict[str, Any]],
+    objective_lookup: dict[str, dict[str, str]],
+) -> Table:
     table = Table(title="Objective Progress", expand=True)
     table.add_column("Objective")
     table.add_column("Progress")
@@ -178,11 +186,11 @@ def build_objective_progress_table(objectives: list[dict[str, Any]], activities:
         objective_id = objective["objective_id"]
         fraction = objective_progress_fraction(objective_id, activities)
         statuses = summarize_objective_statuses(objective_id, activities)
-        table.add_row(display_label(objective_id), progress_renderable(fraction), statuses)
+        table.add_row(objective_label(objective_id, objective_lookup), progress_renderable(fraction), statuses)
     return table
 
 
-def build_activity_table(title: str, activities: list[dict[str, Any]]) -> Table:
+def build_activity_table(title: str, activities: list[dict[str, Any]], objective_lookup: dict[str, dict[str, str]]) -> Table:
     table = Table(title=title, expand=True)
     table.add_column("Activity")
     table.add_column("Objective")
@@ -196,8 +204,8 @@ def build_activity_table(title: str, activities: list[dict[str, Any]]) -> Table:
     for activity in sorted(activities, key=activity_sort_key):
         warnings_text = "; ".join(item["message"] for item in activity.get("warnings", [])) or "-"
         table.add_row(
-            display_label(activity["activity_id"], activity.get("attempt", 1)),
-            display_label(activity["objective_id"]),
+            activity_label(activity),
+            objective_label(activity["objective_id"], objective_lookup),
             status_label(activity),
             warnings_text,
             progress_renderable(activity["progress_fraction"]),
@@ -208,6 +216,7 @@ def build_activity_table(title: str, activities: list[dict[str, Any]]) -> Table:
 
 def build_activity_summary_panel(activity: dict[str, Any]) -> Panel:
     lines = [
+        f"Display ID: {activity_code(activity)}",
         f"Activity: {activity['activity_id']}",
         f"Kind: {activity['kind']}",
         f"Objective: {activity['objective_id']}",
@@ -262,11 +271,13 @@ def build_artifact_paths_panel(activity: dict[str, Any]) -> Panel:
     return Panel("\n".join(lines), title="Artifacts", border_style="blue")
 
 
-def build_warning_rollup_panel(activities: list[dict[str, Any]]) -> Panel:
+def build_warning_rollup_panel(activities: list[dict[str, Any]], objective_lookup: dict[str, dict[str, str]]) -> Panel:
     warning_lines = []
     for activity in sorted(activities, key=activity_sort_key):
         for item in activity.get("warnings", []):
-            warning_lines.append(f"- {activity['activity_id']}: {item['message']}")
+            warning_lines.append(
+                f"- {activity_label(activity)} ({objective_label(activity['objective_id'], objective_lookup)}): {item['message']}"
+            )
     if not warning_lines:
         warning_lines = ["- none"]
     return Panel("\n".join(warning_lines), title="Parallelism Warnings", border_style="red")
@@ -278,7 +289,7 @@ def build_recovery_rollup_panel(activities: list[dict[str, Any]]) -> Panel:
         if activity["status"] not in {"interrupted", "recovered", "abandoned"}:
             continue
         lines.append(
-            f"- {display_label(activity['activity_id'], activity.get('attempt', 1))}: "
+            f"- {activity_label(activity)}: "
             f"{activity['status']} ({activity.get('status_reason') or activity.get('recovery_action') or '-'})"
         )
     if not lines:
@@ -286,21 +297,14 @@ def build_recovery_rollup_panel(activities: list[dict[str, Any]]) -> Panel:
     return Panel("\n".join(lines), title="Recovery Actions", border_style="yellow")
 
 
-def build_activity_history_panel(activities: list[dict[str, Any]]) -> Panel:
-    terminal = sorted(
-        [
-            activity
-            for activity in activities
-            if activity["status"] in {"completed", "recovered", "interrupted", "abandoned", "failed"}
-        ],
-        key=lambda item: item["updated_at"],
-        reverse=True,
-    )[:12]
+def build_activity_history_panel(history: list[dict[str, Any]], objective_lookup: dict[str, dict[str, str]]) -> Panel:
+    terminal = sorted(history, key=lambda item: item["timestamp"], reverse=True)[:12]
     lines = []
     for activity in terminal:
         lines.append(
-            f"- {display_label(activity['activity_id'], activity.get('attempt', 1))}: "
-            f"{activity['status']} at {activity['updated_at']}"
+            f"- {history_activity_label(activity)} "
+            f"({objective_label(activity['objective_id'], objective_lookup)}): "
+            f"{activity['status']} at {activity['timestamp']}"
         )
     if not lines:
         lines = ["- none"]
@@ -370,10 +374,45 @@ def activity_sort_key(activity: dict[str, Any]) -> tuple[int, str]:
     return (int(queue_position), activity["activity_id"])
 
 
-def display_label(value: str, attempt: int | None = None) -> str:
-    if attempt is None:
-        return value
-    return f"[{attempt}] {value}"
+def build_objective_lookup(objectives: list[dict[str, Any]]) -> dict[str, dict[str, str]]:
+    lookup: dict[str, dict[str, str]] = {}
+    for objective in objectives:
+        objective_id = objective["objective_id"]
+        lookup[objective_id] = {
+            "code": stable_code("OBJ", objective_id),
+            "title": objective.get("title") or objective_id,
+        }
+    return lookup
+
+
+def objective_label(objective_id: str, objective_lookup: dict[str, dict[str, str]]) -> str:
+    metadata = objective_lookup.get(objective_id)
+    if metadata is None:
+        return f"{stable_code('OBJ', objective_id)} · {objective_id}"
+    return f"{metadata['code']} · {metadata['title']}"
+
+
+def activity_label(activity: dict[str, Any]) -> str:
+    return f"{activity_code(activity)} · {activity.get('display_name') or activity['activity_id']} [attempt {activity.get('attempt', 1)}]"
+
+
+def history_activity_label(entry: dict[str, Any]) -> str:
+    return f"{activity_code(entry)} · {entry.get('display_name') or entry['activity_id']} [attempt {entry.get('attempt', 1)}]"
+
+
+def activity_code(activity: dict[str, Any]) -> str:
+    kind = activity.get("kind", "activity")
+    prefix = {
+        "task_execution": "TSK",
+        "objective_plan": "OPL",
+        "capability_plan": "CPL",
+    }.get(kind, "ACT")
+    return stable_code(prefix, str(activity["activity_id"]))
+
+
+def stable_code(prefix: str, value: str) -> str:
+    digest = hashlib.sha1(value.encode("utf-8")).hexdigest()[:6].upper()
+    return f"{prefix}-{digest}"
 
 
 def status_label(activity: dict[str, Any]) -> str:

@@ -20,7 +20,7 @@ company-orchestrator init-run run-001 path/to/goal.md
 company-orchestrator decompose-goal run-001
 company-orchestrator suggest-teams run-001
 company-orchestrator generate-roles run-001 --approve
-company-orchestrator plan-phase run-001 --sandbox read-only
+company-orchestrator plan-phase run-001 --sandbox read-only --max-concurrency 3
 company-orchestrator run-phase run-001 --sandbox read-only --max-concurrency 3
 ```
 
@@ -113,6 +113,14 @@ company-orchestrator run-phase run-001 --sandbox read-only --watch
 
 `inspect-activity` shows the activity metadata, full rendered prompt, latest live events, parallel fallback warnings, and the paths to stdout, stderr, workspace, branch, and the final output artifact.
 
+Completed activity history is persisted under:
+
+- `runs/<run-id>/live/activity-history.jsonl`
+
+When an objective belongs to an app-local orchestrator tree under `apps/<app>/orchestrator/roles/objectives/...`, the same history entries are also mirrored to:
+
+- `apps/<app>/orchestrator/activity-logs/<run-id>.jsonl`
+
 Recovery-aware monitoring is also built in:
 
 - activities can be marked `interrupted`, `recovering`, `recovered`, or `abandoned`
@@ -138,6 +146,8 @@ company-orchestrator retry-activity run-001 APP-A-DISC-001 --sandbox read-only
 - The objective manager returns an `objective-outline.v1` describing capability lanes and cross-lane coordination.
 - One capability manager per lane then returns `capability-plan.v1` task bundles for that lane.
 - Python aggregates those capability plans into the final `objective-plan.v1`, validates it, writes it under `runs/<run-id>/manager-plans/`, and materializes the generated `task-assignment.v1` files.
+- `plan-objective --max-concurrency N` can run multiple capability-manager planners at once for the same objective.
+- `plan-phase --max-concurrency N` can run multiple objectives at once while sharing a bounded pool of planning slots across nested objective and capability managers.
 - `run-phase` continues to honor the resulting `bundle_plan` during deterministic acceptance review.
 - Planning prompts are intended to be self-contained. Objective and capability managers should use the injected runtime context and planning inputs directly rather than exploring the repository.
 - Use `--replace` if you want a new manager plan to overwrite the current objective's tasks for the active phase.

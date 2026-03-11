@@ -5,6 +5,7 @@ import subprocess
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -26,7 +27,7 @@ from company_orchestrator.prompts import build_planning_payload, render_prompt
 from company_orchestrator.recovery import RecoveryBlockedError, reconcile_run
 from company_orchestrator.reports import advance_phase, generate_phase_report, record_human_approval
 from company_orchestrator.smoke import scaffold_smoke_test, simulate_context_echo_completion, verify_smoke_reports
-from company_orchestrator.live import ensure_activity, read_activity, record_event, update_activity
+from company_orchestrator.live import ensure_activity, read_activity, read_activity_history, record_event, update_activity
 from company_orchestrator.worktree_manager import commit_task_workspace, ensure_run_integration_workspace, ensure_task_workspace
 from company_orchestrator.bundles import land_accepted_bundle
 
@@ -1182,45 +1183,29 @@ class OrchestratorTests(unittest.TestCase):
         objective_outline = objective_outline_for_objective("planned-capability", "app-a", ["frontend", "backend"])
         frontend_plan = capability_plan_for_objective("planned-capability", "app-a", "frontend")
         backend_plan = capability_plan_for_objective("planned-capability", "app-a", "backend")
-        responses = [
-            completed_process(
-                stdout="\n".join(
-                    [
-                        '{"type":"thread.started","thread_id":"objective-thread"}',
-                        '{"type":"turn.started"}',
-                        json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(objective_outline)}),
-                        '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
-                    ]
-                ),
-                stderr="",
-                returncode=0,
-            ),
-            completed_process(
-                stdout="\n".join(
-                    [
-                        '{"type":"thread.started","thread_id":"frontend-thread"}',
-                        '{"type":"turn.started"}',
-                        json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(frontend_plan)}),
-                        '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
-                    ]
-                ),
-                stderr="",
-                returncode=0,
-            ),
-            completed_process(
-                stdout="\n".join(
-                    [
-                        '{"type":"thread.started","thread_id":"backend-thread"}',
-                        '{"type":"turn.started"}',
-                        json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(backend_plan)}),
-                        '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
-                    ]
-                ),
-                stderr="",
-                returncode=0,
-            ),
-        ]
-        with patch("company_orchestrator.objective_planner.run_codex_command", side_effect=responses):
+
+        def side_effect(*args: object, **kwargs: object):
+            command_text = " ".join(str(part) for part in args[0])
+            if "objective-outline.v1.json" in command_text:
+                payload = objective_outline
+                thread_id = "objective-thread"
+            elif "discovery-app-a-backend" in command_text:
+                payload = backend_plan
+                thread_id = "backend-thread"
+            else:
+                payload = frontend_plan
+                thread_id = "frontend-thread"
+            stdout = "\n".join(
+                [
+                    f'{{"type":"thread.started","thread_id":"{thread_id}"}}',
+                    '{"type":"turn.started"}',
+                    json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(payload)}),
+                    '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
+                ]
+            )
+            return completed_process(stdout=stdout, stderr="", returncode=0)
+
+        with patch("company_orchestrator.objective_planner.run_codex_command", side_effect=side_effect):
             summary = plan_objective(self.project_root, "planned-capability", "app-a")
         self.assertEqual(summary["planning_mode"], "capability_managed")
         self.assertEqual(len(summary["capability_summaries"]), 2)
@@ -1248,6 +1233,48 @@ class OrchestratorTests(unittest.TestCase):
             / "plan__discovery__app-a__frontend.json"
         )
         self.assertEqual(capability_activity["kind"], "capability_plan")
+
+    def test_plan_objective_runs_capability_managers_concurrently(self) -> None:
+        scaffold_planning_run(self.project_root, "planned-capability-parallel", ["frontend", "backend"])
+        objective_outline = objective_outline_for_objective("planned-capability-parallel", "app-a", ["frontend", "backend"])
+        frontend_plan = capability_plan_for_objective("planned-capability-parallel", "app-a", "frontend")
+        backend_plan = capability_plan_for_objective("planned-capability-parallel", "app-a", "backend")
+        lock = threading.Lock()
+        active_calls = 0
+        max_active = 0
+
+        def side_effect(*args: object, **kwargs: object):
+            nonlocal active_calls, max_active
+            command_text = " ".join(str(part) for part in args[0])
+            if "objective-outline.v1.json" in command_text:
+                payload = objective_outline
+            elif "discovery-app-a-backend" in command_text:
+                payload = backend_plan
+            else:
+                payload = frontend_plan
+            with lock:
+                active_calls += 1
+                max_active = max(max_active, active_calls)
+            try:
+                time.sleep(0.05)
+                stdout = "\n".join(
+                    [
+                        '{"type":"thread.started","thread_id":"parallel-plan-thread"}',
+                        '{"type":"turn.started"}',
+                        json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(payload)}),
+                        '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
+                    ]
+                )
+                return completed_process(stdout=stdout, stderr="", returncode=0)
+            finally:
+                with lock:
+                    active_calls -= 1
+
+        with patch("company_orchestrator.objective_planner.run_codex_command", side_effect=side_effect):
+            summary = plan_objective(self.project_root, "planned-capability-parallel", "app-a", max_concurrency=2)
+
+        self.assertEqual(summary["max_concurrency"], 2)
+        self.assertGreaterEqual(max_active, 2)
 
     def test_plan_objective_rejects_unresolved_generated_inputs(self) -> None:
         scaffold_planning_run(self.project_root, "planned-unresolved", ["frontend"])
@@ -1457,13 +1484,13 @@ class OrchestratorTests(unittest.TestCase):
         scaffold_dual_planning_run(self.project_root, "plan-phase")
 
         def side_effect(*args: object, **kwargs: object):
-            prompt = str(kwargs.get("prompt", ""))
-            objective_id = "app-a" if '"objective_id": "app-a"' in prompt else "app-b"
-            if '"planning_schema": "objective-outline.v1"' in prompt:
+            command_text = " ".join(str(part) for part in args[0])
+            objective_id = "app-b" if "discovery-app-b" in command_text else "app-a"
+            if "objective-outline.v1.json" in command_text:
                 capabilities = ["frontend"] if objective_id == "app-a" else ["backend"]
                 payload = objective_outline_for_objective("plan-phase", objective_id, capabilities)
             else:
-                capability = "frontend" if '"capability": "frontend"' in prompt else "backend"
+                capability = "backend" if "discovery-app-b-backend" in command_text else "frontend"
                 payload = capability_plan_for_objective("plan-phase", objective_id, capability)
             stdout = "\n".join(
                 [
@@ -1481,6 +1508,47 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(len(summary["planned_objectives"]), 2)
         self.assertTrue((self.project_root / "runs" / "plan-phase" / "tasks" / "APP-A-FRONTEND-001.json").exists())
         self.assertTrue((self.project_root / "runs" / "plan-phase" / "tasks" / "APP-B-BACKEND-001.json").exists())
+
+    def test_plan_phase_runs_objectives_concurrently(self) -> None:
+        scaffold_dual_planning_run(self.project_root, "plan-phase-parallel")
+        lock = threading.Lock()
+        active_calls = 0
+        max_active = 0
+
+        def side_effect(*args: object, **kwargs: object):
+            nonlocal active_calls, max_active
+            command_text = " ".join(str(part) for part in args[0])
+            objective_id = "app-b" if "discovery-app-b" in command_text else "app-a"
+            if "objective-outline.v1.json" in command_text:
+                capabilities = ["frontend"] if objective_id == "app-a" else ["backend"]
+                payload = objective_outline_for_objective("plan-phase-parallel", objective_id, capabilities)
+            else:
+                capability = "backend" if "discovery-app-b-backend" in command_text else "frontend"
+                payload = capability_plan_for_objective("plan-phase-parallel", objective_id, capability)
+            with lock:
+                active_calls += 1
+                max_active = max(max_active, active_calls)
+            try:
+                time.sleep(0.05)
+                stdout = "\n".join(
+                    [
+                        '{"type":"thread.started","thread_id":"parallel-phase-thread"}',
+                        '{"type":"turn.started"}',
+                        json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(payload)}),
+                        '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
+                    ]
+                )
+                return completed_process(stdout=stdout, stderr="", returncode=0)
+            finally:
+                with lock:
+                    active_calls -= 1
+
+        with patch("company_orchestrator.objective_planner.run_codex_command", side_effect=side_effect):
+            summary = plan_phase(self.project_root, "plan-phase-parallel", max_concurrency=2)
+
+        self.assertEqual(summary["max_concurrency"], 2)
+        self.assertEqual(len(summary["planned_objectives"]), 2)
+        self.assertGreaterEqual(max_active, 2)
 
     def test_monitoring_renderers_show_sections_and_prompt_details(self) -> None:
         scaffold_smoke_test(self.project_root, "monitor")
@@ -1513,6 +1581,14 @@ class OrchestratorTests(unittest.TestCase):
         self.assertIn("Run Status", run_output)
         self.assertIn("Active Task Activities", run_output)
         self.assertIn("Objective Progress", run_output)
+        self.assertIn("OBJ-", run_output)
+        self.assertIn("TSK-", run_output)
+        self.assertIn("Activity History", run_output)
+
+        history = read_activity_history(self.project_root, "monitor")
+        self.assertTrue(history)
+        self.assertEqual(history[-1]["activity_id"], "APP-A-SMOKE-001")
+        self.assertEqual(history[-1]["status"], "ready_for_bundle_review")
 
         console = Console(record=True, width=140)
         console.print(build_activity_detail(self.project_root, "monitor", "APP-A-SMOKE-001", events=10))
@@ -1520,6 +1596,7 @@ class OrchestratorTests(unittest.TestCase):
         self.assertIn("Prompt", detail_output)
         self.assertIn("Task Assignment", detail_output)
         self.assertIn("Latest Events", detail_output)
+        self.assertIn("Display ID", detail_output)
 
     def test_inspect_activity_reports_missing_activity_cleanly(self) -> None:
         scaffold_smoke_test(self.project_root, "missing-activity")
