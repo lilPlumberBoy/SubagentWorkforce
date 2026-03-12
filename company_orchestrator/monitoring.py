@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import time
 import threading
 import hashlib
@@ -14,7 +15,9 @@ from rich.table import Table
 from rich.text import Text
 
 from .filesystem import load_optional_json, read_text
+from .handoffs import list_handoffs
 from .live import list_activities, read_activity, read_activity_history, read_events, read_run_state
+from .management import run_guidance
 
 T = TypeVar("T")
 
@@ -92,6 +95,7 @@ def build_run_dashboard(project_root: Path, run_id: str):
     current_phase = run_state["current_phase"]
     activities = list_activities(project_root, run_id, phase=current_phase)
     history = read_activity_history(project_root, run_id)
+    handoffs = list_handoffs(project_root / "runs" / run_id, phase=current_phase)
     active_plans = [
         activity
         for activity in activities
@@ -122,11 +126,13 @@ def build_run_dashboard(project_root: Path, run_id: str):
         build_activity_table("Active Task Activities", active_tasks, objective_lookup),
         build_activity_table("Queued Tasks", queued_tasks, objective_lookup),
         build_activity_table("Blocked Tasks", blocked_tasks, objective_lookup),
+        build_handoff_table("Collaboration Handoffs", handoffs, objective_lookup),
         build_activity_table("Interrupted / Recovered Activities", interrupted_activities, objective_lookup),
         build_warning_rollup_panel(activities, objective_lookup),
         build_recovery_rollup_panel(activities),
         build_phase_progress_panel(objectives, activities),
         build_activity_history_panel(history, objective_lookup),
+        build_run_guidance_panel(project_root, run_id, current_phase),
     ]
     return Group(*renderables)
 
@@ -147,7 +153,7 @@ def build_run_header(run_id: str, run_state: dict[str, Any]) -> Panel:
     text = Text()
     text.append(f"Run: {run_id}\n", style="bold")
     text.append(f"Phase: {run_state['current_phase']}\n")
-    text.append(f"Updated: {run_state['updated_at']}")
+    text.append(f"Updated: {run_state['updated_at']} ({age_text(run_state['updated_at'])})")
     return Panel(text, title="Run Status", border_style="green")
 
 
@@ -197,9 +203,11 @@ def build_activity_table(title: str, activities: list[dict[str, Any]], objective
     table.add_column("Status")
     table.add_column("Warnings")
     table.add_column("Progress")
+    table.add_column("Elapsed")
+    table.add_column("Last Event")
     table.add_column("Current")
     if not activities:
-        table.add_row("none", "-", "-", "-", progress_renderable(0.0), "-")
+        table.add_row("none", "-", "-", "-", progress_renderable(0.0), "-", "-", "-")
         return table
     for activity in sorted(activities, key=activity_sort_key):
         warnings_text = "; ".join(item["message"] for item in activity.get("warnings", [])) or "-"
@@ -209,6 +217,8 @@ def build_activity_table(title: str, activities: list[dict[str, Any]], objective
             status_label(activity),
             warnings_text,
             progress_renderable(activity["progress_fraction"]),
+            elapsed_text(activity),
+            last_event_age_text(activity),
             activity.get("current_activity") or "-",
         )
     return table
@@ -226,6 +236,9 @@ def build_activity_summary_panel(activity: dict[str, Any]) -> Panel:
         f"Attempt: {activity.get('attempt', 1)}",
         f"Stage: {activity['progress_stage']}",
         f"Progress: {percent_text(activity['progress_fraction'])}",
+        f"Elapsed: {elapsed_text(activity)}",
+        f"Latest event: {activity.get('latest_event', {}).get('event_type') or '-'}",
+        f"Last event age: {last_event_age_text(activity)}",
         f"Status reason: {activity.get('status_reason') or '-'}",
         f"Recovery action: {activity.get('recovery_action') or '-'}",
         f"Interrupted at: {activity.get('interrupted_at') or '-'}",
@@ -244,6 +257,29 @@ def build_activity_summary_panel(activity: dict[str, Any]) -> Panel:
         for item in warnings:
             lines.append(f"- {item['code']}: {item['message']}")
     return Panel("\n".join(lines), title="Activity", border_style="yellow")
+
+
+def build_handoff_table(title: str, handoffs: list[dict[str, Any]], objective_lookup: dict[str, dict[str, str]]) -> Table:
+    table = Table(title=title, expand=True)
+    table.add_column("Handoff")
+    table.add_column("Objective")
+    table.add_column("Status")
+    table.add_column("From")
+    table.add_column("To Tasks")
+    table.add_column("Blocking")
+    if not handoffs:
+        table.add_row("none", "-", "-", "-", "-", "-")
+        return table
+    for handoff in sorted(handoffs, key=lambda item: (item["objective_id"], item["handoff_id"])):
+        table.add_row(
+            stable_code("HOF", handoff["handoff_id"]) + f" · {handoff['handoff_id']}",
+            objective_label(handoff["objective_id"], objective_lookup),
+            f"{handoff['status']} ({handoff.get('status_reason') or '-'})",
+            handoff["from_task_id"],
+            ", ".join(handoff.get("to_task_ids", [])) or "-",
+            "yes" if handoff.get("blocking") else "no",
+        )
+    return table
 
 
 def build_event_table(events: list[dict[str, Any]], *, title: str) -> Table:
@@ -295,6 +331,40 @@ def build_recovery_rollup_panel(activities: list[dict[str, Any]]) -> Panel:
     if not lines:
         lines = ["- none"]
     return Panel("\n".join(lines), title="Recovery Actions", border_style="yellow")
+
+
+def build_run_guidance_panel(project_root: Path, run_id: str, phase: str) -> Panel:
+    run_dir = project_root / "runs" / run_id
+    tasks = []
+    for path in sorted((run_dir / "tasks").glob("*.json")):
+        payload = load_optional_json(path)
+        if payload and payload.get("phase") == phase:
+            tasks.append(payload)
+    manager_summary = load_optional_json(run_dir / "manager-runs" / f"phase-{phase}.json") or {}
+    guidance = run_guidance(
+        project_root,
+        run_id,
+        phase=phase,
+        tasks=tasks,
+        scheduler_summary=manager_summary.get("scheduled", {}),
+    )
+    status = guidance["run_status"]
+    border_style = {
+        "working": "green",
+        "ready_for_review": "yellow",
+        "ready_to_advance": "cyan",
+        "recoverable": "magenta",
+        "blocked": "red",
+    }.get(status, "green")
+    lines = [
+        f"Status: {status}",
+        f"Reason: {guidance['run_status_reason']}",
+        f"Next action: {guidance.get('next_action_command') or 'none'}",
+        f"Action reason: {guidance['next_action_reason']}",
+        f"Review doc: {guidance.get('review_doc_path') or 'none'}",
+        f"Recommendation: {guidance.get('phase_recommendation') or 'none'}",
+    ]
+    return Panel("\n".join(lines), title="Next Action", border_style=border_style)
 
 
 def build_activity_history_panel(history: list[dict[str, Any]], objective_lookup: dict[str, dict[str, str]]) -> Panel:
@@ -419,3 +489,36 @@ def status_label(activity: dict[str, Any]) -> str:
     if activity.get("status_reason"):
         return f"{activity['status']} ({activity['status_reason']})"
     return activity["status"]
+
+
+def parse_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def age_text(value: str | None) -> str:
+    timestamp = parse_timestamp(value)
+    if timestamp is None:
+        return "-"
+    delta = datetime.now(timezone.utc) - timestamp.astimezone(timezone.utc)
+    seconds = max(0, int(delta.total_seconds()))
+    if seconds < 60:
+        return f"{seconds}s ago"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {seconds}s ago"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m ago"
+
+
+def elapsed_text(activity: dict[str, Any]) -> str:
+    return age_text(activity.get("started_at"))
+
+
+def last_event_age_text(activity: dict[str, Any]) -> str:
+    latest_event = activity.get("latest_event") or {}
+    return age_text(latest_event.get("timestamp") or activity.get("updated_at"))

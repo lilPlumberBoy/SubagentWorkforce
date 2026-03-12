@@ -14,6 +14,7 @@ from .live import append_activity_warning, ensure_activity, now_timestamp, recor
 from .prompts import render_prompt
 from .recovery import prepare_activity_retry, reconcile_for_command
 from .schemas import SchemaValidationError, validate_document
+from .timeout_policy import resolve_task_timeout_policy, timeout_final_message, timeout_retry_message
 from .worktree_manager import WorkspaceInfo, WorktreeError, commit_task_workspace, ensure_task_workspace
 
 
@@ -127,7 +128,7 @@ def execute_task(
     *,
     sandbox_mode: str = "read-only",
     codex_path: str = "codex",
-    timeout_seconds: int = 300,
+    timeout_seconds: int | None = None,
     runtime: TaskExecutionRuntime | None = None,
     allow_recovery_blocked: bool = False,
 ) -> dict[str, Any]:
@@ -139,6 +140,7 @@ def execute_task(
 
     task = read_json(task_path)
     runtime = runtime or TaskExecutionRuntime()
+    timeout_policy = resolve_task_timeout_policy(task["phase"], task.get("execution_mode", "read_only"), timeout_seconds)
     previous_activity = prepare_activity_retry(
         project_root,
         run_id,
@@ -258,48 +260,104 @@ def execute_task(
             },
         )
 
-    try:
-        completed = run_codex_command(
-            command,
-            prompt=execution_prompt,
-            cwd=project_root,
-            env=build_exec_environment(),
-            timeout_seconds=timeout_seconds,
-            on_stdout_line=on_stdout_line,
-            on_process_started=on_process_started,
-        )
-    except subprocess.TimeoutExpired as exc:
-        stdout = coerce_process_text(exc.stdout)
-        stderr = coerce_process_text(exc.stderr)
-        write_text(stdout_path, stdout)
-        write_text(stderr_path, stderr)
-        update_activity(
-            project_root,
-            run_id,
-            task_id,
-            status="failed",
-            progress_stage="failed",
-            current_activity=f"Timed out after {timeout_seconds} seconds.",
-            warnings=list(runtime.runtime_warnings),
-            parallel_execution_requested=runtime.parallel_execution_requested,
-            parallel_execution_granted=runtime.parallel_execution_granted,
-            parallel_fallback_reason=runtime.parallel_fallback_reason,
-            workspace_path=runtime.workspace_path,
-            branch_name=runtime.branch_name,
-            process_metadata=None,
-        )
-        record_event(
-            project_root,
-            run_id,
-            phase=task["phase"],
-            activity_id=task_id,
-            event_type="task.failed",
-            message=f"Task {task_id} timed out after {timeout_seconds} seconds.",
-            payload={"timeout_seconds": timeout_seconds},
-        )
-        raise ExecutorError(f"codex exec timed out after {timeout_seconds} seconds for task {task_id}") from exc
-    write_text(stdout_path, completed.stdout)
-    write_text(stderr_path, completed.stderr)
+    stdout_attempts: list[str] = []
+    stderr_attempts: list[str] = []
+    total_attempts = timeout_policy.max_timeout_retries + 1
+    completed: CodexProcessResult | None = None
+    for timeout_attempt in range(1, total_attempts + 1):
+        try:
+            completed = run_codex_command(
+                command,
+                prompt=execution_prompt,
+                cwd=project_root,
+                env=build_exec_environment(),
+                timeout_seconds=timeout_policy.timeout_seconds,
+                on_stdout_line=on_stdout_line,
+                on_process_started=on_process_started,
+            )
+            break
+        except subprocess.TimeoutExpired as exc:
+            stdout_attempts.append(coerce_process_text(exc.stdout))
+            stderr_attempts.append(coerce_process_text(exc.stderr))
+            write_text(stdout_path, "".join(stdout_attempts))
+            write_text(stderr_path, "".join(stderr_attempts))
+            if timeout_attempt <= timeout_policy.max_timeout_retries:
+                message = timeout_retry_message(
+                    "task",
+                    task_id,
+                    timeout_seconds=timeout_policy.timeout_seconds,
+                    attempt=timeout_attempt,
+                    max_attempts=total_attempts,
+                )
+                update_activity(
+                    project_root,
+                    run_id,
+                    task_id,
+                    status="recovering",
+                    progress_stage="recovering",
+                    current_activity=message,
+                    status_reason="timeout_retry_scheduled",
+                    warnings=list(runtime.runtime_warnings),
+                    parallel_execution_requested=runtime.parallel_execution_requested,
+                    parallel_execution_granted=runtime.parallel_execution_granted,
+                    parallel_fallback_reason=runtime.parallel_fallback_reason,
+                    workspace_path=runtime.workspace_path,
+                    branch_name=runtime.branch_name,
+                    process_metadata=None,
+                )
+                record_event(
+                    project_root,
+                    run_id,
+                    phase=task["phase"],
+                    activity_id=task_id,
+                    event_type="task.timeout_retry_scheduled",
+                    message=message,
+                    payload={
+                        "timeout_seconds": timeout_policy.timeout_seconds,
+                        "attempt": timeout_attempt,
+                        "max_attempts": total_attempts,
+                    },
+                )
+                continue
+            failure_message = timeout_final_message(
+                "task",
+                task_id,
+                timeout_seconds=timeout_policy.timeout_seconds,
+                attempts=total_attempts,
+                resume_recommended=task.get("execution_mode", "read_only") == "isolated_write",
+                explicit_override=timeout_policy.source == "explicit",
+            )
+            update_activity(
+                project_root,
+                run_id,
+                task_id,
+                status="failed",
+                progress_stage="failed",
+                current_activity=failure_message,
+                status_reason="timeout_exhausted",
+                warnings=list(runtime.runtime_warnings),
+                parallel_execution_requested=runtime.parallel_execution_requested,
+                parallel_execution_granted=runtime.parallel_execution_granted,
+                parallel_fallback_reason=runtime.parallel_fallback_reason,
+                workspace_path=runtime.workspace_path,
+                branch_name=runtime.branch_name,
+                process_metadata=None,
+            )
+            record_event(
+                project_root,
+                run_id,
+                phase=task["phase"],
+                activity_id=task_id,
+                event_type="task.failed",
+                message=failure_message,
+                payload={"timeout_seconds": timeout_policy.timeout_seconds, "attempts": total_attempts},
+            )
+            raise ExecutorError(failure_message) from exc
+    assert completed is not None
+    stdout_attempts.append(completed.stdout)
+    stderr_attempts.append(completed.stderr)
+    write_text(stdout_path, "".join(stdout_attempts))
+    write_text(stderr_path, "".join(stderr_attempts))
 
     events = parse_jsonl_events(completed.stdout)
     failure = extract_turn_failure(events)
@@ -379,14 +437,16 @@ def execute_task(
         runtime_warnings=runtime.runtime_warnings,
         runtime_recovery={
             "attempt": runtime.attempt,
-            "recovery_action": runtime.recovery_action,
+            "recovery_action": runtime.recovery_action or ("timeout_retry" if len(stdout_attempts) > 1 else None),
             "workspace_reused": runtime.workspace_reused,
+            "timeout_retries_used": max(0, len(stdout_attempts) - 1),
         },
     )
     if task.get("execution_mode", "read_only") == "isolated_write" and report["status"] == "ready_for_bundle_review":
         commit_result = commit_isolated_workspace(runtime, task_id)
         runtime.commit_sha = commit_result.get("commit_sha")
-    activity_status = "recovered" if runtime.attempt > 1 or runtime.recovery_action else report["status"]
+    recovery_action = runtime.recovery_action or ("timeout_retry" if len(stdout_attempts) > 1 else None)
+    activity_status = "recovered" if runtime.attempt > 1 or recovery_action else report["status"]
     update_activity(
         project_root,
         run_id,
@@ -405,7 +465,7 @@ def execute_task(
         branch_name=runtime.branch_name,
         process_metadata=None,
         recovered_at=now_timestamp() if activity_status == "recovered" else None,
-        recovery_action=runtime.recovery_action,
+        recovery_action=recovery_action,
     )
     record_event(
         project_root,
@@ -424,7 +484,7 @@ def execute_task(
             "branch_name": runtime.branch_name,
             "workspace_path": runtime.workspace_path,
             "commit_sha": runtime.commit_sha,
-            "recovery_action": runtime.recovery_action,
+            "recovery_action": recovery_action,
             "workspace_reused": runtime.workspace_reused,
         },
     )

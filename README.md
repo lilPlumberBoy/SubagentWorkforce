@@ -6,7 +6,7 @@ Local-first scaffolding for a company-style subagent orchestration system. The r
 
 - A Python CLI for creating runs, decomposing goals, suggesting teams, generating role files, rendering prompts, executing tasks through Codex CLI, running objective/phase manager flows, reviewing bundles, creating phase reports, and managing change requests.
 - A Codex CLI executor adapter that renders task prompts, runs `codex exec --json`, validates structured output, writes completion reports, and creates collaboration requests when an agent blocks on another team.
-- On-disk JSON contracts for phase plans, objective maps, team registries, task assignments, completion reports, review bundles, collaboration requests, phase reports, change requests, and change proposals.
+- On-disk JSON contracts for phase plans, objective maps, team registries, task assignments, completion reports, review bundles, planned collaboration handoffs, collaboration requests, phase reports, change requests, and change proposals.
 - Markdown role assets for base roles, capability overlays, phase overlays, and reusable templates.
 - A smoke-test scaffold that creates two isolated objectives and verifies prompt inheritance, context echo reporting, and acceptance review.
 - A test suite covering phase locks, objective isolation, bundle rejection on blocking collaboration, phase advancement gating, and change re-entry.
@@ -22,6 +22,12 @@ company-orchestrator suggest-teams run-001
 company-orchestrator generate-roles run-001 --approve
 company-orchestrator plan-phase run-001 --sandbox read-only --max-concurrency 3
 company-orchestrator run-phase run-001 --sandbox read-only --max-concurrency 3
+```
+
+Or use the higher-level bootstrap path to initialize the run, generate roles, and immediately plan the first phase:
+
+```bash
+company-orchestrator bootstrap-run run-001 path/to/goal.md --sandbox read-only --max-concurrency 3 --watch
 ```
 
 Start from the fill-in template at [orchestrator/templates/goal-template.md](/Users/mike/projects/personal/SubagentWorkforce/orchestrator/templates/goal-template.md). The example todo-app goal lives at [goal-draft.md](/Users/mike/projects/personal/SubagentWorkforce/apps/todo/goal-draft.md).
@@ -80,6 +86,7 @@ Objective-specific roles can live either in the generic tree above or under an a
 - `run-objective` schedules all active-phase tasks for one objective, executes ready tasks, assembles the objective bundle, and runs acceptance review.
 - `run-phase` does the same across every objective in the active phase, then writes the end-of-phase report automatically.
 - Task dependencies declared in `depends_on` are respected before execution.
+- Blocking collaboration handoffs are now treated as scheduler gates. Downstream tasks wait until the producing task/report satisfies the handoff deliverables.
 - `--max-concurrency` controls how many safe tasks the controller may run at the same time. The default is `3`.
 - Tasks that are not safe to parallelize fall back to serialized execution with a warning instead of failing the run.
 - Code-writing tasks use run-scoped git worktree isolation. Accepted work lands on a dedicated run integration branch `codex/run-<run-id>`, not directly on your current branch.
@@ -109,7 +116,22 @@ company-orchestrator plan-phase run-001 --sandbox read-only --watch
 company-orchestrator run-phase run-001 --sandbox read-only --watch
 ```
 
-`watch-run` shows the run header, summary counts, objective progress, active planning activities, active task activities, queued work, blocked work, parallelism warnings, and a phase-level progress bar.
+`watch-run` shows the run header, a `Next Action` panel, summary counts, objective progress, active planning activities, active task activities, queued work, blocked work, collaboration handoffs, parallelism warnings, and a phase-level progress bar.
+
+The `Next Action` panel and command JSON output both surface:
+- `run_status`
+- `run_status_reason`
+- `next_action_command`
+- `next_action_reason`
+- `review_doc_path`
+
+This is intended to tell the human exactly what to do next when a run is:
+- actively working
+- recoverable after interruption or stale planning
+- ready for review
+- ready to advance
+
+Operator commands now print a compact human summary by default. Pass `--json` to any CLI command when you need the full machine-readable payload instead.
 
 `inspect-activity` shows the activity metadata, full rendered prompt, latest live events, parallel fallback warnings, and the paths to stdout, stderr, workspace, branch, and the final output artifact.
 
@@ -146,10 +168,13 @@ company-orchestrator retry-activity run-001 APP-A-DISC-001 --sandbox read-only
 - The objective manager returns an `objective-outline.v1` describing capability lanes and cross-lane coordination.
 - One capability manager per lane then returns `capability-plan.v1` task bundles for that lane.
 - Python aggregates those capability plans into the final `objective-plan.v1`, validates it, writes it under `runs/<run-id>/manager-plans/`, and materializes the generated `task-assignment.v1` files.
+- Capability managers are expected to emit concrete `owned_paths`, `shared_asset_ids`, and `collaboration_handoffs`, not just lane-local task lists.
+- Planned cross-lane handoffs are materialized under `runs/<run-id>/collaboration-plans/` as `collaboration-handoff.v1` artifacts, consumed by the scheduler as real readiness gates, and summarized in phase reports.
 - `plan-objective --max-concurrency N` can run multiple capability-manager planners at once for the same objective.
 - `plan-phase --max-concurrency N` can run multiple objectives at once while sharing a bounded pool of planning slots across nested objective and capability managers.
 - `run-phase` continues to honor the resulting `bundle_plan` during deterministic acceptance review.
 - Planning prompts are intended to be self-contained. Objective and capability managers should use the injected runtime context and planning inputs directly rather than exploring the repository.
+- Planning prompts now use a compact goal/context view for manager reasoning, while worker input resolution still retains the full run payload.
 - Use `--replace` if you want a new manager plan to overwrite the current objective's tasks for the active phase.
 
 ## Running Tests

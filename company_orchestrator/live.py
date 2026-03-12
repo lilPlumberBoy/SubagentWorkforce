@@ -128,6 +128,8 @@ def ensure_activity(
     parallel_fallback_reason: str | None = None,
     workspace_path: str | None = None,
     branch_name: str | None = None,
+    dependency_blocker_fingerprint: str | None = None,
+    handoff_blocker_fingerprint: str | None = None,
     attempt: int | None = None,
     status_reason: str | None = None,
     interrupted_at: str | None = None,
@@ -193,6 +195,16 @@ def ensure_activity(
             ),
             "workspace_path": workspace_path if workspace_path is not None else (existing.get("workspace_path") if existing else None),
             "branch_name": branch_name if branch_name is not None else (existing.get("branch_name") if existing else None),
+            "dependency_blocker_fingerprint": (
+                dependency_blocker_fingerprint
+                if dependency_blocker_fingerprint is not None
+                else (existing.get("dependency_blocker_fingerprint") if existing else None)
+            ),
+            "handoff_blocker_fingerprint": (
+                handoff_blocker_fingerprint
+                if handoff_blocker_fingerprint is not None
+                else (existing.get("handoff_blocker_fingerprint") if existing else None)
+            ),
             "current_activity": current_activity,
             "prompt_path": prompt_path,
             "stdout_path": stdout_path,
@@ -473,6 +485,8 @@ def normalize_activity_payload(payload: dict[str, Any]) -> dict[str, Any]:
     normalized.setdefault("parallel_fallback_reason", None)
     normalized.setdefault("workspace_path", None)
     normalized.setdefault("branch_name", None)
+    normalized.setdefault("dependency_blocker_fingerprint", None)
+    normalized.setdefault("handoff_blocker_fingerprint", None)
     return normalized
 
 

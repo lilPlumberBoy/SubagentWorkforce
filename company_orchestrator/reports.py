@@ -6,6 +6,7 @@ from typing import Any
 from .bundle_plans import objective_bundle_specs
 from .constants import PHASES
 from .filesystem import read_json, write_json, write_text
+from .handoffs import HANDOFF_BLOCKED, HANDOFF_SATISFIED, PENDING_HANDOFF_STATUSES
 from .live import initialize_live_run, record_event, refresh_run_state
 from .parallelism import summarize_parallelism_for_phase
 from .recovery import summarize_recovery_for_phase
@@ -74,6 +75,7 @@ def generate_phase_report(project_root: Path, run_id: str) -> tuple[dict[str, An
         if task["phase"] == phase:
             phase_tasks.append(task)
     parallelism_summary = summarize_parallelism_for_phase(run_dir, phase, phase_tasks)
+    collaboration_summary = summarize_collaboration_for_phase(run_dir, phase, objective_map["objectives"])
     recovery_summary = summarize_recovery_for_phase(project_root, run_id, phase)
     payload = {
         "schema": "phase-report.v1",
@@ -84,6 +86,7 @@ def generate_phase_report(project_root: Path, run_id: str) -> tuple[dict[str, An
         "accepted_bundles": accepted_bundle_ids,
         "unresolved_risks": [bundle["bundle_id"] for bundle in rejected] + [bundle["bundle_id"] for bundle in blocked],
         "parallelism_summary": parallelism_summary,
+        "collaboration_summary": collaboration_summary,
         "recovery_summary": recovery_summary,
         "proposed_role_changes": [],
         "recommendation": recommendation,
@@ -165,12 +168,93 @@ def render_phase_report_markdown(report: dict[str, Any]) -> str:
             f"- abandoned attempts: {report['recovery_summary']['abandoned_attempts']}",
         ]
     )
+    lines.extend(
+        [
+            "",
+            "## Collaboration Summary",
+            f"- total handoffs: {report['collaboration_summary']['total_handoffs']}",
+            f"- blocking handoffs: {report['collaboration_summary']['blocking_handoffs']}",
+            f"- satisfied handoffs: {report['collaboration_summary']['satisfied_handoffs']}",
+            f"- pending handoffs: {report['collaboration_summary']['pending_handoffs']}",
+            f"- blocked handoffs: {report['collaboration_summary']['blocked_handoffs']}",
+        ]
+    )
+    if report["collaboration_summary"]["handoffs_by_objective"]:
+        for item in report["collaboration_summary"]["handoffs_by_objective"]:
+            handoffs = ", ".join(item["handoff_ids"]) or "none"
+            lines.append(
+                f"- {item['objective_id']}: {item['total_handoffs']} handoffs "
+                f"({item['blocking_handoffs']} blocking, {item['satisfied_handoffs']} satisfied, "
+                f"{item['pending_handoffs']} pending, {item['blocked_handoffs']} blocked) [{handoffs}]"
+            )
+    else:
+        lines.append("- by objective: none")
+    if report["collaboration_summary"]["incidents"]:
+        lines.append("- incidents:")
+        for incident in report["collaboration_summary"]["incidents"]:
+            consumers = ", ".join(incident.get("consumer_task_ids", [])) or "none"
+            lines.append(
+                f"  - {incident['handoff_id']}: {incident['status']} ({incident['reason']}) "
+                f"[consumers: {consumers}] ({incident['artifact_path']})"
+            )
+    else:
+        lines.append("- incidents: none")
     if report["recovery_summary"]["incidents"]:
         for incident in report["recovery_summary"]["incidents"]:
             lines.append(f"- {incident['activity_id']}: {incident['status']} ({incident['reason']})")
     else:
         lines.append("- incidents: none")
     return "\n".join(lines)
+
+
+def summarize_collaboration_for_phase(run_dir: Path, phase: str, objectives: list[dict[str, Any]]) -> dict[str, Any]:
+    collaboration_dir = run_dir / "collaboration-plans"
+    handoffs = []
+    for path in sorted(collaboration_dir.glob("*.json")):
+        payload = read_json(path)
+        if payload["phase"] == phase:
+            handoffs.append(payload)
+    by_objective = []
+    incidents = []
+    for objective in objectives:
+        objective_handoffs = [handoff for handoff in handoffs if handoff["objective_id"] == objective["objective_id"]]
+        satisfied_handoffs = sum(1 for handoff in objective_handoffs if handoff.get("status") == HANDOFF_SATISFIED)
+        pending_handoffs = sum(1 for handoff in objective_handoffs if handoff.get("status") in PENDING_HANDOFF_STATUSES)
+        blocked_handoffs = sum(1 for handoff in objective_handoffs if handoff.get("status") == HANDOFF_BLOCKED)
+        by_objective.append(
+            {
+                "objective_id": objective["objective_id"],
+                "total_handoffs": len(objective_handoffs),
+                "blocking_handoffs": sum(1 for handoff in objective_handoffs if handoff["blocking"]),
+                "satisfied_handoffs": satisfied_handoffs,
+                "pending_handoffs": pending_handoffs,
+                "blocked_handoffs": blocked_handoffs,
+                "handoff_ids": [handoff["handoff_id"] for handoff in objective_handoffs],
+            }
+        )
+        for handoff in objective_handoffs:
+            status = handoff.get("status")
+            if status in {HANDOFF_SATISFIED, "planned"}:
+                continue
+            incidents.append(
+                {
+                    "handoff_id": handoff["handoff_id"],
+                    "status": status,
+                    "reason": handoff.get("status_reason") or "Handoff still waiting on required collaboration.",
+                    "artifact_path": str((run_dir / "collaboration-plans" / f"{handoff['handoff_id']}.json").relative_to(run_dir.parent.parent)),
+                    "objective_id": handoff["objective_id"],
+                    "consumer_task_ids": list(handoff.get("to_task_ids", [])),
+                }
+            )
+    return {
+        "total_handoffs": len(handoffs),
+        "blocking_handoffs": sum(1 for handoff in handoffs if handoff["blocking"]),
+        "satisfied_handoffs": sum(1 for handoff in handoffs if handoff.get("status") == HANDOFF_SATISFIED),
+        "pending_handoffs": sum(1 for handoff in handoffs if handoff.get("status") in PENDING_HANDOFF_STATUSES),
+        "blocked_handoffs": sum(1 for handoff in handoffs if handoff.get("status") == HANDOFF_BLOCKED),
+        "handoffs_by_objective": by_objective,
+        "incidents": incidents,
+    }
 
 
 def record_human_approval(project_root: Path, run_id: str, phase: str, approved: bool) -> dict[str, Any]:

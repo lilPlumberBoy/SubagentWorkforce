@@ -51,12 +51,28 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["from_capability", "to_role", "reason"],
+        "required": [
+          "edge_id",
+          "from_capability",
+          "to_capability",
+          "to_role",
+          "handoff_type",
+          "reason",
+          "deliverables",
+          "blocking",
+          "shared_asset_ids"
+        ],
         "additionalProperties": false,
         "properties": {
+          "edge_id": {"type": "string"},
           "from_capability": {"type": "string"},
+          "to_capability": {"type": "string"},
           "to_role": {"type": "string"},
-          "reason": {"type": "string"}
+          "handoff_type": {"type": "string"},
+          "reason": {"type": "string"},
+          "deliverables": {"type": "array", "items": {"type": "string"}},
+          "blocking": {"type": "boolean"},
+          "shared_asset_ids": {"type": "array", "items": {"type": "string"}}
         }
       }
     }

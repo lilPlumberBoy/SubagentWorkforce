@@ -9,6 +9,7 @@
     "accepted_bundles",
     "unresolved_risks",
     "parallelism_summary",
+    "collaboration_summary",
     "recovery_summary",
     "proposed_role_changes",
     "recommendation",
@@ -60,6 +61,67 @@
               "task_id": {"type": "string"},
               "reason": {"type": "string"},
               "artifact_path": {"type": "string"}
+            }
+          }
+        }
+      }
+    },
+    "collaboration_summary": {
+      "type": "object",
+      "required": [
+        "total_handoffs",
+        "blocking_handoffs",
+        "satisfied_handoffs",
+        "pending_handoffs",
+        "blocked_handoffs",
+        "handoffs_by_objective",
+        "incidents"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "total_handoffs": {"type": "number"},
+        "blocking_handoffs": {"type": "number"},
+        "satisfied_handoffs": {"type": "number"},
+        "pending_handoffs": {"type": "number"},
+        "blocked_handoffs": {"type": "number"},
+        "handoffs_by_objective": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "objective_id",
+              "total_handoffs",
+              "blocking_handoffs",
+              "satisfied_handoffs",
+              "pending_handoffs",
+              "blocked_handoffs",
+              "handoff_ids"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "objective_id": {"type": "string"},
+              "total_handoffs": {"type": "number"},
+              "blocking_handoffs": {"type": "number"},
+              "satisfied_handoffs": {"type": "number"},
+              "pending_handoffs": {"type": "number"},
+              "blocked_handoffs": {"type": "number"},
+              "handoff_ids": {"type": "array", "items": {"type": "string"}}
+            }
+          }
+        },
+        "incidents": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["handoff_id", "status", "reason", "artifact_path"],
+            "additionalProperties": false,
+            "properties": {
+              "handoff_id": {"type": "string"},
+              "status": {"type": "string"},
+              "reason": {"type": "string"},
+              "artifact_path": {"type": "string"},
+              "objective_id": {"type": "string"},
+              "consumer_task_ids": {"type": "array", "items": {"type": "string"}}
             }
           }
         }

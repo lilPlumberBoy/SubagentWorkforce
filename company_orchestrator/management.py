@@ -9,7 +9,8 @@ from .bundle_plans import objective_bundle_specs
 from .bundles import assemble_review_bundle, land_accepted_bundle, review_bundle
 from .executor import ExecutorError, TaskExecutionRuntime, execute_task
 from .filesystem import ensure_dir, load_optional_json, read_json, write_json
-from .live import activity_path, ensure_activity, initialize_live_run, record_event, update_activity
+from .handoffs import HANDOFF_BLOCKED, blocking_handoffs_for_task, list_handoffs, refresh_handoffs_for_phase
+from .live import activity_path, ensure_activity, initialize_live_run, list_activities, record_event, update_activity
 from .parallelism import classify_parallel_safety, parallel_requested, warning
 from .recovery import reconcile_for_command
 from .reports import generate_phase_report
@@ -22,7 +23,7 @@ def run_phase(
     sandbox_mode: str = "read-only",
     codex_path: str = "codex",
     force: bool = False,
-    timeout_seconds: int = 300,
+    timeout_seconds: int | None = None,
     max_concurrency: int = 3,
 ) -> dict[str, Any]:
     reconcile_for_command(project_root, run_id, apply=True)
@@ -51,6 +52,7 @@ def run_phase(
         "objectives": objective_summaries,
         "phase_report_path": str(phase_report_path.relative_to(project_root)),
         "recommendation": phase_report["recommendation"],
+        "recommended_next_command": suggested_recovery_command(project_root, run_id, phase, tasks, scheduler_summary),
     }
     write_manager_summary(run_dir, f"phase-{phase}", summary)
     return summary
@@ -64,7 +66,7 @@ def run_objective(
     sandbox_mode: str = "read-only",
     codex_path: str = "codex",
     force: bool = False,
-    timeout_seconds: int = 300,
+    timeout_seconds: int | None = None,
     max_concurrency: int = 3,
 ) -> dict[str, Any]:
     reconcile_for_command(project_root, run_id, apply=True)
@@ -90,6 +92,7 @@ def run_objective(
         "objective_id": objective_id,
         "scheduled": scheduler_summary,
         "objective": objective_summary,
+        "recommended_next_command": suggested_recovery_command(project_root, run_id, phase, tasks, scheduler_summary),
     }
     write_manager_summary(run_dir, f"{phase}-{objective_id}", summary)
     return summary
@@ -117,7 +120,7 @@ def schedule_tasks(
     sandbox_mode: str,
     codex_path: str,
     force: bool,
-    timeout_seconds: int,
+    timeout_seconds: int | None,
     max_concurrency: int,
 ) -> dict[str, Any]:
     reconcile_for_command(project_root, run_id, apply=True)
@@ -137,11 +140,14 @@ def schedule_tasks(
     skipped_existing: list[str] = []
     skipped_dependency: dict[str, list[str]] = {}
     unresolved_dependencies: dict[str, list[str]] = {}
+    blocked_handoffs: dict[str, list[str]] = {}
     failures: list[dict[str, str]] = []
     running: dict[str, dict[str, Any]] = {}
     warning_events_emitted: set[tuple[str, str]] = set()
+    handoff_events_emitted: set[tuple[str, str, tuple[str, ...]]] = set()
     forced_serialization: dict[str, tuple[str, str]] = {}
     max_concurrency = max(1, max_concurrency)
+    handoffs_by_id = refresh_handoffs_for_phase(project_root, run_id, tasks[0]["phase"], tasks_by_id) if tasks else {}
 
     def emit_parallel_warning(task: dict[str, Any], code: str, message: str) -> None:
         marker = (task["task_id"], code)
@@ -172,7 +178,10 @@ def schedule_tasks(
             "progress_stage": "queued",
             "current_activity": current_activity,
             "dependency_blockers": [],
+            "dependency_blocker_fingerprint": None,
+            "handoff_blocker_fingerprint": None,
             "queue_position": queue_position,
+            "status_reason": None,
             "parallel_execution_requested": parallel_requested(task),
         }
         if warnings is not None:
@@ -182,6 +191,115 @@ def schedule_tasks(
         if parallel_fallback_reason is not None:
             payload["parallel_fallback_reason"] = parallel_fallback_reason
         update_activity(project_root, run_id, task["task_id"], **payload)
+
+    def blockers_fingerprint(blockers: list[str]) -> str | None:
+        if not blockers:
+            return None
+        return "|".join(sorted(set(blockers)))
+
+    def read_task_activity(task_id: str) -> dict[str, Any]:
+        return load_optional_json(activity_path(run_dir, task_id)) or {}
+
+    def queue_state_changed(task_id: str, *, queue_position: int | None, current_activity: str) -> bool:
+        previous = read_task_activity(task_id)
+        return (
+            previous.get("status") != "queued"
+            or previous.get("queue_position") != queue_position
+            or previous.get("current_activity") != current_activity
+        )
+
+    def emit_resolution_events(task: dict[str, Any], previous: dict[str, Any]) -> None:
+        dependency_fingerprint = previous.get("dependency_blocker_fingerprint")
+        if dependency_fingerprint:
+            record_event(
+                project_root,
+                run_id,
+                phase=task["phase"],
+                activity_id=task["task_id"],
+                event_type="task.dependencies_resolved",
+                message=f"Task {task['task_id']} has all task dependencies resolved.",
+                payload={"resolved_dependency_blockers": dependency_fingerprint.split("|")},
+            )
+        handoff_fingerprint = previous.get("handoff_blocker_fingerprint")
+        if handoff_fingerprint:
+            record_event(
+                project_root,
+                run_id,
+                phase=task["phase"],
+                activity_id=task["task_id"],
+                event_type="task.handoffs_resolved",
+                message=f"Task {task['task_id']} has all blocking collaboration handoffs resolved.",
+                payload={"resolved_handoff_blockers": handoff_fingerprint.split("|")},
+            )
+
+    def set_dependency_wait_state(task: dict[str, Any], blockers: list[str]) -> None:
+        previous = read_task_activity(task["task_id"])
+        fingerprint = blockers_fingerprint(blockers)
+        update_activity(
+            project_root,
+            run_id,
+            task["task_id"],
+            status="waiting_dependencies",
+            progress_stage="waiting_dependencies",
+            current_activity="Waiting on dependency completion.",
+            dependency_blockers=blockers,
+            dependency_blocker_fingerprint=fingerprint,
+            handoff_blocker_fingerprint=None,
+            queue_position=None,
+            status_reason=None,
+        )
+        if (
+            previous.get("status") != "waiting_dependencies"
+            or previous.get("dependency_blocker_fingerprint") != fingerprint
+            or previous.get("current_activity") != "Waiting on dependency completion."
+            or previous.get("status_reason") is not None
+        ):
+            record_event(
+                project_root,
+                run_id,
+                phase=task["phase"],
+                activity_id=task["task_id"],
+                event_type="task.waiting_dependencies",
+                message=f"Task {task['task_id']} is waiting on dependencies.",
+                payload={"dependency_blockers": blockers},
+            )
+
+    def set_waiting_handoffs_state(task: dict[str, Any], handoffs: list[dict[str, Any]]) -> None:
+        previous = read_task_activity(task["task_id"])
+        blocker_ids = [handoff["handoff_id"] for handoff in handoffs]
+        fingerprint = blockers_fingerprint(blocker_ids)
+        reason = "Waiting on blocking collaboration handoff."
+        update_activity(
+            project_root,
+            run_id,
+            task["task_id"],
+            status="waiting_dependencies",
+            progress_stage="waiting_dependencies",
+            current_activity="Waiting on collaboration handoff completion.",
+            dependency_blockers=blocker_ids,
+            dependency_blocker_fingerprint=None,
+            handoff_blocker_fingerprint=fingerprint,
+            queue_position=None,
+            status_reason=reason,
+        )
+        if (
+            previous.get("status") != "waiting_dependencies"
+            or previous.get("handoff_blocker_fingerprint") != fingerprint
+            or previous.get("current_activity") != "Waiting on collaboration handoff completion."
+            or previous.get("status_reason") != reason
+        ):
+            record_event(
+                project_root,
+                run_id,
+                phase=task["phase"],
+                activity_id=task["task_id"],
+                event_type="task.waiting_handoffs",
+                message=f"Task {task['task_id']} is waiting on collaboration handoffs.",
+                payload={
+                    "handoff_ids": blocker_ids,
+                    "reasons": [handoff.get("status_reason") for handoff in handoffs],
+                },
+            )
 
     def launch_task(
         pool: ThreadPoolExecutor,
@@ -264,7 +382,10 @@ def schedule_tasks(
                 progress_stage=report["status"],
                 current_activity="Using existing task report.",
                 dependency_blockers=[],
+                dependency_blocker_fingerprint=None,
+                handoff_blocker_fingerprint=None,
                 queue_position=None,
+                status_reason=None,
             )
             record_event(
                 project_root,
@@ -280,6 +401,7 @@ def schedule_tasks(
     with ThreadPoolExecutor(max_workers=max_concurrency) as pool:
         while pending or running:
             progressed = False
+            handoffs_by_id = refresh_handoffs_for_phase(project_root, run_id, tasks[0]["phase"], tasks_by_id) if tasks else {}
 
             for task_id, info in list(running.items()):
                 future: Future[dict[str, Any]] = info["future"]
@@ -313,6 +435,9 @@ def schedule_tasks(
                     current_activity=f"Execution finished with status {execution_summary['status']}.",
                     queue_position=None,
                     dependency_blockers=[],
+                    dependency_blocker_fingerprint=None,
+                    handoff_blocker_fingerprint=None,
+                    status_reason=None,
                     stdout_path=execution_summary.get("stdout_path"),
                     stderr_path=execution_summary.get("stderr_path"),
                     output_path=execution_summary.get("report_path"),
@@ -341,6 +466,8 @@ def schedule_tasks(
                         progress_stage="blocked",
                         current_activity="Blocked by failed dependencies.",
                         dependency_blockers=failed_deps,
+                        dependency_blocker_fingerprint=blockers_fingerprint(failed_deps),
+                        handoff_blocker_fingerprint=None,
                         queue_position=None,
                     )
                     record_event(
@@ -357,33 +484,68 @@ def schedule_tasks(
 
                 unmet_deps = [dependency for dependency in task["depends_on"] if dependency not in completed]
                 if unmet_deps:
+                    set_dependency_wait_state(task, unmet_deps)
+                    continue
+                task_handoffs = blocking_handoffs_for_task(task, handoffs_by_id)
+                blocked_task_handoffs = [
+                    handoff for handoff in task_handoffs if handoff.get("status") == HANDOFF_BLOCKED
+                ]
+                waiting_task_handoffs = [
+                    handoff
+                    for handoff in task_handoffs
+                    if handoff.get("status") not in {"satisfied", HANDOFF_BLOCKED}
+                ]
+                if blocked_task_handoffs:
+                    blocker_ids = [handoff["handoff_id"] for handoff in blocked_task_handoffs]
+                    blocked_handoffs[task_id] = blocker_ids
+                    reason = "; ".join(
+                        handoff.get("status_reason") or f"{handoff['handoff_id']} is blocked"
+                        for handoff in blocked_task_handoffs
+                    )
                     update_activity(
                         project_root,
                         run_id,
                         task_id,
-                        status="waiting_dependencies",
-                        progress_stage="waiting_dependencies",
-                        current_activity="Waiting on dependency completion.",
-                        dependency_blockers=unmet_deps,
+                        status="blocked",
+                        progress_stage="blocked",
+                        current_activity="Blocked by collaboration handoff.",
+                        dependency_blockers=blocker_ids,
+                        dependency_blocker_fingerprint=None,
+                        handoff_blocker_fingerprint=blockers_fingerprint(blocker_ids),
                         queue_position=None,
+                        status_reason=reason,
                     )
-                    record_event(
-                        project_root,
-                        run_id,
-                        phase=task["phase"],
-                        activity_id=task_id,
-                        event_type="task.waiting_dependencies",
-                        message=f"Task {task_id} is waiting on dependencies.",
-                        payload={"dependency_blockers": unmet_deps},
-                    )
+                    marker = (task_id, "task.handoff_blocked", tuple(blocker_ids))
+                    if marker not in handoff_events_emitted:
+                        handoff_events_emitted.add(marker)
+                        record_event(
+                            project_root,
+                            run_id,
+                            phase=task["phase"],
+                            activity_id=task_id,
+                            event_type="task.handoff_blocked",
+                            message=f"Task {task_id} is blocked by collaboration handoffs.",
+                            payload={
+                                "handoff_ids": blocker_ids,
+                                "reasons": [handoff.get("status_reason") for handoff in blocked_task_handoffs],
+                            },
+                        )
+                    pending.pop(task_id)
+                    continue
+                if waiting_task_handoffs:
+                    set_waiting_handoffs_state(task, waiting_task_handoffs)
                     continue
                 ready.append(task)
 
             if not ready and not running and pending:
                 for task_id, task in pending.items():
-                    unresolved_dependencies[task_id] = [
-                        dependency for dependency in task["depends_on"] if dependency not in completed
-                    ]
+                    blockers = [dependency for dependency in task["depends_on"] if dependency not in completed]
+                    blockers.extend(
+                        handoff["handoff_id"]
+                        for handoff in blocking_handoffs_for_task(task, handoffs_by_id)
+                        if handoff.get("status") != "satisfied"
+                    )
+                    unresolved_dependencies[task_id] = blockers
                 break
             if not ready and running:
                 wait([info["future"] for info in running.values()], timeout=0.1, return_when=FIRST_COMPLETED)
@@ -420,20 +582,28 @@ def schedule_tasks(
             queue_index = 1
             if serialized_running:
                 for task in ordered_ready:
+                    previous = read_task_activity(task["task_id"])
+                    emit_resolution_events(task, previous)
+                    changed = queue_state_changed(
+                        task["task_id"],
+                        queue_position=queue_index,
+                        current_activity="Waiting for the serialized execution lane to clear.",
+                    )
                     set_queue_state(
                         task,
                         queue_position=queue_index,
                         current_activity="Waiting for the serialized execution lane to clear.",
                     )
-                    record_event(
-                        project_root,
-                        run_id,
-                        phase=task["phase"],
-                        activity_id=task["task_id"],
-                        event_type="task.serialized_lane_wait",
-                        message=f"Task {task['task_id']} is waiting because a serialized task is currently running.",
-                        payload={},
-                    )
+                    if changed:
+                        record_event(
+                            project_root,
+                            run_id,
+                            phase=task["phase"],
+                            activity_id=task["task_id"],
+                            event_type="task.serialized_lane_wait",
+                            message=f"Task {task['task_id']} is waiting because a serialized task is currently running.",
+                            payload={},
+                        )
                     queue_index += 1
                 wait([info["future"] for info in running.values()], timeout=0.1, return_when=FIRST_COMPLETED)
                 continue
@@ -441,44 +611,67 @@ def schedule_tasks(
             started_any = False
             slots = max(0, max_concurrency - len(running))
             for task in ready_parallel[:slots]:
+                previous = read_task_activity(task["task_id"])
+                emit_resolution_events(task, previous)
+                changed = queue_state_changed(
+                    task["task_id"],
+                    queue_position=queue_index,
+                    current_activity="Queued for parallel execution.",
+                )
                 set_queue_state(
                     task,
                     queue_position=queue_index,
                     current_activity="Queued for parallel execution.",
                     parallel_execution_granted=True,
                 )
-                record_event(
-                    project_root,
-                    run_id,
-                    phase=task["phase"],
-                    activity_id=task["task_id"],
-                    event_type="task.queued",
-                    message=f"Queued task {task['task_id']} for parallel execution.",
-                    payload={"queue_position": queue_index},
-                )
+                if changed:
+                    record_event(
+                        project_root,
+                        run_id,
+                        phase=task["phase"],
+                        activity_id=task["task_id"],
+                        event_type="task.queued",
+                        message=f"Queued task {task['task_id']} for parallel execution.",
+                        payload={"queue_position": queue_index},
+                    )
                 launch_task(pool, task, granted=True)
                 queue_index += 1
                 started_any = True
 
             for task in ready_parallel[slots:]:
+                previous = read_task_activity(task["task_id"])
+                emit_resolution_events(task, previous)
+                changed = queue_state_changed(
+                    task["task_id"],
+                    queue_position=queue_index,
+                    current_activity="Queued for parallel execution.",
+                )
                 set_queue_state(
                     task,
                     queue_position=queue_index,
                     current_activity="Queued for parallel execution.",
                     parallel_execution_granted=True,
                 )
-                record_event(
-                    project_root,
-                    run_id,
-                    phase=task["phase"],
-                    activity_id=task["task_id"],
-                    event_type="task.queued",
-                    message=f"Queued task {task['task_id']} for parallel execution.",
-                    payload={"queue_position": queue_index},
-                )
+                if changed:
+                    record_event(
+                        project_root,
+                        run_id,
+                        phase=task["phase"],
+                        activity_id=task["task_id"],
+                        event_type="task.queued",
+                        message=f"Queued task {task['task_id']} for parallel execution.",
+                        payload={"queue_position": queue_index},
+                    )
                 queue_index += 1
 
             for task, warning_code, warning_message in ready_serialized:
+                previous = read_task_activity(task["task_id"])
+                emit_resolution_events(task, previous)
+                changed = queue_state_changed(
+                    task["task_id"],
+                    queue_position=queue_index,
+                    current_activity="Queued for serialized execution.",
+                )
                 set_queue_state(
                     task,
                     queue_position=queue_index,
@@ -488,15 +681,16 @@ def schedule_tasks(
                     parallel_fallback_reason=warning_message,
                 )
                 emit_parallel_warning(task, warning_code, warning_message)
-                record_event(
-                    project_root,
-                    run_id,
-                    phase=task["phase"],
-                    activity_id=task["task_id"],
-                    event_type="task.queued",
-                    message=f"Queued task {task['task_id']} for serialized execution.",
-                    payload={"queue_position": queue_index, "reason": warning_message},
-                )
+                if changed:
+                    record_event(
+                        project_root,
+                        run_id,
+                        phase=task["phase"],
+                        activity_id=task["task_id"],
+                        event_type="task.queued",
+                        message=f"Queued task {task['task_id']} for serialized execution.",
+                        payload={"queue_position": queue_index, "reason": warning_message},
+                    )
                 queue_index += 1
 
             if not started_any and not running and ready_serialized:
@@ -515,6 +709,7 @@ def schedule_tasks(
         "skipped_existing": skipped_existing,
         "skipped_dependency": skipped_dependency,
         "unresolved_dependencies": unresolved_dependencies,
+        "blocked_handoffs": blocked_handoffs,
         "failures": failures,
         "max_concurrency": max_concurrency,
     }
@@ -594,3 +789,224 @@ def finalize_objective_bundle(project_root: Path, run_id: str, phase: str, objec
 def write_manager_summary(run_dir: Path, summary_id: str, payload: dict[str, Any]) -> None:
     manager_dir = ensure_dir(run_dir / "manager-runs")
     write_json(manager_dir / f"{summary_id}.json", payload)
+
+
+def default_operator_command(run_id: str, action: str, *, phase: str | None = None) -> str:
+    suffix = "--sandbox read-only --max-concurrency 2 --timeout-seconds 600 --watch"
+    if action == "plan-phase":
+        return f"python3 -m company_orchestrator plan-phase {run_id} {suffix}"
+    if action == "plan-phase-replace":
+        return f"python3 -m company_orchestrator plan-phase {run_id} --replace {suffix}"
+    if action == "run-phase":
+        return f"python3 -m company_orchestrator run-phase {run_id} {suffix}"
+    if action == "resume-phase":
+        return f"python3 -m company_orchestrator resume-phase {run_id} {suffix}"
+    if action == "approve-phase":
+        if phase is None:
+            raise ValueError("phase is required for approve-phase guidance")
+        return f"python3 -m company_orchestrator approve-phase {run_id} {phase}"
+    if action == "advance-phase":
+        return f"python3 -m company_orchestrator advance-phase {run_id}"
+    raise ValueError(f"Unsupported operator action {action}")
+
+
+def run_guidance(
+    project_root: Path,
+    run_id: str,
+    *,
+    phase: str | None = None,
+    tasks: list[dict[str, Any]] | None = None,
+    scheduler_summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    run_dir = project_root / "runs" / run_id
+    phase_plan = read_json(run_dir / "phase-plan.json")
+    active_phase_name = phase or phase_plan["current_phase"]
+    phase_state = next(item for item in phase_plan["phases"] if item["phase"] == active_phase_name)
+    phase_tasks_payload = tasks if tasks is not None else phase_tasks(run_dir, active_phase_name)
+    phase_task_ids = {task["task_id"] for task in phase_tasks_payload}
+    activities = list_activities(project_root, run_id, phase=active_phase_name)
+    active_activities = [
+        activity
+        for activity in activities
+        if activity["status"]
+        not in {
+            "queued",
+            "waiting_dependencies",
+            "ready_for_bundle_review",
+            "blocked",
+            "needs_revision",
+            "completed",
+            "failed",
+            "accepted",
+            "rejected",
+            "skipped_existing",
+            "interrupted",
+            "recovered",
+            "abandoned",
+        }
+    ]
+    queued_activities = [activity for activity in activities if activity["status"] == "queued"]
+    blocked_activities = [
+        activity for activity in activities if activity["status"] in {"waiting_dependencies", "blocked"}
+    ]
+    interrupted_activities = [
+        activity for activity in activities if activity["status"] in {"interrupted", "failed", "abandoned"}
+    ]
+    phase_report_json_path = run_dir / "phase-reports" / f"{active_phase_name}.json"
+    phase_report_md_path = run_dir / "phase-reports" / f"{active_phase_name}.md"
+    phase_report = load_optional_json(phase_report_json_path)
+    phase_report_path = (
+        str(phase_report_json_path.relative_to(project_root)) if phase_report_json_path.exists() else None
+    )
+    review_doc_path = str(phase_report_md_path.relative_to(project_root)) if phase_report_md_path.exists() else phase_report_path
+    effective_scheduler_summary = scheduler_summary
+    if effective_scheduler_summary is None:
+        manager_summary = load_optional_json(run_dir / "manager-runs" / f"phase-{active_phase_name}.json") or {}
+        effective_scheduler_summary = manager_summary.get("scheduled", {})
+    next_action_command = suggested_recovery_command(
+        project_root,
+        run_id,
+        active_phase_name,
+        phase_tasks_payload,
+        effective_scheduler_summary or {},
+    )
+
+    if phase_report is not None and not phase_state.get("human_approved", False):
+        recommendation = phase_report["recommendation"]
+        if recommendation == "advance":
+            return {
+                "run_status": "ready_for_review",
+                "run_status_reason": (
+                    f"{active_phase_name.title()} phase report recommends advance and is waiting for human approval."
+                ),
+                "next_action_command": default_operator_command(run_id, "approve-phase", phase=active_phase_name),
+                "next_action_reason": "Review the phase report, then record approval to unlock advancement.",
+                "review_doc_path": review_doc_path,
+                "phase_report_path": phase_report_path,
+                "phase_recommendation": recommendation,
+            }
+        if next_action_command is not None:
+            return {
+                "run_status": "recoverable",
+                "run_status_reason": (
+                    f"{active_phase_name.title()} phase report recommends hold, but the run has a concrete recovery path."
+                ),
+                "next_action_command": next_action_command,
+                "next_action_reason": "Review the report if needed, then run the suggested recovery command to continue.",
+                "review_doc_path": review_doc_path,
+                "phase_report_path": phase_report_path,
+                "phase_recommendation": recommendation,
+            }
+        return {
+            "run_status": "ready_for_review",
+            "run_status_reason": (
+                f"{active_phase_name.title()} phase report recommends hold and needs human review before continuing."
+            ),
+            "next_action_command": None,
+            "next_action_reason": "Review the phase report and unresolved risks before choosing a recovery command.",
+            "review_doc_path": review_doc_path,
+            "phase_report_path": phase_report_path,
+            "phase_recommendation": recommendation,
+        }
+
+    if (
+        phase_report is not None
+        and phase_report.get("recommendation") == "advance"
+        and phase_state.get("human_approved", False)
+        and phase_state.get("status") != "complete"
+    ):
+        return {
+            "run_status": "ready_to_advance",
+            "run_status_reason": f"{active_phase_name.title()} is approved and ready to advance to the next phase.",
+            "next_action_command": default_operator_command(run_id, "advance-phase"),
+            "next_action_reason": "Advance the run to unlock planning and execution for the next phase.",
+            "review_doc_path": review_doc_path,
+            "phase_report_path": phase_report_path,
+            "phase_recommendation": phase_report.get("recommendation"),
+        }
+
+    if active_activities or queued_activities:
+        return {
+            "run_status": "working",
+            "run_status_reason": (
+                f"{len(active_activities)} active activities, {len(queued_activities)} queued, "
+                f"{len(blocked_activities)} blocked in {active_phase_name}."
+            ),
+            "next_action_command": None,
+            "next_action_reason": "Monitor the run. No manual action is required while work is active.",
+            "review_doc_path": review_doc_path,
+            "phase_report_path": phase_report_path,
+            "phase_recommendation": phase_report.get("recommendation") if phase_report else None,
+        }
+
+    if next_action_command is not None:
+        unresolved = (effective_scheduler_summary or {}).get("unresolved_dependencies", {})
+        task_handoff_ids = {
+            handoff["handoff_id"]
+            for handoff in list_handoffs(project_root / "runs" / run_id, phase=active_phase_name)
+        }
+        has_non_runtime_blockers = any(
+            blocker not in phase_task_ids and blocker not in task_handoff_ids
+            for blockers in unresolved.values()
+            for blocker in blockers
+        )
+        if has_non_runtime_blockers:
+            reason = "Planned work is blocked by stale planning dependencies and should be replanned."
+        elif interrupted_activities:
+            reason = "The run has interrupted work that can be recovered automatically."
+        else:
+            reason = "The run has blocked work that can be resumed safely."
+        return {
+            "run_status": "recoverable",
+            "run_status_reason": reason,
+            "next_action_command": next_action_command,
+            "next_action_reason": "Run the suggested recovery command to continue from the current checkpoint.",
+            "review_doc_path": review_doc_path,
+            "phase_report_path": phase_report_path,
+            "phase_recommendation": phase_report.get("recommendation") if phase_report else None,
+        }
+
+    if phase_tasks_payload:
+        return {
+            "run_status": "working",
+            "run_status_reason": f"{active_phase_name.title()} has planned tasks and is ready to execute.",
+            "next_action_command": default_operator_command(run_id, "run-phase"),
+            "next_action_reason": "Execute the current phase to start worker activity.",
+            "review_doc_path": review_doc_path,
+            "phase_report_path": phase_report_path,
+            "phase_recommendation": phase_report.get("recommendation") if phase_report else None,
+        }
+
+    return {
+        "run_status": "working",
+        "run_status_reason": f"{active_phase_name.title()} is active and ready for planning.",
+        "next_action_command": default_operator_command(run_id, "plan-phase"),
+        "next_action_reason": "Plan the current phase to materialize objective and task work.",
+        "review_doc_path": review_doc_path,
+        "phase_report_path": phase_report_path,
+        "phase_recommendation": phase_report.get("recommendation") if phase_report else None,
+    }
+
+
+def suggested_recovery_command(
+    project_root: Path,
+    run_id: str,
+    phase: str,
+    tasks: list[dict[str, Any]],
+    scheduler_summary: dict[str, Any],
+) -> str | None:
+    if scheduler_summary.get("executed"):
+        return None
+    task_ids = {task["task_id"] for task in tasks}
+    handoff_ids = {handoff["handoff_id"] for handoff in list_handoffs(project_root / "runs" / run_id, phase=phase)}
+    unresolved = scheduler_summary.get("unresolved_dependencies", {})
+    has_non_runtime_blockers = any(
+        blocker not in task_ids and blocker not in handoff_ids
+        for blockers in unresolved.values()
+        for blocker in blockers
+    )
+    if has_non_runtime_blockers:
+        return default_operator_command(run_id, "plan-phase-replace")
+    if unresolved or scheduler_summary.get("blocked_handoffs") or scheduler_summary.get("failures"):
+        return default_operator_command(run_id, "resume-phase")
+    return None

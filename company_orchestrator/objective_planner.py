@@ -21,12 +21,14 @@ from .executor import (
     run_codex_command,
 )
 from .filesystem import ensure_dir, load_optional_json, read_json, write_json, write_text
+from .handoffs import derive_target_tasks
 from .live import capability_plan_activity_id, ensure_activity, now_timestamp, plan_activity_id, record_event, update_activity
-from .objective_roots import find_objective_root
+from .objective_roots import capability_owned_path_hints, capability_shared_asset_hints, find_objective_root
 from .parallelism import infer_execution_metadata
 from .prompts import preview_resolved_inputs, render_capability_planning_prompt, render_objective_planning_prompt
 from .recovery import prepare_activity_retry, reconcile_for_command
 from .schemas import SchemaValidationError, validate_document
+from .timeout_policy import resolve_planning_timeout_policy, timeout_final_message, timeout_retry_message
 
 
 class PlanningLimiter:
@@ -59,7 +61,7 @@ def plan_objective(
     sandbox_mode: str = "read-only",
     codex_path: str = "codex",
     replace: bool = False,
-    timeout_seconds: int = 300,
+    timeout_seconds: int | None = None,
     max_concurrency: int = 3,
     allow_recovery_blocked: bool = False,
     skip_reconcile: bool = False,
@@ -117,32 +119,44 @@ def plan_objective(
         write_json(outline_path, outline)
     else:
         objective_result["recovery_action"] = "reused_valid_outline"
-    capability_summaries, capability_plans = plan_capabilities_for_objective(
-        project_root,
-        run_id,
-        objective_id,
-        outline["capability_lanes"],
-        objective_outline=outline,
-        replace=replace,
-        sandbox_mode=sandbox_mode,
-        codex_path=codex_path,
-        timeout_seconds=timeout_seconds,
-        max_concurrency=max_concurrency,
-        planning_limiter=planning_limiter,
-    )
-    plan = aggregate_capability_plans(
-        project_root,
-        run_id,
-        phase,
-        objective_id,
-        outline,
-        capability_plans,
-    )
-    planning_mode = "capability_managed"
+    try:
+        capability_summaries, capability_plans = plan_capabilities_for_objective(
+            project_root,
+            run_id,
+            objective_id,
+            outline["capability_lanes"],
+            objective_outline=outline,
+            replace=replace,
+            sandbox_mode=sandbox_mode,
+            codex_path=codex_path,
+            timeout_seconds=timeout_seconds,
+            max_concurrency=max_concurrency,
+            planning_limiter=planning_limiter,
+        )
+        plan = aggregate_capability_plans(
+            project_root,
+            run_id,
+            phase,
+            objective_id,
+            outline,
+            capability_plans,
+        )
+        planning_mode = "capability_managed"
 
-    validate_objective_plan_contents(project_root, plan, objective)
-    validate_planned_task_inputs(project_root, run_id, plan["phase"], plan["objective_id"], plan["tasks"])
-    materialize_objective_plan(project_root, run_id, plan, replace=replace)
+        validate_objective_plan_contents(project_root, plan, objective)
+        validate_planned_task_inputs(project_root, run_id, plan["phase"], plan["objective_id"], plan["tasks"])
+        materialize_objective_plan(project_root, run_id, plan, replace=replace)
+    except BaseException as exc:
+        mark_objective_planning_failed(
+            project_root,
+            run_id,
+            phase=phase,
+            objective_id=objective_id,
+            assigned_role=f"objectives.{objective_id}.objective-manager",
+            message=str(exc),
+            reason="capability_planning_failed" if outline is not None else "objective_planning_failed",
+        )
+        raise
 
     summary = {
         "run_id": run_id,
@@ -153,6 +167,7 @@ def plan_objective(
         "plan_path": f"runs/{run_id}/manager-plans/{phase}-{objective_id}.json",
         "task_ids": [task["task_id"] for task in plan["tasks"]],
         "bundle_ids": [bundle["bundle_id"] for bundle in plan["bundle_plan"]],
+        "handoff_ids": [handoff["handoff_id"] for handoff in plan.get("collaboration_handoffs", [])],
         "stdout_path": objective_result["stdout_path"],
         "stderr_path": objective_result["stderr_path"],
         "last_message_path": objective_result["last_message_path"],
@@ -199,6 +214,44 @@ def plan_objective(
     return summary
 
 
+def mark_objective_planning_failed(
+    project_root: Path,
+    run_id: str,
+    *,
+    phase: str,
+    objective_id: str,
+    assigned_role: str,
+    message: str,
+    reason: str,
+) -> None:
+    activity_id = plan_activity_id(phase, objective_id)
+    ensure_activity(
+        project_root,
+        run_id,
+        activity_id=activity_id,
+        kind="objective_plan",
+        entity_id=objective_id,
+        phase=phase,
+        objective_id=objective_id,
+        display_name=f"Plan {objective_id}",
+        assigned_role=assigned_role,
+        status="failed",
+        progress_stage="failed",
+        current_activity=message,
+        process_metadata=None,
+        status_reason=reason,
+    )
+    record_event(
+        project_root,
+        run_id,
+        phase=phase,
+        activity_id=activity_id,
+        event_type="planning.failed",
+        message=f"Planning activity for objective {objective_id} failed.",
+        payload={"error": message, "reason": reason},
+    )
+
+
 def plan_phase(
     project_root: Path,
     run_id: str,
@@ -206,7 +259,7 @@ def plan_phase(
     sandbox_mode: str = "read-only",
     codex_path: str = "codex",
     replace: bool = False,
-    timeout_seconds: int = 300,
+    timeout_seconds: int | None = None,
     max_concurrency: int = 3,
 ) -> dict[str, Any]:
     reconcile_for_command(project_root, run_id, apply=True)
@@ -282,7 +335,7 @@ def plan_capabilities_for_objective(
     replace: bool,
     sandbox_mode: str,
     codex_path: str,
-    timeout_seconds: int,
+    timeout_seconds: int | None,
     max_concurrency: int,
     planning_limiter: PlanningLimiter,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -355,7 +408,7 @@ def plan_capability(
     replace: bool,
     sandbox_mode: str,
     codex_path: str,
-    timeout_seconds: int,
+    timeout_seconds: int | None,
     planning_limiter: PlanningLimiter,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     run_dir = project_root / "runs" / run_id
@@ -422,6 +475,7 @@ def plan_capability(
         "plan_path": f"runs/{run_id}/manager-plans/{phase}-{objective_id}-{capability}.json",
         "task_ids": [task["task_id"] for task in plan["tasks"]],
         "bundle_ids": [bundle["bundle_id"] for bundle in plan["bundle_plan"]],
+        "handoff_ids": [handoff["handoff_id"] for handoff in plan.get("collaboration_handoffs", [])],
         "stdout_path": result["stdout_path"],
         "stderr_path": result["stderr_path"],
         "last_message_path": result["last_message_path"],
@@ -482,7 +536,7 @@ def execute_planning_activity(
     failure_label: str,
     sandbox_mode: str,
     codex_path: str,
-    timeout_seconds: int,
+    timeout_seconds: int | None,
     planning_limiter: PlanningLimiter,
 ) -> dict[str, Any]:
     run_dir = project_root / "runs" / run_id
@@ -507,6 +561,7 @@ def execute_planning_activity(
         reason="Starting a new planning attempt.",
     )
     attempt = (int(previous_activity.get("attempt", 1)) + 1) if previous_activity is not None else 1
+    timeout_policy = resolve_planning_timeout_policy(phase, timeout_seconds)
     activity_state = ensure_activity(
         project_root,
         run_id,
@@ -593,43 +648,93 @@ def execute_planning_activity(
                 },
             )
 
-        try:
-            completed = run_codex_command(
-                command,
-                prompt=execution_prompt,
-                cwd=project_root,
-                env=build_exec_environment(),
-                timeout_seconds=timeout_seconds,
-                on_stdout_line=on_stdout_line,
-                on_process_started=on_process_started,
-            )
-        except subprocess.TimeoutExpired as exc:
-            stdout = coerce_process_text(exc.stdout)
-            stderr = coerce_process_text(exc.stderr)
-            write_text(stdout_path, stdout)
-            write_text(stderr_path, stderr)
-            update_activity(
-                project_root,
-                run_id,
-                activity_id,
-                status="failed",
-                progress_stage="failed",
-                current_activity=f"Timed out after {timeout_seconds} seconds.",
-                process_metadata=None,
-            )
-            record_event(
-                project_root,
-                run_id,
-                phase=phase,
-                activity_id=activity_id,
-                event_type="planning.failed",
-                message=f"Planning activity for {failure_label} timed out.",
-                payload={"timeout_seconds": timeout_seconds},
-            )
-            raise ExecutorError(f"codex exec timed out after {timeout_seconds} seconds while planning {failure_label}") from exc
+        stdout_attempts: list[str] = []
+        stderr_attempts: list[str] = []
+        total_attempts = timeout_policy.max_timeout_retries + 1
+        completed = None
+        for timeout_attempt in range(1, total_attempts + 1):
+            try:
+                completed = run_codex_command(
+                    command,
+                    prompt=execution_prompt,
+                    cwd=project_root,
+                    env=build_exec_environment(),
+                    timeout_seconds=timeout_policy.timeout_seconds,
+                    on_stdout_line=on_stdout_line,
+                    on_process_started=on_process_started,
+                )
+                break
+            except subprocess.TimeoutExpired as exc:
+                stdout_attempts.append(coerce_process_text(exc.stdout))
+                stderr_attempts.append(coerce_process_text(exc.stderr))
+                write_text(stdout_path, "".join(stdout_attempts))
+                write_text(stderr_path, "".join(stderr_attempts))
+                if timeout_attempt <= timeout_policy.max_timeout_retries:
+                    message = timeout_retry_message(
+                        "planning",
+                        failure_label,
+                        timeout_seconds=timeout_policy.timeout_seconds,
+                        attempt=timeout_attempt,
+                        max_attempts=total_attempts,
+                    )
+                    update_activity(
+                        project_root,
+                        run_id,
+                        activity_id,
+                        status="recovering",
+                        progress_stage="recovering",
+                        current_activity=message,
+                        status_reason="timeout_retry_scheduled",
+                        process_metadata=None,
+                    )
+                    record_event(
+                        project_root,
+                        run_id,
+                        phase=phase,
+                        activity_id=activity_id,
+                        event_type="planning.timeout_retry_scheduled",
+                        message=message,
+                        payload={
+                            "timeout_seconds": timeout_policy.timeout_seconds,
+                            "attempt": timeout_attempt,
+                            "max_attempts": total_attempts,
+                        },
+                    )
+                    continue
+                failure_message = timeout_final_message(
+                    "planning",
+                    failure_label,
+                    timeout_seconds=timeout_policy.timeout_seconds,
+                    attempts=total_attempts,
+                    resume_recommended=True,
+                    explicit_override=timeout_policy.source == "explicit",
+                )
+                update_activity(
+                    project_root,
+                    run_id,
+                    activity_id,
+                    status="failed",
+                    progress_stage="failed",
+                    current_activity=failure_message,
+                    status_reason="timeout_exhausted",
+                    process_metadata=None,
+                )
+                record_event(
+                    project_root,
+                    run_id,
+                    phase=phase,
+                    activity_id=activity_id,
+                    event_type="planning.failed",
+                    message=failure_message,
+                    payload={"timeout_seconds": timeout_policy.timeout_seconds, "attempts": total_attempts},
+                )
+                raise ExecutorError(failure_message) from exc
 
-        write_text(stdout_path, completed.stdout)
-        write_text(stderr_path, completed.stderr)
+        assert completed is not None
+        stdout_attempts.append(completed.stdout)
+        stderr_attempts.append(completed.stderr)
+        write_text(stdout_path, "".join(stdout_attempts))
+        write_text(stderr_path, "".join(stderr_attempts))
         events = parse_jsonl_events(completed.stdout)
         failure = extract_turn_failure(events)
         if completed.returncode != 0 or failure is not None:
@@ -679,7 +784,11 @@ def execute_planning_activity(
         "last_message_path": str(last_message_path.relative_to(project_root)),
         "identity_adjustments": {},
         "attempt": attempt,
-        "recovery_action": "retry" if previous_activity is not None else None,
+        "recovery_action": (
+            "retry"
+            if previous_activity is not None
+            else ("timeout_retry" if len(stdout_attempts) > 1 else None)
+        ),
     }
 
 
@@ -716,7 +825,9 @@ def build_planning_prompt(prompt_text: str) -> str:
         + "Do not execute implementation work.\n"
         + "Define capability lanes for the active objective using only roles already present in the injected team definition.\n"
         + "Each capability lane must include objective, inputs, expected_outputs, done_when, depends_on, planning_notes, and collaboration_rules.\n"
-        + "Use collaboration_edges only for real cross-lane dependencies that require another role.\n"
+        + "Use collaboration_edges only for real cross-lane dependencies that require another capability lane or role.\n"
+        + "Every collaboration edge must include edge_id, from_capability, to_capability, to_role, handoff_type, reason, deliverables, blocking, and shared_asset_ids.\n"
+        + "Deliverables must be concrete artifacts or contract outputs, not vague prose.\n"
     )
 
 
@@ -736,11 +847,16 @@ def build_capability_planning_prompt(prompt_text: str) -> str:
         + "Every generated task must include execution_mode, parallel_policy, owned_paths, and shared_asset_ids.\n"
         + "Use execution_mode `read_only` for analysis/reporting work and `isolated_write` for code-writing or file-writing work.\n"
         + "Use parallel_policy `allow` only when you can justify safe isolation from other tasks; otherwise use `serialize`.\n"
+        + "Prefer concrete owned_paths aligned to the injected capability_scope_hints instead of broad repo-wide globs.\n"
+        + "Use shared_asset_ids to identify cross-lane contracts, schemas, or shared integration surfaces.\n"
         + "Every bundle in bundle_plan must reference only generated task ids.\n"
         + "For phases after discovery, each task input must be either a concrete repo-relative file path, "
         + "an explicit `Output of <task-id>` reference, or a dotted `Planning Inputs.`/`Runtime Context.` reference.\n"
         + "When prior-phase reports or artifacts are available in Capability Planning Inputs, prefer referencing those exact paths "
         + "instead of vague English placeholders such as 'approved design package'.\n"
+        + "Emit collaboration_handoffs only for real cross-lane handoffs and tie them to concrete from_task_id values.\n"
+        + "Every collaboration_handoff must include handoff_id, from_capability, to_capability, from_task_id, to_role, handoff_type, reason, deliverables, blocking, and shared_asset_ids.\n"
+        + "If required_handoffs are provided in Capability Planning Inputs, cover them with concrete task-level collaboration_handoffs.\n"
     )
 
 
@@ -788,9 +904,41 @@ def normalize_objective_outline(
         expected_manager_role = derive_manager_role_for_capability(project_root, objective["objective_id"], capability)
         if lane["assigned_manager_role"] != expected_manager_role:
             lane["assigned_manager_role"] = expected_manager_role
+    seen_edge_ids: set[str] = set()
+    for edge in payload.get("collaboration_edges", []):
+        edge_id = edge["edge_id"]
+        if not edge_id.startswith(f"{objective['objective_id']}-"):
+            edge_id = f"{objective['objective_id']}-{edge_id}"
+            edge["edge_id"] = edge_id
+        if edge["from_capability"] not in expected_capabilities:
+            raise ExecutorError(
+                f"Objective outline proposed collaboration edge {edge['edge_id']} for an unexpected capability"
+            )
+        if edge["to_capability"] not in expected_capabilities and not allows_non_lane_target(
+            objective["objective_id"],
+            edge["to_capability"],
+            edge["to_role"],
+        ):
+            raise ExecutorError(
+                f"Objective outline proposed collaboration edge {edge['edge_id']} for an unexpected capability"
+            )
+        if edge_id in seen_edge_ids:
+            raise ExecutorError(f"Objective outline duplicated collaboration edge {edge_id}")
+        seen_edge_ids.add(edge_id)
+        edge["shared_asset_ids"] = dedupe_strings(
+            [item for item in edge.get("shared_asset_ids", []) if isinstance(item, str) and item] or [edge_id]
+        )
     if not payload["capability_lanes"]:
         raise ExecutorError("Objective outline must include at least one capability lane")
     return payload, adjustments
+
+
+def allows_non_lane_target(objective_id: str, to_capability: str, to_role: str) -> bool:
+    allowed = {
+        (f"objectives.{objective_id}.acceptance-manager", "acceptance"),
+        (f"objectives.{objective_id}.objective-manager", "objective"),
+    }
+    return (to_role, to_capability) in allowed
 
 
 def normalize_capability_plan(
@@ -810,8 +958,9 @@ def normalize_capability_plan(
     if payload["capability"] != capability:
         raise ExecutorError(f"Capability plan identity does not match requested capability {capability}")
     adjustments = normalize_plan_identity(payload, run_id=run_id, phase=phase, objective_id=objective_id)
-    normalize_task_execution_metadata(payload)
+    normalize_task_execution_metadata(project_root, objective_id, capability, payload)
     normalize_bundle_ids(payload)
+    normalize_collaboration_handoffs(payload, objective_id=objective_id, capability=capability)
     validate_capability_plan_contents(project_root, payload, objective_id=objective_id, capability=capability)
     return payload, adjustments
 
@@ -829,7 +978,7 @@ def aggregate_capability_plans(
     tasks: list[dict[str, Any]] = []
     bundle_plan: list[dict[str, Any]] = []
     dependency_notes = list(outline.get("dependency_notes", []))
-    collaboration_edges: list[dict[str, Any]] = []
+    collaboration_handoffs: list[dict[str, Any]] = []
 
     for plan in capability_plans:
         for task in plan["tasks"]:
@@ -843,18 +992,12 @@ def aggregate_capability_plans(
             bundle_ids.add(bundle["bundle_id"])
             bundle_plan.append(bundle)
         dependency_notes.extend(plan.get("dependency_notes", []))
-        collaboration_edges.extend(plan.get("collaboration_edges", []))
+        collaboration_handoffs.extend(plan.get("collaboration_handoffs", []))
 
-    for edge in outline.get("collaboration_edges", []):
-        source_tasks = [task["task_id"] for task in tasks if task.get("capability") == edge["from_capability"]]
-        for task_id in source_tasks:
-            collaboration_edges.append(
-                {
-                    "from_task_id": task_id,
-                    "to_role": edge["to_role"],
-                    "reason": edge["reason"],
-                }
-            )
+    normalize_task_dependencies(tasks)
+    validate_required_handoffs(outline, collaboration_handoffs)
+    attach_handoff_shared_assets(tasks, collaboration_handoffs)
+    attach_handoff_dependencies(tasks, collaboration_handoffs)
 
     plan = {
         "schema": "objective-plan.v1",
@@ -865,7 +1008,7 @@ def aggregate_capability_plans(
         "tasks": tasks,
         "bundle_plan": bundle_plan,
         "dependency_notes": dedupe_strings(dependency_notes),
-        "collaboration_edges": dedupe_dicts(collaboration_edges),
+        "collaboration_handoffs": dedupe_dicts(collaboration_handoffs),
     }
     try:
         validate_document(plan, "objective-plan.v1", project_root)
@@ -873,6 +1016,13 @@ def aggregate_capability_plans(
         raise ExecutorError(f"Aggregated capability plan was invalid: {exc}") from exc
     normalize_bundle_ids(plan)
     return plan
+
+
+def normalize_task_dependencies(tasks: list[dict[str, Any]]) -> None:
+    valid_task_ids = {task["task_id"] for task in tasks}
+    for task in tasks:
+        dependencies = [value for value in task.get("depends_on", []) if isinstance(value, str)]
+        task["depends_on"] = [value for value in dedupe_strings(dependencies) if value in valid_task_ids]
 
 
 def normalize_bundle_ids(payload: dict[str, Any]) -> None:
@@ -888,8 +1038,15 @@ def normalize_bundle_ids(payload: dict[str, Any]) -> None:
         seen.add(bundle_id)
 
 
-def normalize_task_execution_metadata(payload: dict[str, Any]) -> None:
+def normalize_task_execution_metadata(
+    project_root: Path,
+    objective_id: str,
+    capability: str,
+    payload: dict[str, Any],
+) -> None:
     phase = str(payload.get("phase", "discovery"))
+    owned_path_hints = capability_owned_path_hints(project_root, objective_id, capability)
+    shared_asset_hints = capability_shared_asset_hints(objective_id, capability)
     for task in payload.get("tasks", []):
         inferred = infer_execution_metadata(
             phase=phase,
@@ -898,9 +1055,109 @@ def normalize_task_execution_metadata(payload: dict[str, Any]) -> None:
             existing=task,
         )
         task.update(inferred)
+        concrete_output_paths = [
+            item for item in task.get("expected_outputs", []) if isinstance(item, str) and "/" in item and not item.endswith(".v1")
+        ]
+        if task["execution_mode"] == "isolated_write":
+            current_owned = [item for item in task.get("owned_paths", []) if isinstance(item, str) and item]
+            if concrete_output_paths:
+                current_owned.extend(concrete_output_paths)
+            if not current_owned:
+                current_owned.extend(owned_path_hints)
+            task["owned_paths"] = dedupe_strings(current_owned)
+        else:
+            task["owned_paths"] = dedupe_strings([item for item in task.get("owned_paths", []) if isinstance(item, str)])
+        current_shared_assets = [item for item in task.get("shared_asset_ids", []) if isinstance(item, str) and item]
+        if not current_shared_assets and task_mentions_shared_surface(task):
+            current_shared_assets.extend(shared_asset_hints)
+        task["shared_asset_ids"] = dedupe_strings(current_shared_assets)
         task.setdefault("working_directory", None)
         task.setdefault("sandbox_mode", "read-only")
         task.setdefault("additional_directories", [])
+
+
+def task_mentions_shared_surface(task: dict[str, Any]) -> bool:
+    haystack = " ".join(
+        [str(task.get("objective", ""))]
+        + [str(item) for item in task.get("expected_outputs", [])]
+        + [str(item) for item in task.get("inputs", [])]
+        + [str(item) for item in task.get("done_when", [])]
+    ).lower()
+    keywords = ("contract", "schema", "handoff", "integration", "shared", "interface")
+    return any(keyword in haystack for keyword in keywords)
+
+
+def normalize_collaboration_handoffs(payload: dict[str, Any], *, objective_id: str, capability: str) -> None:
+    normalized: list[dict[str, Any]] = []
+    for handoff in payload.get("collaboration_handoffs", []):
+        item = dict(handoff)
+        handoff_id = item["handoff_id"]
+        if not handoff_id.startswith(f"{objective_id}-{capability}-"):
+            handoff_id = f"{objective_id}-{capability}-{handoff_id}"
+            item["handoff_id"] = handoff_id
+        item["from_capability"] = capability
+        shared_assets = [value for value in item.get("shared_asset_ids", []) if isinstance(value, str) and value]
+        if handoff_id not in shared_assets:
+            shared_assets.insert(0, handoff_id)
+        item["shared_asset_ids"] = dedupe_strings(shared_assets)
+        normalized.append(item)
+    payload["collaboration_handoffs"] = normalized
+
+
+def validate_required_handoffs(outline: dict[str, Any], handoffs: list[dict[str, Any]]) -> None:
+    for edge in outline.get("collaboration_edges", []):
+        matched = [
+            handoff
+            for handoff in handoffs
+            if handoff["from_capability"] == edge["from_capability"]
+            and handoff["to_capability"] == edge["to_capability"]
+            and handoff["to_role"] == edge["to_role"]
+            and handoff["handoff_type"] == edge["handoff_type"]
+        ]
+        if not matched:
+            raise ExecutorError(
+                "Capability plans did not materialize required collaboration edge "
+                f"{edge['edge_id']} from {edge['from_capability']} to {edge['to_capability']}"
+            )
+
+
+def attach_handoff_shared_assets(tasks: list[dict[str, Any]], handoffs: list[dict[str, Any]]) -> None:
+    task_by_id = {task["task_id"]: task for task in tasks}
+    for handoff in handoffs:
+        source_task = task_by_id.get(handoff["from_task_id"])
+        if source_task is not None:
+            source_task["shared_asset_ids"] = dedupe_strings(
+                list(source_task.get("shared_asset_ids", [])) + list(handoff.get("shared_asset_ids", []))
+            )
+        for task in tasks:
+            if task.get("capability") != handoff["to_capability"]:
+                continue
+            depends_on = set(task.get("depends_on", []))
+            input_refs = {str(value) for value in task.get("inputs", [])}
+            if handoff["from_task_id"] in depends_on or f"Output of {handoff['from_task_id']}" in input_refs:
+                task["shared_asset_ids"] = dedupe_strings(
+                    list(task.get("shared_asset_ids", [])) + list(handoff.get("shared_asset_ids", []))
+                )
+
+
+def attach_handoff_dependencies(tasks: list[dict[str, Any]], handoffs: list[dict[str, Any]]) -> None:
+    task_by_id = {task["task_id"]: task for task in tasks}
+    objective_id = next((task.get("objective_id") for task in tasks if task.get("objective_id")), None)
+    for task in tasks:
+        task.setdefault("handoff_dependencies", [])
+    for handoff in handoffs:
+        resolved_handoff = dict(handoff)
+        if objective_id is not None:
+            resolved_handoff.setdefault("objective_id", objective_id)
+        target_ids = derive_target_tasks(resolved_handoff, task_by_id)
+        handoff["to_task_ids"] = target_ids
+        for task_id in target_ids:
+            task = task_by_id.get(task_id)
+            if task is None:
+                continue
+            task["handoff_dependencies"] = dedupe_strings(
+                list(task.get("handoff_dependencies", [])) + [handoff["handoff_id"]]
+            )
 
 
 def validate_capability_plan_contents(
@@ -914,6 +1171,7 @@ def validate_capability_plan_contents(
     if capability != "general":
         valid_roles.add(f"objectives.{objective_id}.{capability}-worker")
     task_ids = set()
+    handoff_ids = set()
     for task in plan["tasks"]:
         if task["task_id"] in task_ids:
             raise ExecutorError(f"Capability plan duplicated task id {task['task_id']}")
@@ -932,11 +1190,20 @@ def validate_capability_plan_contents(
         for task_id in bundle["task_ids"]:
             if task_id not in task_ids:
                 raise ExecutorError(f"Bundle {bundle['bundle_id']} referenced unknown task {task_id}")
-    for edge in plan["collaboration_edges"]:
-        if edge["from_task_id"] not in task_ids:
+    for handoff in plan["collaboration_handoffs"]:
+        if handoff["handoff_id"] in handoff_ids:
+            raise ExecutorError(f"Capability plan duplicated handoff id {handoff['handoff_id']}")
+        handoff_ids.add(handoff["handoff_id"])
+        if handoff["from_task_id"] not in task_ids:
             raise ExecutorError(
-                f"Capability plan collaboration edge referenced unknown task {edge['from_task_id']}"
+                f"Capability plan collaboration handoff referenced unknown task {handoff['from_task_id']}"
             )
+        if handoff["from_capability"] != capability:
+            raise ExecutorError(
+                f"Capability plan collaboration handoff {handoff['handoff_id']} used mismatched source capability"
+            )
+        if not handoff["deliverables"]:
+            raise ExecutorError(f"Capability plan collaboration handoff {handoff['handoff_id']} must declare deliverables")
 
 
 def validate_objective_plan_contents(project_root: Path, plan: dict[str, Any], objective: dict[str, Any]) -> None:
@@ -945,6 +1212,7 @@ def validate_objective_plan_contents(project_root: Path, plan: dict[str, Any], o
         if capability != "general":
             valid_roles.add(f"objectives.{objective['objective_id']}.{capability}-worker")
     task_ids = set()
+    handoff_ids = set()
     for task in plan["tasks"]:
         if task["task_id"] in task_ids:
             raise ExecutorError(f"Objective plan duplicated task id {task['task_id']}")
@@ -959,9 +1227,12 @@ def validate_objective_plan_contents(project_root: Path, plan: dict[str, Any], o
         for task_id in bundle["task_ids"]:
             if task_id not in task_ids:
                 raise ExecutorError(f"Bundle {bundle['bundle_id']} referenced unknown task {task_id}")
-    for edge in plan["collaboration_edges"]:
-        if edge["from_task_id"] not in task_ids:
-            raise ExecutorError(f"Collaboration edge referenced unknown task {edge['from_task_id']}")
+    for handoff in plan["collaboration_handoffs"]:
+        if handoff["handoff_id"] in handoff_ids:
+            raise ExecutorError(f"Objective plan duplicated handoff id {handoff['handoff_id']}")
+        handoff_ids.add(handoff["handoff_id"])
+        if handoff["from_task_id"] not in task_ids:
+            raise ExecutorError(f"Collaboration handoff referenced unknown task {handoff['from_task_id']}")
 
 
 def validate_planned_task_inputs(
@@ -985,6 +1256,7 @@ def validate_planned_task_inputs(
             "parallel_policy": planned_task["parallel_policy"],
             "owned_paths": planned_task["owned_paths"],
             "shared_asset_ids": planned_task["shared_asset_ids"],
+            "handoff_dependencies": planned_task.get("handoff_dependencies", []),
             "task_id": planned_task["task_id"],
             "assigned_role": planned_task["assigned_role"],
             "manager_role": derive_manager_role(project_root, objective_id, planned_task["assigned_role"]),
@@ -1043,6 +1315,7 @@ def materialize_objective_plan(project_root: Path, run_id: str, plan: dict[str, 
             "parallel_policy": planned_task["parallel_policy"],
             "owned_paths": planned_task["owned_paths"],
             "shared_asset_ids": planned_task["shared_asset_ids"],
+            "handoff_dependencies": planned_task.get("handoff_dependencies", []),
             "task_id": planned_task["task_id"],
             "assigned_role": planned_task["assigned_role"],
             "manager_role": derive_manager_role(project_root, objective_id, planned_task["assigned_role"]),
@@ -1059,22 +1332,66 @@ def materialize_objective_plan(project_root: Path, run_id: str, plan: dict[str, 
         desired_payloads[planned_task["task_id"]] = payload
 
     manager_plan_path = run_dir / "manager-plans" / f"{phase}-{objective_id}.json"
+    collaboration_dir = ensure_dir(run_dir / "collaboration-plans")
+    existing_handoff_paths = []
+    for path in sorted(collaboration_dir.glob("*.json")):
+        payload = read_json(path)
+        if payload["phase"] == phase and payload["objective_id"] == objective_id:
+            existing_handoff_paths.append(path)
+    desired_handoffs = {
+        handoff["handoff_id"]: build_planned_handoff_payload(project_root, run_id, phase, objective_id, handoff)
+        for handoff in plan.get("collaboration_handoffs", [])
+    }
     if existing_paths and not replace:
         existing_payloads = {path.stem: read_json(path) for path in existing_paths}
-        if set(existing_payloads) == set(desired_payloads) and all(
+        existing_handoffs = {path.stem: read_json(path) for path in existing_handoff_paths}
+        if set(existing_payloads) == set(desired_payloads) and set(existing_handoffs) == set(desired_handoffs) and all(
             existing_payloads[task_id] == desired_payloads[task_id] for task_id in desired_payloads
-        ):
+        ) and all(existing_handoffs[handoff_id] == desired_handoffs[handoff_id] for handoff_id in desired_handoffs):
             write_json(manager_plan_path, plan)
             return
         raise ExecutorError(f"Tasks already exist for objective {objective_id} in phase {phase}; rerun with replace")
 
     for path in existing_paths:
         path.unlink()
+    for path in existing_handoff_paths:
+        path.unlink()
 
     write_json(manager_plan_path, plan)
 
     for task_id, payload in desired_payloads.items():
         write_json(run_dir / "tasks" / f"{task_id}.json", payload)
+    for handoff_id, payload in desired_handoffs.items():
+        write_json(collaboration_dir / f"{handoff_id}.json", payload)
+
+
+def build_planned_handoff_payload(
+    project_root: Path, run_id: str, phase: str, objective_id: str, handoff: dict[str, Any]
+) -> dict[str, Any]:
+    payload = {
+        "schema": "collaboration-handoff.v1",
+        "run_id": run_id,
+        "phase": phase,
+        "objective_id": objective_id,
+        "handoff_id": handoff["handoff_id"],
+        "from_capability": handoff["from_capability"],
+        "to_capability": handoff["to_capability"],
+        "from_task_id": handoff["from_task_id"],
+        "to_role": handoff["to_role"],
+        "handoff_type": handoff["handoff_type"],
+        "reason": handoff["reason"],
+        "deliverables": handoff["deliverables"],
+        "blocking": handoff["blocking"],
+        "shared_asset_ids": handoff["shared_asset_ids"],
+        "to_task_ids": handoff.get("to_task_ids", []),
+        "status": "planned",
+        "satisfied_by_task_ids": [],
+        "missing_deliverables": [],
+        "status_reason": None,
+        "last_checked_at": None,
+    }
+    validate_document(payload, "collaboration-handoff.v1", project_root)
+    return payload
 
 
 def derive_manager_role_for_capability(project_root: Path, objective_id: str, capability: str) -> str:

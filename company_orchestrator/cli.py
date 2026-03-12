@@ -10,25 +10,37 @@ from .changes import analyze_change_request, approve_change, create_change_reque
 from .collaboration import create_collaboration_request, resolve_collaboration_request
 from .executor import execute_task
 from .filesystem import read_json
-from .management import run_objective, run_phase
+from .management import run_guidance, run_objective, run_phase
 from .monitoring import inspect_activity, run_with_watch, watch_run
 from .objective_planner import plan_objective, plan_phase
-from .planner import decompose_goal, generate_role_files, initialize_run, promote_roles, suggest_team_proposals
+from .planner import bootstrap_run, decompose_goal, generate_role_files, initialize_run, promote_roles, suggest_team_proposals
 from .prompts import render_prompt
 from .recovery import reconcile_run
 from .reports import advance_phase, generate_phase_report, record_human_approval
 from .schemas import validate_document
 from .smoke import scaffold_smoke_test, simulate_context_echo_completion, verify_smoke_reports
 
-
 def main() -> None:
     parser = argparse.ArgumentParser(prog="company-orchestrator")
     parser.add_argument("--project-root", default=".")
+    parser.add_argument("--json", dest="json_output", action="store_true")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     init_parser = subparsers.add_parser("init-run")
     init_parser.add_argument("run_id")
     init_parser.add_argument("goal_file")
+
+    bootstrap_parser = subparsers.add_parser("bootstrap-run")
+    bootstrap_parser.add_argument("run_id")
+    bootstrap_parser.add_argument("goal_file")
+    bootstrap_parser.add_argument("--sandbox", default="read-only")
+    bootstrap_parser.add_argument("--codex-path", default="codex")
+    bootstrap_parser.add_argument("--timeout-seconds", type=int, default=None)
+    bootstrap_parser.add_argument("--max-concurrency", type=int, default=3)
+    bootstrap_parser.add_argument("--skip-plan", action="store_true")
+    bootstrap_parser.add_argument("--no-approve-roles", action="store_true")
+    bootstrap_parser.add_argument("--watch", action="store_true")
+    bootstrap_parser.add_argument("--watch-refresh-seconds", type=float, default=1.0)
 
     subparsers.add_parser("decompose-goal").add_argument("run_id")
     subparsers.add_parser("suggest-teams").add_argument("run_id")
@@ -53,7 +65,7 @@ def main() -> None:
     execute_parser.add_argument("task_id")
     execute_parser.add_argument("--sandbox", default="read-only")
     execute_parser.add_argument("--codex-path", default="codex")
-    execute_parser.add_argument("--timeout-seconds", type=int, default=300)
+    execute_parser.add_argument("--timeout-seconds", type=int, default=None)
     execute_parser.add_argument("--watch", action="store_true")
     execute_parser.add_argument("--watch-refresh-seconds", type=float, default=1.0)
 
@@ -63,7 +75,7 @@ def main() -> None:
     plan_objective_parser.add_argument("--sandbox", default="read-only")
     plan_objective_parser.add_argument("--codex-path", default="codex")
     plan_objective_parser.add_argument("--replace", action="store_true")
-    plan_objective_parser.add_argument("--timeout-seconds", type=int, default=300)
+    plan_objective_parser.add_argument("--timeout-seconds", type=int, default=None)
     plan_objective_parser.add_argument("--max-concurrency", type=int, default=3)
     plan_objective_parser.add_argument("--watch", action="store_true")
     plan_objective_parser.add_argument("--watch-refresh-seconds", type=float, default=1.0)
@@ -73,7 +85,7 @@ def main() -> None:
     plan_phase_parser.add_argument("--sandbox", default="read-only")
     plan_phase_parser.add_argument("--codex-path", default="codex")
     plan_phase_parser.add_argument("--replace", action="store_true")
-    plan_phase_parser.add_argument("--timeout-seconds", type=int, default=300)
+    plan_phase_parser.add_argument("--timeout-seconds", type=int, default=None)
     plan_phase_parser.add_argument("--max-concurrency", type=int, default=3)
     plan_phase_parser.add_argument("--watch", action="store_true")
     plan_phase_parser.add_argument("--watch-refresh-seconds", type=float, default=1.0)
@@ -84,7 +96,7 @@ def main() -> None:
     run_objective_parser.add_argument("--sandbox", default="read-only")
     run_objective_parser.add_argument("--codex-path", default="codex")
     run_objective_parser.add_argument("--force", action="store_true")
-    run_objective_parser.add_argument("--timeout-seconds", type=int, default=300)
+    run_objective_parser.add_argument("--timeout-seconds", type=int, default=None)
     run_objective_parser.add_argument("--max-concurrency", type=int, default=3)
     run_objective_parser.add_argument("--watch", action="store_true")
     run_objective_parser.add_argument("--watch-refresh-seconds", type=float, default=1.0)
@@ -94,7 +106,7 @@ def main() -> None:
     run_phase_parser.add_argument("--sandbox", default="read-only")
     run_phase_parser.add_argument("--codex-path", default="codex")
     run_phase_parser.add_argument("--force", action="store_true")
-    run_phase_parser.add_argument("--timeout-seconds", type=int, default=300)
+    run_phase_parser.add_argument("--timeout-seconds", type=int, default=None)
     run_phase_parser.add_argument("--max-concurrency", type=int, default=3)
     run_phase_parser.add_argument("--watch", action="store_true")
     run_phase_parser.add_argument("--watch-refresh-seconds", type=float, default=1.0)
@@ -118,7 +130,7 @@ def main() -> None:
     resume_parser.add_argument("--sandbox", default="read-only")
     resume_parser.add_argument("--codex-path", default="codex")
     resume_parser.add_argument("--force", action="store_true")
-    resume_parser.add_argument("--timeout-seconds", type=int, default=300)
+    resume_parser.add_argument("--timeout-seconds", type=int, default=None)
     resume_parser.add_argument("--max-concurrency", type=int, default=3)
     resume_parser.add_argument("--watch", action="store_true")
     resume_parser.add_argument("--watch-refresh-seconds", type=float, default=1.0)
@@ -128,7 +140,7 @@ def main() -> None:
     retry_parser.add_argument("activity_id")
     retry_parser.add_argument("--sandbox", default="read-only")
     retry_parser.add_argument("--codex-path", default="codex")
-    retry_parser.add_argument("--timeout-seconds", type=int, default=300)
+    retry_parser.add_argument("--timeout-seconds", type=int, default=None)
     retry_parser.add_argument("--watch", action="store_true")
     retry_parser.add_argument("--watch-refresh-seconds", type=float, default=1.0)
 
@@ -209,6 +221,42 @@ def main() -> None:
         result = initialize_run(project_root, args.run_id, goal_text)
         print(result)
         return
+    if args.command == "bootstrap-run":
+        goal_text = Path(args.goal_file).read_text(encoding="utf-8")
+        result: dict[str, Any] = {
+            "bootstrap": bootstrap_run(
+                project_root,
+                args.run_id,
+                goal_text,
+                approve_roles=not args.no_approve_roles,
+            )
+        }
+        if not args.skip_plan:
+            operation = lambda: plan_phase(
+                project_root,
+                args.run_id,
+                sandbox_mode=args.sandbox,
+                codex_path=args.codex_path,
+                replace=False,
+                timeout_seconds=args.timeout_seconds,
+                max_concurrency=args.max_concurrency,
+            )
+            result["planning"] = run_maybe_watched(
+                project_root,
+                args.run_id,
+                args.watch,
+                args.watch_refresh_seconds,
+                operation,
+            )
+        if should_print_result(args.json_output, watched=args.watch and not args.skip_plan):
+            print_result(
+                project_root,
+                result,
+                run_id=args.run_id,
+                leading_blank_line=args.watch and not args.skip_plan,
+                json_output=args.json_output,
+            )
+        return
     if args.command == "decompose-goal":
         print_json(decompose_goal(project_root, args.run_id))
         return
@@ -238,10 +286,15 @@ def main() -> None:
                 codex_path=args.codex_path,
                 timeout_seconds=args.timeout_seconds,
             )
-        print_result(
-            run_maybe_watched(project_root, args.run_id, args.watch, args.watch_refresh_seconds, operation),
-            leading_blank_line=args.watch,
-        )
+        result = run_maybe_watched(project_root, args.run_id, args.watch, args.watch_refresh_seconds, operation)
+        if should_print_result(args.json_output, watched=args.watch):
+            print_result(
+                project_root,
+                result,
+                run_id=args.run_id,
+                leading_blank_line=args.watch,
+                json_output=args.json_output,
+            )
         return
     if args.command == "plan-objective":
         operation = lambda: plan_objective(
@@ -254,10 +307,15 @@ def main() -> None:
                 timeout_seconds=args.timeout_seconds,
                 max_concurrency=args.max_concurrency,
             )
-        print_result(
-            run_maybe_watched(project_root, args.run_id, args.watch, args.watch_refresh_seconds, operation),
-            leading_blank_line=args.watch,
-        )
+        result = run_maybe_watched(project_root, args.run_id, args.watch, args.watch_refresh_seconds, operation)
+        if should_print_result(args.json_output, watched=args.watch):
+            print_result(
+                project_root,
+                result,
+                run_id=args.run_id,
+                leading_blank_line=args.watch,
+                json_output=args.json_output,
+            )
         return
     if args.command == "plan-phase":
         operation = lambda: plan_phase(
@@ -269,10 +327,15 @@ def main() -> None:
                 timeout_seconds=args.timeout_seconds,
                 max_concurrency=args.max_concurrency,
             )
-        print_result(
-            run_maybe_watched(project_root, args.run_id, args.watch, args.watch_refresh_seconds, operation),
-            leading_blank_line=args.watch,
-        )
+        result = run_maybe_watched(project_root, args.run_id, args.watch, args.watch_refresh_seconds, operation)
+        if should_print_result(args.json_output, watched=args.watch):
+            print_result(
+                project_root,
+                result,
+                run_id=args.run_id,
+                leading_blank_line=args.watch,
+                json_output=args.json_output,
+            )
         return
     if args.command == "run-objective":
         operation = lambda: run_objective(
@@ -285,10 +348,15 @@ def main() -> None:
                 timeout_seconds=args.timeout_seconds,
                 max_concurrency=args.max_concurrency,
             )
-        print_result(
-            run_maybe_watched(project_root, args.run_id, args.watch, args.watch_refresh_seconds, operation),
-            leading_blank_line=args.watch,
-        )
+        result = run_maybe_watched(project_root, args.run_id, args.watch, args.watch_refresh_seconds, operation)
+        if should_print_result(args.json_output, watched=args.watch):
+            print_result(
+                project_root,
+                result,
+                run_id=args.run_id,
+                leading_blank_line=args.watch,
+                json_output=args.json_output,
+            )
         return
     if args.command == "run-phase":
         operation = lambda: run_phase(
@@ -300,10 +368,15 @@ def main() -> None:
                 timeout_seconds=args.timeout_seconds,
                 max_concurrency=args.max_concurrency,
             )
-        print_result(
-            run_maybe_watched(project_root, args.run_id, args.watch, args.watch_refresh_seconds, operation),
-            leading_blank_line=args.watch,
-        )
+        result = run_maybe_watched(project_root, args.run_id, args.watch, args.watch_refresh_seconds, operation)
+        if should_print_result(args.json_output, watched=args.watch):
+            print_result(
+                project_root,
+                result,
+                run_id=args.run_id,
+                leading_blank_line=args.watch,
+                json_output=args.json_output,
+            )
         return
     if args.command == "watch-run":
         watch_run(project_root, args.run_id, refresh_seconds=args.refresh_seconds)
@@ -324,10 +397,15 @@ def main() -> None:
                 timeout_seconds=args.timeout_seconds,
                 max_concurrency=args.max_concurrency,
             )
-        print_result(
-            run_maybe_watched(project_root, args.run_id, args.watch, args.watch_refresh_seconds, operation),
-            leading_blank_line=args.watch,
-        )
+        result = run_maybe_watched(project_root, args.run_id, args.watch, args.watch_refresh_seconds, operation)
+        if should_print_result(args.json_output, watched=args.watch):
+            print_result(
+                project_root,
+                result,
+                run_id=args.run_id,
+                leading_blank_line=args.watch,
+                json_output=args.json_output,
+            )
         return
     if args.command == "retry-activity":
         operation = lambda: retry_activity(
@@ -338,10 +416,15 @@ def main() -> None:
                 codex_path=args.codex_path,
                 timeout_seconds=args.timeout_seconds,
             )
-        print_result(
-            run_maybe_watched(project_root, args.run_id, args.watch, args.watch_refresh_seconds, operation),
-            leading_blank_line=args.watch,
-        )
+        result = run_maybe_watched(project_root, args.run_id, args.watch, args.watch_refresh_seconds, operation)
+        if should_print_result(args.json_output, watched=args.watch):
+            print_result(
+                project_root,
+                result,
+                run_id=args.run_id,
+                leading_blank_line=args.watch,
+                json_output=args.json_output,
+            )
         return
     if args.command == "assemble-bundle":
         report_paths = [Path(path) for path in args.report_paths]
@@ -374,13 +457,18 @@ def main() -> None:
         return
     if args.command == "phase-report":
         report, _ = generate_phase_report(project_root, args.run_id)
-        print_json(report)
+        print_result(project_root, report, run_id=args.run_id, json_output=args.json_output)
         return
     if args.command == "approve-phase":
-        print_json(record_human_approval(project_root, args.run_id, args.phase, True))
+        print_result(
+            project_root,
+            record_human_approval(project_root, args.run_id, args.phase, True),
+            run_id=args.run_id,
+            json_output=args.json_output,
+        )
         return
     if args.command == "advance-phase":
-        print_json(advance_phase(project_root, args.run_id))
+        print_result(project_root, advance_phase(project_root, args.run_id), run_id=args.run_id, json_output=args.json_output)
         return
     if args.command == "scaffold-smoke-test":
         print(scaffold_smoke_test(project_root, args.run_id))
@@ -419,10 +507,71 @@ def print_json(payload: dict[str, object]) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True))
 
 
-def print_result(payload: dict[str, object], *, leading_blank_line: bool = False) -> None:
+def print_result(
+    project_root: Path,
+    payload: dict[str, object],
+    *,
+    run_id: str | None = None,
+    leading_blank_line: bool = False,
+    json_output: bool = False,
+) -> None:
     if leading_blank_line:
         print()
-    print_json(payload)
+    augmented = augment_result_with_guidance(project_root, payload, run_id=run_id)
+    if json_output:
+        print_json(augmented)
+        return
+    print(format_result_summary(augmented))
+
+
+def should_print_result(json_output: bool, *, watched: bool) -> bool:
+    return json_output or not watched
+
+
+def format_result_summary(payload: dict[str, object]) -> str:
+    lines: list[str] = []
+    if payload.get("run_id") is not None:
+        lines.append(f"Run: {payload['run_id']}")
+    if payload.get("phase") is not None:
+        lines.append(f"Phase: {payload['phase']}")
+    if payload.get("objective_id") is not None:
+        lines.append(f"Objective: {payload['objective_id']}")
+    if payload.get("run_status") is not None:
+        lines.append(f"Status: {payload['run_status']}")
+    if payload.get("run_status_reason") is not None:
+        lines.append(f"Reason: {payload['run_status_reason']}")
+    if payload.get("phase_recommendation") is not None:
+        lines.append(f"Recommendation: {payload['phase_recommendation']}")
+    if payload.get("review_doc_path") is not None:
+        lines.append(f"Review doc: {payload['review_doc_path']}")
+    if payload.get("next_action_command") is not None:
+        lines.append(f"Next action: {payload['next_action_command']}")
+    if payload.get("next_action_reason") is not None:
+        lines.append(f"Next action reason: {payload['next_action_reason']}")
+    return "\n".join(lines)
+
+
+def augment_result_with_guidance(
+    project_root: Path,
+    payload: dict[str, object],
+    *,
+    run_id: str | None = None,
+) -> dict[str, object]:
+    effective_run_id = run_id or (str(payload.get("run_id")) if payload.get("run_id") is not None else None)
+    if effective_run_id is None:
+        return payload
+    guidance = run_guidance(project_root, effective_run_id)
+    augmented = dict(payload)
+    augmented["run_status"] = guidance["run_status"]
+    augmented["run_status_reason"] = guidance["run_status_reason"]
+    augmented["next_action_command"] = guidance["next_action_command"]
+    augmented["next_action_reason"] = guidance["next_action_reason"]
+    augmented["review_doc_path"] = guidance["review_doc_path"]
+    augmented["phase_recommendation"] = guidance["phase_recommendation"]
+    augmented.pop("phase_report_path", None)
+    if "recommended_next_command" not in augmented:
+        augmented["recommended_next_command"] = guidance["next_action_command"]
+    return augmented
 
 
 def run_maybe_watched(
@@ -444,7 +593,7 @@ def retry_activity(
     *,
     sandbox_mode: str,
     codex_path: str,
-    timeout_seconds: int,
+    timeout_seconds: int | None,
 ) -> dict[str, Any]:
     activity = read_json(project_root / "runs" / run_id / "live" / "activities" / f"{activity_id.replace(':', '__')}.json")
     if activity["kind"] == "task_execution":

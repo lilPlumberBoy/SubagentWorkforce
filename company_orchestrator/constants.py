@@ -19,6 +19,7 @@ SCHEMA_NAMES = {
     "objective-outline.v1": "objective-outline.v1.json",
     "objective-plan.v1": "objective-plan.v1.json",
     "capability-plan.v1": "capability-plan.v1.json",
+    "collaboration-handoff.v1": "collaboration-handoff.v1.json",
     "run-live-state.v1": "run-live-state.v1.json",
     "activity-live-state.v1": "activity-live-state.v1.json",
     "live-event.v1": "live-event.v1.json",

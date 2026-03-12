@@ -27,6 +27,7 @@ def initialize_run(project_root: Path, run_id: str, goal_text: str) -> Path:
         "reports",
         "bundles",
         "collaboration",
+        "collaboration-plans",
         "phase-reports",
         "changes",
         "prompt-logs",
@@ -41,6 +42,20 @@ def initialize_run(project_root: Path, run_id: str, goal_text: str) -> Path:
     write_json(run_dir / "team-registry.json", default_team_registry(run_id))
     initialize_live_run(project_root, run_id)
     return run_dir
+
+
+def bootstrap_run(project_root: Path, run_id: str, goal_text: str, *, approve_roles: bool = True) -> dict[str, Any]:
+    run_dir = initialize_run(project_root, run_id, goal_text)
+    objective_map = decompose_goal(project_root, run_id)
+    team_registry = suggest_team_proposals(project_root, run_id)
+    written_roles = generate_role_files(project_root, run_id, approve=approve_roles)
+    return {
+        "run_dir": str(run_dir.relative_to(project_root)),
+        "objective_count": len(objective_map["objectives"]),
+        "team_count": len(team_registry["teams"]),
+        "approved_roles": approve_roles,
+        "written_roles": [str(path.relative_to(project_root)) for path in written_roles],
+    }
 
 
 def assert_active_phase(project_root: Path, run_id: str, requested_phase: str) -> None:

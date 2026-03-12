@@ -10,7 +10,7 @@
     "tasks",
     "bundle_plan",
     "dependency_notes",
-    "collaboration_edges"
+    "collaboration_handoffs"
   ],
   "additionalProperties": false,
   "properties": {
@@ -90,16 +90,34 @@
       }
     },
     "dependency_notes": {"type": "array", "items": {"type": "string"}},
-    "collaboration_edges": {
+    "collaboration_handoffs": {
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["from_task_id", "to_role", "reason"],
+        "required": [
+          "handoff_id",
+          "from_capability",
+          "to_capability",
+          "from_task_id",
+          "to_role",
+          "handoff_type",
+          "reason",
+          "deliverables",
+          "blocking",
+          "shared_asset_ids"
+        ],
         "additionalProperties": false,
         "properties": {
+          "handoff_id": {"type": "string"},
+          "from_capability": {"type": "string"},
+          "to_capability": {"type": "string"},
           "from_task_id": {"type": "string"},
           "to_role": {"type": "string"},
-          "reason": {"type": "string"}
+          "handoff_type": {"type": "string"},
+          "reason": {"type": "string"},
+          "deliverables": {"type": "array", "items": {"type": "string"}},
+          "blocking": {"type": "boolean"},
+          "shared_asset_ids": {"type": "array", "items": {"type": "string"}}
         }
       }
     }

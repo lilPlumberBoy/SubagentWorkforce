@@ -1,0 +1,46 @@
+{
+  "type": "object",
+  "required": [
+    "schema",
+    "run_id",
+    "phase",
+    "objective_id",
+    "handoff_id",
+    "from_capability",
+    "to_capability",
+    "from_task_id",
+    "to_role",
+    "handoff_type",
+    "reason",
+    "deliverables",
+    "blocking",
+    "shared_asset_ids",
+    "status"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"type": "string", "enum": ["collaboration-handoff.v1"]},
+    "run_id": {"type": "string"},
+    "phase": {"type": "string", "enum": ["discovery", "design", "mvp-build", "polish"]},
+    "objective_id": {"type": "string"},
+    "handoff_id": {"type": "string"},
+    "from_capability": {"type": "string"},
+    "to_capability": {"type": "string"},
+    "from_task_id": {"type": "string"},
+    "to_role": {"type": "string"},
+    "handoff_type": {"type": "string"},
+    "reason": {"type": "string"},
+    "deliverables": {"type": "array", "items": {"type": "string"}},
+    "blocking": {"type": "boolean"},
+    "shared_asset_ids": {"type": "array", "items": {"type": "string"}},
+    "status": {
+      "type": "string",
+      "enum": ["planned", "waiting_on_source", "satisfied", "blocked"]
+    },
+    "to_task_ids": {"type": "array", "items": {"type": "string"}},
+    "satisfied_by_task_ids": {"type": "array", "items": {"type": "string"}},
+    "missing_deliverables": {"type": "array", "items": {"type": "string"}},
+    "status_reason": {"type": ["string", "null"]},
+    "last_checked_at": {"type": ["string", "null"]}
+  }
+}

@@ -14,16 +14,27 @@ from unittest.mock import patch
 from rich.console import Console
 
 from company_orchestrator.bundles import assemble_review_bundle, review_bundle
-from company_orchestrator.cli import main as cli_main
+from company_orchestrator.cli import augment_result_with_guidance, format_result_summary, main as cli_main
 from company_orchestrator.changes import analyze_change_request, approve_change, create_change_request, scaffold_delta_run
 from company_orchestrator.collaboration import create_collaboration_request, resolve_collaboration_request
 from company_orchestrator.executor import ExecutorError, execute_task
 from company_orchestrator.filesystem import read_json, write_json
-from company_orchestrator.management import run_phase, schedule_tasks
+from company_orchestrator.handoffs import list_handoffs
+from company_orchestrator.management import run_guidance, run_phase, schedule_tasks
 from company_orchestrator.monitoring import build_activity_detail, build_run_dashboard, inspect_activity
-from company_orchestrator.objective_planner import build_planning_prompt, plan_objective, plan_phase
-from company_orchestrator.planner import generate_role_files, initialize_run, suggest_team_proposals
-from company_orchestrator.prompts import build_planning_payload, render_prompt
+from company_orchestrator.objective_planner import (
+    build_planning_prompt,
+    normalize_objective_outline,
+    plan_objective,
+    plan_phase,
+)
+from company_orchestrator.planner import bootstrap_run, generate_role_files, initialize_run, suggest_team_proposals
+from company_orchestrator.prompts import (
+    build_planning_payload,
+    render_capability_planning_prompt,
+    render_objective_planning_prompt,
+    render_prompt,
+)
 from company_orchestrator.recovery import RecoveryBlockedError, reconcile_run
 from company_orchestrator.reports import advance_phase, generate_phase_report, record_human_approval
 from company_orchestrator.smoke import scaffold_smoke_test, simulate_context_echo_completion, verify_smoke_reports
@@ -694,6 +705,49 @@ class OrchestratorTests(unittest.TestCase):
         )
         self.assertEqual(activity["status"], "failed")
 
+    def test_execute_task_retries_timeout_when_using_policy_defaults(self) -> None:
+        import subprocess
+
+        scaffold_smoke_test(self.project_root, "timeout-retry-exec")
+        final_payload = {
+            "summary": "Recovered after timeout retry.",
+            "status": "ready_for_bundle_review",
+            "artifacts": [],
+            "validation_results": [],
+            "dependency_impact": [],
+            "open_issues": [],
+            "follow_up_requests": [],
+            "context_echo": None,
+            "collaboration_request": None,
+        }
+        timeout_error = subprocess.TimeoutExpired(
+            cmd=["codex", "exec"],
+            timeout=300,
+            output=b'{"type":"thread.started","thread_id":"thread-timeout-retry"}\n',
+            stderr=b"worker still reasoning\n",
+        )
+        completed = completed_process(
+            stdout="\n".join(
+                [
+                    '{"type":"thread.started","thread_id":"thread-timeout-retry-2"}',
+                    '{"type":"turn.started"}',
+                    json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(final_payload)}),
+                    '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
+                ]
+            ),
+            stderr="",
+            returncode=0,
+        )
+        with patch("company_orchestrator.executor.run_codex_command", side_effect=[timeout_error, completed]):
+            summary = execute_task(self.project_root, "timeout-retry-exec", "APP-A-SMOKE-001", timeout_seconds=None)
+        self.assertEqual(summary["status"], "ready_for_bundle_review")
+        report = read_json(self.project_root / "runs" / "timeout-retry-exec" / "reports" / "APP-A-SMOKE-001.json")
+        self.assertEqual(report["runtime_recovery"]["timeout_retries_used"], 1)
+        activity = read_activity(self.project_root, "timeout-retry-exec", "APP-A-SMOKE-001")
+        self.assertEqual(activity["status"], "recovered")
+        events = read_json_lines(self.project_root / "runs" / "timeout-retry-exec" / "live" / "events.jsonl")
+        self.assertIn("task.timeout_retry_scheduled", {event["event_type"] for event in events})
+
     def test_run_phase_executes_all_tasks_and_generates_phase_report(self) -> None:
         scaffold_smoke_test(self.project_root, "managed")
 
@@ -766,6 +820,117 @@ class OrchestratorTests(unittest.TestCase):
 
         self.assertEqual(executed_order, ["APP-A-SMOKE-001", "APP-B-SMOKE-001"])
         self.assertEqual(summary["recommendation"], "advance")
+
+    def test_run_phase_suggests_replan_command_for_stale_plan_blockers(self) -> None:
+        scaffold_smoke_test(self.project_root, "stale-plan")
+        task_path = self.project_root / "runs" / "stale-plan" / "tasks" / "APP-A-SMOKE-001.json"
+        task = read_json(task_path)
+        task["depends_on"] = ["Approved planning inputs for scope, constraints, and success criteria"]
+        write_json(task_path, task)
+
+        summary = run_phase(self.project_root, "stale-plan")
+
+        self.assertEqual(
+            summary["recommended_next_command"],
+            "python3 -m company_orchestrator plan-phase stale-plan --replace --sandbox read-only --max-concurrency 2 --timeout-seconds 600 --watch",
+        )
+        console = Console(record=True, width=140)
+        console.print(build_run_dashboard(self.project_root, "stale-plan"))
+        dashboard_output = console.export_text()
+        self.assertIn("Next Action", dashboard_output)
+        self.assertIn("plan-phase stale-plan --replace", dashboard_output)
+        self.assertIn("recoverable", dashboard_output)
+        self.assertNotIn("Phase report:", dashboard_output)
+        self.assertLess(dashboard_output.index("Activity History"), dashboard_output.index("Next Action"))
+
+    def test_run_guidance_reports_review_and_advance_states(self) -> None:
+        scaffold_smoke_test(self.project_root, "reviewable")
+
+        def side_effect(project_root: Path, run_id: str, task_id: str, **_: object):
+            return write_managed_report(
+                project_root,
+                run_id,
+                task_id,
+                status="ready_for_bundle_review",
+                summary=f"{task_id} complete",
+            )
+
+        with patch("company_orchestrator.management.execute_task", side_effect=side_effect):
+            run_phase(self.project_root, "reviewable")
+
+        guidance = run_guidance(self.project_root, "reviewable")
+        self.assertEqual(guidance["run_status"], "ready_for_review")
+        self.assertEqual(
+            guidance["next_action_command"],
+            "python3 -m company_orchestrator approve-phase reviewable discovery",
+        )
+        self.assertTrue(str(guidance["review_doc_path"]).endswith("runs/reviewable/phase-reports/discovery.md"))
+
+        record_human_approval(self.project_root, "reviewable", "discovery", True)
+        guidance = run_guidance(self.project_root, "reviewable")
+        self.assertEqual(guidance["run_status"], "ready_to_advance")
+        self.assertEqual(
+            guidance["next_action_command"],
+            "python3 -m company_orchestrator advance-phase reviewable",
+        )
+
+    def test_cli_result_guidance_adds_review_paths(self) -> None:
+        scaffold_smoke_test(self.project_root, "guided")
+        payload = augment_result_with_guidance(self.project_root, {"run_id": "guided"})
+        self.assertEqual(payload["run_status"], "working")
+        self.assertEqual(
+            payload["next_action_command"],
+            "python3 -m company_orchestrator run-phase guided --sandbox read-only --max-concurrency 2 --timeout-seconds 600 --watch",
+        )
+        self.assertNotIn("phase_report_path", payload)
+
+    def test_normalize_objective_outline_allows_acceptance_target_edge(self) -> None:
+        payload = {
+            "schema": "objective-outline.v1",
+            "run_id": "outline-acceptance",
+            "phase": "design",
+            "objective_id": "app-a",
+            "summary": "Outline with acceptance review edge.",
+            "capability_lanes": [
+                {
+                    "capability": "frontend",
+                    "assigned_manager_role": "wrong-role",
+                    "objective": "Plan frontend work.",
+                    "inputs": [],
+                    "expected_outputs": [],
+                    "done_when": [],
+                    "depends_on": [],
+                    "planning_notes": [],
+                    "collaboration_rules": [],
+                }
+            ],
+            "dependency_notes": [],
+            "collaboration_edges": [
+                {
+                    "edge_id": "frontend-review-gate",
+                    "from_capability": "frontend",
+                    "to_capability": "acceptance",
+                    "to_role": "objectives.app-a.acceptance-manager",
+                    "handoff_type": "review_bundle",
+                    "reason": "Needs approval.",
+                    "deliverables": ["design.md"],
+                    "blocking": True,
+                    "shared_asset_ids": [],
+                }
+            ],
+        }
+        normalized, _ = normalize_objective_outline(
+            self.project_root,
+            payload,
+            run_id="outline-acceptance",
+            phase="design",
+            objective={"objective_id": "app-a", "capabilities": ["frontend"]},
+        )
+        self.assertEqual(
+            normalized["capability_lanes"][0]["assigned_manager_role"],
+            "objectives.app-a.frontend-manager",
+        )
+        self.assertEqual(normalized["collaboration_edges"][0]["to_capability"], "acceptance")
 
     def test_schedule_tasks_runs_parallel_read_only_work(self) -> None:
         scaffold_smoke_test(self.project_root, "parallel")
@@ -861,6 +1026,287 @@ class OrchestratorTests(unittest.TestCase):
         self.assertTrue(activity["warnings"])
         phase_report, _ = generate_phase_report(self.project_root, "serialize-warning")
         self.assertEqual(phase_report["parallelism_summary"]["tasks_serialized_by_runtime_conflict"], 1)
+
+    def test_schedule_tasks_waits_for_blocking_handoff_before_running_consumer(self) -> None:
+        scaffold_planning_run(self.project_root, "handoff-gating", ["frontend", "backend"])
+        run_dir = self.project_root / "runs" / "handoff-gating"
+        source_task = {
+            "schema": "task-assignment.v1",
+            "run_id": "handoff-gating",
+            "phase": "discovery",
+            "objective_id": "app-a",
+            "capability": "frontend",
+            "task_id": "APP-A-FRONTEND-001",
+            "assigned_role": "objectives.app-a.frontend-worker",
+            "manager_role": "objectives.app-a.frontend-manager",
+            "acceptance_role": "objectives.app-a.acceptance-manager",
+            "execution_mode": "read_only",
+            "parallel_policy": "allow",
+            "owned_paths": [],
+            "shared_asset_ids": ["app-a:api-contract"],
+            "handoff_dependencies": [],
+            "objective": "Publish the API contract.",
+            "inputs": [],
+            "expected_outputs": ["docs/contracts/app-a-api.md"],
+            "done_when": ["contract published"],
+            "depends_on": [],
+            "validation": [],
+            "collaboration_rules": [],
+        }
+        consumer_task = {
+            "schema": "task-assignment.v1",
+            "run_id": "handoff-gating",
+            "phase": "discovery",
+            "objective_id": "app-a",
+            "capability": "backend",
+            "task_id": "APP-A-BACKEND-001",
+            "assigned_role": "objectives.app-a.backend-worker",
+            "manager_role": "objectives.app-a.backend-manager",
+            "acceptance_role": "objectives.app-a.acceptance-manager",
+            "execution_mode": "read_only",
+            "parallel_policy": "allow",
+            "owned_paths": [],
+            "shared_asset_ids": ["app-a:api-contract"],
+            "handoff_dependencies": ["app-a-frontend-api-contract"],
+            "objective": "Consume the published API contract.",
+            "inputs": [],
+            "expected_outputs": ["backend notes"],
+            "done_when": ["contract consumed"],
+            "depends_on": [],
+            "validation": [],
+            "collaboration_rules": [],
+        }
+        write_json(run_dir / "tasks" / "APP-A-FRONTEND-001.json", source_task)
+        write_json(run_dir / "tasks" / "APP-A-BACKEND-001.json", consumer_task)
+        write_json(
+            run_dir / "collaboration-plans" / "app-a-frontend-api-contract.json",
+            {
+                "schema": "collaboration-handoff.v1",
+                "run_id": "handoff-gating",
+                "phase": "discovery",
+                "objective_id": "app-a",
+                "handoff_id": "app-a-frontend-api-contract",
+                "from_capability": "frontend",
+                "to_capability": "backend",
+                "from_task_id": "APP-A-FRONTEND-001",
+                "to_role": "objectives.app-a.backend-manager",
+                "handoff_type": "contract",
+                "reason": "Backend depends on the frontend contract.",
+                "deliverables": ["docs/contracts/app-a-api.md"],
+                "blocking": True,
+                "shared_asset_ids": ["app-a:api-contract"],
+                "to_task_ids": ["APP-A-BACKEND-001"],
+                "status": "planned",
+                "satisfied_by_task_ids": [],
+                "missing_deliverables": [],
+                "status_reason": None,
+                "last_checked_at": None,
+            },
+        )
+        call_order: list[str] = []
+
+        def side_effect(project_root: Path, run_id: str, task_id: str, **_: object):
+            call_order.append(task_id)
+            artifacts = []
+            if task_id == "APP-A-FRONTEND-001":
+                artifact_path = project_root / "docs" / "contracts" / "app-a-api.md"
+                artifact_path.parent.mkdir(parents=True, exist_ok=True)
+                artifact_path.write_text("contract", encoding="utf-8")
+                artifacts.append({"path": "docs/contracts/app-a-api.md", "status": "created"})
+            return write_managed_report(
+                project_root,
+                run_id,
+                task_id,
+                status="ready_for_bundle_review",
+                summary=f"{task_id} complete",
+                artifacts=artifacts,
+            )
+
+        with patch("company_orchestrator.management.execute_task", side_effect=side_effect):
+            summary = schedule_tasks(
+                self.project_root,
+                "handoff-gating",
+                [source_task, consumer_task],
+                sandbox_mode="read-only",
+                codex_path="codex",
+                force=False,
+                timeout_seconds=30,
+                max_concurrency=2,
+            )
+
+        self.assertEqual(call_order, ["APP-A-FRONTEND-001", "APP-A-BACKEND-001"])
+        self.assertFalse(summary["unresolved_dependencies"])
+        events = read_json_lines(run_dir / "live" / "events.jsonl")
+        self.assertIn("task.waiting_handoffs", {event["event_type"] for event in events})
+        refreshed_handoff = read_json(run_dir / "collaboration-plans" / "app-a-frontend-api-contract.json")
+        self.assertEqual(refreshed_handoff["status"], "satisfied")
+
+    def test_waiting_dependency_events_are_emitted_once_until_blockers_change(self) -> None:
+        scaffold_smoke_test(self.project_root, "dependency-noise")
+        run_dir = self.project_root / "runs" / "dependency-noise"
+        app_a = read_json(run_dir / "tasks" / "APP-A-SMOKE-001.json")
+        app_b = read_json(run_dir / "tasks" / "APP-B-SMOKE-001.json")
+        app_b["depends_on"] = ["APP-A-SMOKE-001"]
+        write_json(run_dir / "tasks" / "APP-B-SMOKE-001.json", app_b)
+
+        def side_effect(project_root: Path, run_id: str, task_id: str, **_: object):
+            if task_id == "APP-A-SMOKE-001":
+                time.sleep(0.25)
+            return write_managed_report(
+                project_root,
+                run_id,
+                task_id,
+                status="ready_for_bundle_review",
+                summary=f"{task_id} complete",
+            )
+
+        with patch("company_orchestrator.management.execute_task", side_effect=side_effect):
+            summary = schedule_tasks(
+                self.project_root,
+                "dependency-noise",
+                [app_a, app_b],
+                sandbox_mode="read-only",
+                codex_path="codex",
+                force=False,
+                timeout_seconds=30,
+                max_concurrency=2,
+            )
+
+        self.assertFalse(summary["failures"])
+        events = read_json_lines(run_dir / "live" / "events.jsonl")
+        waiting_events = [
+            event
+            for event in events
+            if event["event_type"] == "task.waiting_dependencies" and event["activity_id"] == "APP-B-SMOKE-001"
+        ]
+        resolved_events = [
+            event
+            for event in events
+            if event["event_type"] == "task.dependencies_resolved" and event["activity_id"] == "APP-B-SMOKE-001"
+        ]
+        self.assertEqual(len(waiting_events), 1)
+        self.assertEqual(len(resolved_events), 1)
+
+    def test_waiting_handoff_events_are_emitted_once_until_handoff_resolves(self) -> None:
+        scaffold_planning_run(self.project_root, "handoff-noise", ["frontend", "backend"])
+        run_dir = self.project_root / "runs" / "handoff-noise"
+        source_task = {
+            "schema": "task-assignment.v1",
+            "run_id": "handoff-noise",
+            "phase": "discovery",
+            "objective_id": "app-a",
+            "capability": "frontend",
+            "task_id": "APP-A-FRONTEND-001",
+            "assigned_role": "objectives.app-a.frontend-worker",
+            "manager_role": "objectives.app-a.frontend-manager",
+            "acceptance_role": "objectives.app-a.acceptance-manager",
+            "execution_mode": "read_only",
+            "parallel_policy": "allow",
+            "owned_paths": [],
+            "shared_asset_ids": ["app-a:api-contract"],
+            "handoff_dependencies": [],
+            "objective": "Publish the API contract.",
+            "inputs": [],
+            "expected_outputs": ["docs/contracts/app-a-api.md"],
+            "done_when": ["contract published"],
+            "depends_on": [],
+            "validation": [],
+            "collaboration_rules": [],
+        }
+        consumer_task = {
+            "schema": "task-assignment.v1",
+            "run_id": "handoff-noise",
+            "phase": "discovery",
+            "objective_id": "app-a",
+            "capability": "backend",
+            "task_id": "APP-A-BACKEND-001",
+            "assigned_role": "objectives.app-a.backend-worker",
+            "manager_role": "objectives.app-a.backend-manager",
+            "acceptance_role": "objectives.app-a.acceptance-manager",
+            "execution_mode": "read_only",
+            "parallel_policy": "allow",
+            "owned_paths": [],
+            "shared_asset_ids": ["app-a:api-contract"],
+            "handoff_dependencies": ["app-a-frontend-api-contract"],
+            "objective": "Consume the published API contract.",
+            "inputs": [],
+            "expected_outputs": ["backend notes"],
+            "done_when": ["contract consumed"],
+            "depends_on": [],
+            "validation": [],
+            "collaboration_rules": [],
+        }
+        write_json(run_dir / "tasks" / "APP-A-FRONTEND-001.json", source_task)
+        write_json(run_dir / "tasks" / "APP-A-BACKEND-001.json", consumer_task)
+        write_json(
+            run_dir / "collaboration-plans" / "app-a-frontend-api-contract.json",
+            {
+                "schema": "collaboration-handoff.v1",
+                "run_id": "handoff-noise",
+                "phase": "discovery",
+                "objective_id": "app-a",
+                "handoff_id": "app-a-frontend-api-contract",
+                "from_capability": "frontend",
+                "to_capability": "backend",
+                "from_task_id": "APP-A-FRONTEND-001",
+                "to_role": "objectives.app-a.backend-manager",
+                "handoff_type": "contract",
+                "reason": "Backend depends on the frontend contract.",
+                "deliverables": ["docs/contracts/app-a-api.md"],
+                "blocking": True,
+                "shared_asset_ids": ["app-a:api-contract"],
+                "to_task_ids": ["APP-A-BACKEND-001"],
+                "status": "planned",
+                "satisfied_by_task_ids": [],
+                "missing_deliverables": [],
+                "status_reason": None,
+                "last_checked_at": None,
+            },
+        )
+
+        def side_effect(project_root: Path, run_id: str, task_id: str, **_: object):
+            if task_id == "APP-A-FRONTEND-001":
+                time.sleep(0.25)
+                artifact_path = project_root / "docs" / "contracts" / "app-a-api.md"
+                artifact_path.parent.mkdir(parents=True, exist_ok=True)
+                artifact_path.write_text("contract", encoding="utf-8")
+                artifacts = [{"path": "docs/contracts/app-a-api.md", "status": "created"}]
+            else:
+                artifacts = []
+            return write_managed_report(
+                project_root,
+                run_id,
+                task_id,
+                status="ready_for_bundle_review",
+                summary=f"{task_id} complete",
+                artifacts=artifacts,
+            )
+
+        with patch("company_orchestrator.management.execute_task", side_effect=side_effect):
+            schedule_tasks(
+                self.project_root,
+                "handoff-noise",
+                [source_task, consumer_task],
+                sandbox_mode="read-only",
+                codex_path="codex",
+                force=False,
+                timeout_seconds=30,
+                max_concurrency=2,
+            )
+
+        events = read_json_lines(run_dir / "live" / "events.jsonl")
+        waiting_events = [
+            event
+            for event in events
+            if event["event_type"] == "task.waiting_handoffs" and event["activity_id"] == "APP-A-BACKEND-001"
+        ]
+        resolved_events = [
+            event
+            for event in events
+            if event["event_type"] == "task.handoffs_resolved" and event["activity_id"] == "APP-A-BACKEND-001"
+        ]
+        self.assertEqual(len(waiting_events), 1)
+        self.assertEqual(len(resolved_events), 1)
 
     def test_worktree_isolation_and_landing_merge_accepted_changes(self) -> None:
         init_git_repo(self.project_root)
@@ -1013,7 +1459,7 @@ class OrchestratorTests(unittest.TestCase):
                 }
             ],
             "dependency_notes": ["Task 2 depends on task 1"],
-            "collaboration_edges": []
+            "collaboration_handoffs": []
         }
         responses = [
             completed_process(
@@ -1234,6 +1680,322 @@ class OrchestratorTests(unittest.TestCase):
         )
         self.assertEqual(capability_activity["kind"], "capability_plan")
 
+    def test_plan_objective_materializes_cross_lane_handoffs_and_report_summary(self) -> None:
+        scaffold_planning_run(self.project_root, "planned-handoffs", ["frontend", "backend"])
+        objective_outline = objective_outline_for_objective(
+            "planned-handoffs",
+            "app-a",
+            ["frontend", "backend"],
+            collaboration_edges=[
+                {
+                    "edge_id": "api-contract",
+                    "from_capability": "frontend",
+                    "to_capability": "backend",
+                    "to_role": "objectives.app-a.backend-manager",
+                    "handoff_type": "contract",
+                    "reason": "Backend needs the frontend-owned API contract before implementation planning.",
+                    "deliverables": ["docs/contracts/app-a-api.md"],
+                    "blocking": True,
+                    "shared_asset_ids": ["app-a:api-contract"],
+                }
+            ],
+        )
+        frontend_plan = capability_plan_for_objective(
+            "planned-handoffs",
+            "app-a",
+            "frontend",
+            collaboration_handoffs=[
+                {
+                    "handoff_id": "api-contract",
+                    "from_capability": "frontend",
+                    "to_capability": "backend",
+                    "from_task_id": "APP-A-FRONTEND-001",
+                    "to_role": "objectives.app-a.backend-manager",
+                    "handoff_type": "contract",
+                    "reason": "Publish the API contract for backend planning.",
+                    "deliverables": ["docs/contracts/app-a-api.md"],
+                    "blocking": True,
+                    "shared_asset_ids": ["app-a:api-contract"],
+                }
+            ],
+        )
+        frontend_plan["tasks"][0]["expected_outputs"] = ["docs/contracts/app-a-api.md"]
+        backend_plan = capability_plan_for_objective("planned-handoffs", "app-a", "backend")
+        backend_plan["tasks"][0]["depends_on"] = ["APP-A-FRONTEND-001"]
+        backend_plan["tasks"][0]["inputs"] = ["Output of APP-A-FRONTEND-001"]
+
+        def side_effect(*args: object, **kwargs: object):
+            command_text = " ".join(str(part) for part in args[0])
+            if "objective-outline.v1.json" in command_text:
+                payload = objective_outline
+                thread_id = "objective-thread"
+            elif "discovery-app-a-backend" in command_text:
+                payload = backend_plan
+                thread_id = "backend-thread"
+            else:
+                payload = frontend_plan
+                thread_id = "frontend-thread"
+            stdout = "\n".join(
+                [
+                    f'{{"type":"thread.started","thread_id":"{thread_id}"}}',
+                    '{"type":"turn.started"}',
+                    json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(payload)}),
+                    '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
+                ]
+            )
+            return completed_process(stdout=stdout, stderr="", returncode=0)
+
+        with patch("company_orchestrator.objective_planner.run_codex_command", side_effect=side_effect):
+            summary = plan_objective(self.project_root, "planned-handoffs", "app-a")
+
+        self.assertEqual(summary["handoff_ids"], ["app-a-frontend-api-contract"])
+        manager_plan = read_json(
+            self.project_root / "runs" / "planned-handoffs" / "manager-plans" / "discovery-app-a.json"
+        )
+        self.assertEqual(manager_plan["collaboration_handoffs"][0]["handoff_id"], "app-a-frontend-api-contract")
+        backend_task = next(task for task in manager_plan["tasks"] if task["task_id"] == "APP-A-BACKEND-001")
+        self.assertIn("app-a:api-contract", backend_task["shared_asset_ids"])
+        self.assertEqual(backend_task["handoff_dependencies"], ["app-a-frontend-api-contract"])
+        handoff_path = (
+            self.project_root
+            / "runs"
+            / "planned-handoffs"
+            / "collaboration-plans"
+            / "app-a-frontend-api-contract.json"
+        )
+        self.assertTrue(handoff_path.exists())
+        handoff_payload = read_json(handoff_path)
+        self.assertEqual(handoff_payload["to_task_ids"], ["APP-A-BACKEND-001"])
+
+        report, _ = generate_phase_report(self.project_root, "planned-handoffs")
+        self.assertEqual(report["collaboration_summary"]["total_handoffs"], 1)
+        self.assertEqual(report["collaboration_summary"]["blocking_handoffs"], 1)
+        self.assertEqual(report["collaboration_summary"]["pending_handoffs"], 1)
+        self.assertEqual(report["collaboration_summary"]["satisfied_handoffs"], 0)
+        self.assertEqual(report["collaboration_summary"]["blocked_handoffs"], 0)
+
+    def test_plan_objective_filters_non_task_dependencies_and_review_handoff_fallbacks(self) -> None:
+        scaffold_planning_run(self.project_root, "planned-sanitize", ["frontend"])
+        objective_outline = objective_outline_for_objective("planned-sanitize", "app-a", ["frontend"])
+        capability_plan = {
+            "schema": "capability-plan.v1",
+            "run_id": "planned-sanitize",
+            "phase": "discovery",
+            "objective_id": "app-a",
+            "capability": "frontend",
+            "summary": "Sanitized frontend discovery plan",
+            "tasks": [
+                {
+                    "task_id": "FE-DISC-01-scope-brief",
+                    "capability": "frontend",
+                    "assigned_role": "objectives.app-a.frontend-worker",
+                    "execution_mode": "read_only",
+                    "parallel_policy": "allow",
+                    "owned_paths": [],
+                    "shared_asset_ids": [],
+                    "objective": "Write the scope brief.",
+                    "inputs": ["Planning Inputs.goal_context.sections.In Scope"],
+                    "expected_outputs": ["frontend-mvp-scope-brief-v1"],
+                    "done_when": ["scope is documented"],
+                    "depends_on": ["Approved planning inputs for scope, constraints, and success criteria"],
+                    "validation": [],
+                    "collaboration_rules": [],
+                    "working_directory": None,
+                    "additional_directories": [],
+                    "sandbox_mode": "read-only",
+                },
+                {
+                    "task_id": "FE-DISC-02-boundary-and-contract",
+                    "capability": "frontend",
+                    "assigned_role": "objectives.app-a.frontend-worker",
+                    "execution_mode": "read_only",
+                    "parallel_policy": "allow",
+                    "owned_paths": [],
+                    "shared_asset_ids": [],
+                    "objective": "Write the boundary and contract notes.",
+                    "inputs": ["Planning Inputs.required_handoffs[0]"],
+                    "expected_outputs": ["frontend-contract-question-log-v1"],
+                    "done_when": ["contract gaps are documented"],
+                    "depends_on": ["Approved planning inputs for scope, constraints, and success criteria"],
+                    "validation": [],
+                    "collaboration_rules": [],
+                    "working_directory": None,
+                    "additional_directories": [],
+                    "sandbox_mode": "read-only",
+                },
+                {
+                    "task_id": "FE-DISC-03-unknowns-and-task-graph",
+                    "capability": "frontend",
+                    "assigned_role": "objectives.app-a.frontend-worker",
+                    "execution_mode": "read_only",
+                    "parallel_policy": "allow",
+                    "owned_paths": [],
+                    "shared_asset_ids": [],
+                    "objective": "Write the unknowns and task graph notes.",
+                    "inputs": ["Planning Inputs.goal_context.sections.Known Unknowns"],
+                    "expected_outputs": ["frontend-unknowns-register-v1"],
+                    "done_when": ["unknowns are documented"],
+                    "depends_on": ["Approved planning inputs for scope, constraints, and success criteria"],
+                    "validation": [],
+                    "collaboration_rules": [],
+                    "working_directory": None,
+                    "additional_directories": [],
+                    "sandbox_mode": "read-only",
+                },
+                {
+                    "task_id": "FE-DISC-04-acceptance-bundle",
+                    "capability": "frontend",
+                    "assigned_role": "objectives.app-a.frontend-worker",
+                    "execution_mode": "read_only",
+                    "parallel_policy": "allow",
+                    "owned_paths": [],
+                    "shared_asset_ids": [],
+                    "objective": "Bundle discovery outputs for review.",
+                    "inputs": [
+                        "Output of FE-DISC-01-scope-brief",
+                        "Output of FE-DISC-02-boundary-and-contract",
+                        "Output of FE-DISC-03-unknowns-and-task-graph",
+                    ],
+                    "expected_outputs": ["frontend-discovery-review-bundle-v1"],
+                    "done_when": ["bundle is ready"],
+                    "depends_on": [
+                        "FE-DISC-01-scope-brief",
+                        "FE-DISC-02-boundary-and-contract",
+                        "FE-DISC-03-unknowns-and-task-graph",
+                    ],
+                    "validation": [],
+                    "collaboration_rules": [],
+                    "working_directory": None,
+                    "additional_directories": [],
+                    "sandbox_mode": "read-only",
+                },
+            ],
+            "bundle_plan": [
+                {
+                    "bundle_id": "frontend-discovery-core",
+                    "task_ids": [
+                        "FE-DISC-01-scope-brief",
+                        "FE-DISC-02-boundary-and-contract",
+                        "FE-DISC-03-unknowns-and-task-graph",
+                    ],
+                    "summary": "Core discovery docs",
+                },
+                {
+                    "bundle_id": "frontend-discovery-acceptance",
+                    "task_ids": ["FE-DISC-04-acceptance-bundle"],
+                    "summary": "Acceptance bundle",
+                },
+            ],
+            "dependency_notes": [],
+            "collaboration_handoffs": [
+                {
+                    "handoff_id": "frontend-to-acceptance-manager-discovery-review",
+                    "from_capability": "frontend",
+                    "to_capability": "frontend",
+                    "from_task_id": "FE-DISC-04-acceptance-bundle",
+                    "to_role": "objectives.app-a.acceptance-manager",
+                    "handoff_type": "review_bundle",
+                    "reason": "Acceptance manager review",
+                    "deliverables": ["frontend-discovery-review-bundle-v1"],
+                    "blocking": True,
+                    "shared_asset_ids": ["frontend-discovery-review-bundle-v1"],
+                },
+                {
+                    "handoff_id": "frontend-to-objective-manager-contract-request",
+                    "from_capability": "frontend",
+                    "to_capability": "frontend",
+                    "from_task_id": "FE-DISC-02-boundary-and-contract",
+                    "to_role": "objectives.app-a.objective-manager",
+                    "handoff_type": "collaboration_request",
+                    "reason": "Contract question escalation",
+                    "deliverables": ["frontend-contract-question-log-v1"],
+                    "blocking": True,
+                    "shared_asset_ids": ["frontend-contract-question-log-v1"],
+                },
+            ],
+        }
+        responses = [
+            completed_process(
+                stdout="\n".join(
+                    [
+                        '{"type":"thread.started","thread_id":"outline-thread"}',
+                        '{"type":"turn.started"}',
+                        json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(objective_outline)}),
+                        '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
+                    ]
+                ),
+                stderr="",
+                returncode=0,
+            ),
+            completed_process(
+                stdout="\n".join(
+                    [
+                        '{"type":"thread.started","thread_id":"capability-thread"}',
+                        '{"type":"turn.started"}',
+                        json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(capability_plan)}),
+                        '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
+                    ]
+                ),
+                stderr="",
+                returncode=0,
+            ),
+        ]
+        with patch("company_orchestrator.objective_planner.run_codex_command", side_effect=responses):
+            plan_objective(self.project_root, "planned-sanitize", "app-a")
+
+        task_1 = read_json(self.project_root / "runs" / "planned-sanitize" / "tasks" / "FE-DISC-01-scope-brief.json")
+        task_2 = read_json(self.project_root / "runs" / "planned-sanitize" / "tasks" / "FE-DISC-02-boundary-and-contract.json")
+        task_4 = read_json(self.project_root / "runs" / "planned-sanitize" / "tasks" / "FE-DISC-04-acceptance-bundle.json")
+        review_handoff_path = next(
+            (
+                self.project_root
+                / "runs"
+                / "planned-sanitize"
+                / "collaboration-plans"
+            ).glob("*acceptance-manager-discovery-review.json")
+        )
+        review_handoff = read_json(review_handoff_path)
+
+        self.assertEqual(task_1["depends_on"], [])
+        self.assertEqual(task_2["depends_on"], [])
+        self.assertEqual(task_1["handoff_dependencies"], [])
+        self.assertEqual(task_2["handoff_dependencies"], [])
+        self.assertEqual(task_4["handoff_dependencies"], ["app-a-frontend-frontend-to-objective-manager-contract-request"])
+        self.assertEqual(review_handoff["to_task_ids"], [])
+
+    def test_list_handoffs_skips_invalid_json_files(self) -> None:
+        scaffold_planning_run(self.project_root, "handoff-race", ["frontend"])
+        collaboration_dir = self.project_root / "runs" / "handoff-race" / "collaboration-plans"
+        collaboration_dir.mkdir(parents=True, exist_ok=True)
+        valid_handoff = {
+            "schema": "collaboration-handoff.v1",
+            "run_id": "handoff-race",
+            "phase": "discovery",
+            "objective_id": "app-a",
+            "handoff_id": "HOF-VALID",
+            "from_capability": "frontend",
+            "to_capability": "backend",
+            "from_task_id": "APP-A-FRONTEND-001",
+            "to_role": "objectives.app-a.backend-worker",
+            "handoff_type": "contract",
+            "reason": "Share a contract",
+            "deliverables": ["docs/contract.md"],
+            "blocking": True,
+            "shared_asset_ids": ["asset.contract"],
+            "status": "planned",
+            "to_task_ids": ["APP-A-BACKEND-001"],
+            "satisfied_by_task_ids": [],
+            "missing_deliverables": [],
+            "status_reason": None,
+            "last_checked_at": None,
+        }
+        write_json(collaboration_dir / "HOF-VALID.json", valid_handoff)
+        (collaboration_dir / "HOF-BROKEN.json").write_text("", encoding="utf-8")
+
+        handoffs = list_handoffs(self.project_root / "runs" / "handoff-race", phase="discovery")
+
+        self.assertEqual([handoff["handoff_id"] for handoff in handoffs], ["HOF-VALID"])
+
     def test_plan_objective_runs_capability_managers_concurrently(self) -> None:
         scaffold_planning_run(self.project_root, "planned-capability-parallel", ["frontend", "backend"])
         objective_outline = objective_outline_for_objective("planned-capability-parallel", "app-a", ["frontend", "backend"])
@@ -1338,6 +2100,81 @@ class OrchestratorTests(unittest.TestCase):
         self.assertIn("thread.started", stdout_log)
         self.assertIn("manager still reasoning", stderr_log)
 
+    def test_plan_objective_marks_parent_activity_failed_when_capability_planning_fails(self) -> None:
+        import subprocess
+
+        scaffold_planning_run(self.project_root, "planned-capability-timeout", ["frontend"])
+        outline = objective_outline_for_objective("planned-capability-timeout", "app-a", ["frontend"])
+        outline_stdout = "\n".join(
+            [
+                '{"type":"thread.started","thread_id":"objective-thread"}',
+                '{"type":"turn.started"}',
+                json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(outline)}),
+                '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
+            ]
+        )
+        timeout_error = subprocess.TimeoutExpired(
+            cmd=["codex", "exec"],
+            timeout=7,
+            output=b'{"type":"thread.started","thread_id":"capability-timeout"}\n',
+            stderr=b"capability manager still reasoning\n",
+        )
+        responses = [
+            completed_process(stdout=outline_stdout, stderr="", returncode=0),
+            timeout_error,
+        ]
+        with patch("company_orchestrator.objective_planner.run_codex_command", side_effect=responses):
+            with self.assertRaisesRegex(ExecutorError, "timed out after 7 seconds while planning app-a:frontend"):
+                plan_objective(self.project_root, "planned-capability-timeout", "app-a", timeout_seconds=7)
+        activity = read_activity(self.project_root, "planned-capability-timeout", "plan:discovery:app-a")
+        self.assertEqual(activity["status"], "failed")
+        self.assertEqual(activity["status_reason"], "capability_planning_failed")
+        self.assertIn("timed out after 7 seconds", activity["current_activity"])
+
+    def test_plan_objective_retries_timeout_when_using_policy_defaults(self) -> None:
+        import subprocess
+
+        scaffold_planning_run(self.project_root, "planned-timeout-retry", ["frontend"])
+        outline = objective_outline_for_objective("planned-timeout-retry", "app-a", ["frontend"])
+        capability_plan = capability_plan_for_objective("planned-timeout-retry", "app-a", "frontend")
+        timeout_error = subprocess.TimeoutExpired(
+            cmd=["codex", "exec"],
+            timeout=600,
+            output=b'{"type":"thread.started","thread_id":"plan-timeout-retry"}\n',
+            stderr=b"manager still reasoning\n",
+        )
+        objective_completed = completed_process(
+            stdout="\n".join(
+                [
+                    '{"type":"thread.started","thread_id":"objective-timeout-retry"}',
+                    '{"type":"turn.started"}',
+                    json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(outline)}),
+                    '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
+                ]
+            ),
+            stderr="",
+            returncode=0,
+        )
+        capability_completed = completed_process(
+            stdout="\n".join(
+                [
+                    '{"type":"thread.started","thread_id":"capability-timeout-retry"}',
+                    '{"type":"turn.started"}',
+                    json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(capability_plan)}),
+                    '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
+                ]
+            ),
+            stderr="",
+            returncode=0,
+        )
+        with patch("company_orchestrator.objective_planner.run_codex_command", side_effect=[timeout_error, objective_completed, capability_completed]):
+            summary = plan_objective(self.project_root, "planned-timeout-retry", "app-a", timeout_seconds=None)
+        self.assertEqual(summary["recovery_action"], "timeout_retry")
+        activity = read_activity(self.project_root, "planned-timeout-retry", "plan:discovery:app-a")
+        self.assertEqual(activity["status"], "recovered")
+        events = read_json_lines(self.project_root / "runs" / "planned-timeout-retry" / "live" / "events.jsonl")
+        self.assertIn("planning.timeout_retry_scheduled", {event["event_type"] for event in events})
+
     def test_run_phase_uses_manager_generated_bundle_plan(self) -> None:
         scaffold_planning_run(self.project_root, "planned-phase", ["frontend"])
         objective_outline = objective_outline_for_objective("planned-phase", "app-a", ["frontend"])
@@ -1401,7 +2238,7 @@ class OrchestratorTests(unittest.TestCase):
                 }
             ],
             "dependency_notes": [],
-            "collaboration_edges": []
+            "collaboration_handoffs": []
         }
         responses = [
             completed_process(
@@ -1584,6 +2421,8 @@ class OrchestratorTests(unittest.TestCase):
         self.assertIn("OBJ-", run_output)
         self.assertIn("TSK-", run_output)
         self.assertIn("Activity History", run_output)
+        self.assertIn("Elapsed", run_output)
+        self.assertIn("Last Event", run_output)
 
         history = read_activity_history(self.project_root, "monitor")
         self.assertTrue(history)
@@ -1597,6 +2436,8 @@ class OrchestratorTests(unittest.TestCase):
         self.assertIn("Task Assignment", detail_output)
         self.assertIn("Latest Events", detail_output)
         self.assertIn("Display ID", detail_output)
+        self.assertIn("Elapsed:", detail_output)
+        self.assertIn("Last event age:", detail_output)
 
     def test_inspect_activity_reports_missing_activity_cleanly(self) -> None:
         scaffold_smoke_test(self.project_root, "missing-activity")
@@ -1624,7 +2465,103 @@ class OrchestratorTests(unittest.TestCase):
             cli_main()
         wrapped.assert_called_once()
         self.assertTrue(wrapped.call_args.args[2])
-        print_result_mock.assert_called_once_with(expected, leading_blank_line=True)
+        self.assertEqual(print_result_mock.call_count, 0)
+
+    def test_cli_execute_task_watch_with_json_prints_payload(self) -> None:
+        scaffold_smoke_test(self.project_root, "watch-cli-json")
+        expected = {"task_id": "APP-A-SMOKE-001", "status": "ready_for_bundle_review"}
+        argv = [
+            "company-orchestrator",
+            "--project-root",
+            str(self.project_root),
+            "--json",
+            "execute-task",
+            "watch-cli-json",
+            "APP-A-SMOKE-001",
+            "--watch",
+        ]
+        with (
+            patch.object(sys, "argv", argv),
+            patch("company_orchestrator.cli.run_maybe_watched", return_value=expected) as wrapped,
+            patch("company_orchestrator.cli.print_result") as print_result_mock,
+        ):
+            cli_main()
+        wrapped.assert_called_once()
+        self.assertEqual(print_result_mock.call_count, 1)
+        self.assertEqual(Path(print_result_mock.call_args.args[0]).resolve(), self.project_root.resolve())
+        self.assertEqual(print_result_mock.call_args.args[1], expected)
+        self.assertEqual(print_result_mock.call_args.kwargs["run_id"], "watch-cli-json")
+        self.assertTrue(print_result_mock.call_args.kwargs["leading_blank_line"])
+        self.assertTrue(print_result_mock.call_args.kwargs["json_output"])
+
+    def test_bootstrap_run_initializes_run_and_invokes_first_plan(self) -> None:
+        goal_path = REPO_ROOT / "apps" / "todo" / "goal-draft.md"
+        goal_text = goal_path.read_text(encoding="utf-8")
+        summary = bootstrap_run(self.project_root, "bootstrap-run", goal_text)
+        self.assertEqual(summary["objective_count"], 3)
+        self.assertTrue((self.project_root / "runs" / "bootstrap-run" / "goal.md").exists())
+        self.assertTrue((self.project_root / "runs" / "bootstrap-run" / "team-registry.json").exists())
+
+        argv = [
+            "company-orchestrator",
+            "--project-root",
+            str(self.project_root),
+            "bootstrap-run",
+            "bootstrap-cli",
+            str(goal_path),
+        ]
+        with (
+            patch.object(sys, "argv", argv),
+            patch("company_orchestrator.cli.plan_phase", return_value={"phase": "discovery"}) as planned,
+            patch("company_orchestrator.cli.print_result") as print_result_mock,
+        ):
+            cli_main()
+        planned.assert_called_once()
+        payload = print_result_mock.call_args.args[1]
+        self.assertIn("bootstrap", payload)
+        self.assertIn("planning", payload)
+        self.assertFalse(print_result_mock.call_args.kwargs["json_output"])
+
+    def test_format_result_summary_prefers_compact_human_output(self) -> None:
+        summary = format_result_summary(
+            {
+                "run_id": "demo",
+                "phase": "discovery",
+                "run_status": "ready_for_review",
+                "run_status_reason": "Discovery phase report recommends advance and is waiting for human approval.",
+                "phase_recommendation": "advance",
+                "review_doc_path": "runs/demo/phase-reports/discovery.md",
+                "next_action_command": "python3 -m company_orchestrator approve-phase demo discovery",
+                "next_action_reason": "Review the phase report, then record approval to unlock advancement.",
+                "objectives": {"demo": {"status": "accepted"}},
+                "scheduled": {"executed": ["too much detail"]},
+            }
+        )
+        self.assertIn("Run: demo", summary)
+        self.assertIn("Status: ready_for_review", summary)
+        self.assertIn("Review doc: runs/demo/phase-reports/discovery.md", summary)
+        self.assertNotIn("scheduled", summary)
+        self.assertNotIn("objectives", summary)
+
+    def test_planning_prompts_use_compact_goal_context(self) -> None:
+        scaffold_planning_run(self.project_root, "compact-prompts", ["frontend"])
+        objective_metadata = render_objective_planning_prompt(self.project_root, "compact-prompts", "app-a")
+        objective_prompt = (self.project_root / objective_metadata["prompt_path"]).read_text(encoding="utf-8")
+        self.assertIn('"goal_context"', objective_prompt)
+        self.assertNotIn('"goal_markdown"', objective_prompt)
+
+        objective_outline = objective_outline_for_objective("compact-prompts", "app-a", ["frontend"])
+        capability_metadata = render_capability_planning_prompt(
+            self.project_root,
+            "compact-prompts",
+            "app-a",
+            "frontend",
+            objective_outline,
+        )
+        capability_prompt = (self.project_root / capability_metadata["prompt_path"]).read_text(encoding="utf-8")
+        self.assertIn('"goal_context"', capability_prompt)
+        self.assertNotIn('"goal_markdown"', capability_prompt)
+        self.assertIn('"relevant_collaboration_edges"', capability_prompt)
 
     def test_build_planning_payload_uses_immediately_previous_phase_for_detailed_reports(self) -> None:
         scaffold_planning_run(self.project_root, "polish-payload", ["frontend"])
@@ -1925,6 +2862,7 @@ def write_managed_report(
     *,
     status: str,
     summary: str,
+    artifacts: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     task = read_json(project_root / "runs" / run_id / "tasks" / f"{task_id}.json")
     report = {
@@ -1936,7 +2874,7 @@ def write_managed_report(
         "agent_role": task["assigned_role"],
         "status": status,
         "summary": summary,
-        "artifacts": [],
+        "artifacts": artifacts or [],
         "validation_results": [],
         "dependency_impact": [],
         "open_issues": [],
@@ -2051,11 +2989,17 @@ def planned_payload_for_objective(run_id: str, objective_id: str) -> dict[str, o
             }
         ],
         "dependency_notes": [],
-        "collaboration_edges": []
+        "collaboration_handoffs": []
     }
 
 
-def objective_outline_for_objective(run_id: str, objective_id: str, capabilities: list[str]) -> dict[str, object]:
+def objective_outline_for_objective(
+    run_id: str,
+    objective_id: str,
+    capabilities: list[str],
+    *,
+    collaboration_edges: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
     return {
         "schema": "objective-outline.v1",
         "run_id": run_id,
@@ -2081,11 +3025,17 @@ def objective_outline_for_objective(run_id: str, objective_id: str, capabilities
             for capability in capabilities
         ],
         "dependency_notes": [],
-        "collaboration_edges": [],
+        "collaboration_edges": collaboration_edges or [],
     }
 
 
-def capability_plan_for_objective(run_id: str, objective_id: str, capability: str) -> dict[str, object]:
+def capability_plan_for_objective(
+    run_id: str,
+    objective_id: str,
+    capability: str,
+    *,
+    collaboration_handoffs: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
     return {
         "schema": "capability-plan.v1",
         "run_id": run_id,
@@ -2122,8 +3072,18 @@ def capability_plan_for_objective(run_id: str, objective_id: str, capability: st
             }
         ],
         "dependency_notes": [],
-        "collaboration_edges": [],
+        "collaboration_handoffs": collaboration_handoffs or [],
     }
+
+
+def read_json_lines(path: Path) -> list[dict[str, object]]:
+    entries: list[dict[str, object]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        entries.append(json.loads(stripped))
+    return entries
 
 
 def init_git_repo(project_root: Path) -> None:

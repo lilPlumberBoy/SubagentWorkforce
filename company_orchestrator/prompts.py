@@ -5,7 +5,12 @@ from pathlib import Path
 from typing import Any
 
 from .filesystem import read_json, read_text, write_json, write_text
-from .objective_roots import find_objective_root
+from .objective_roots import (
+    capability_owned_path_hints,
+    capability_shared_asset_hints,
+    find_objective_app_root,
+    find_objective_root,
+)
 from .planner import assert_active_phase
 
 PHASE_SEQUENCE = ["discovery", "design", "mvp-build", "polish"]
@@ -96,7 +101,7 @@ def render_objective_planning_prompt(project_root: Path, run_id: str, objective_
 
     add(project_root / "orchestrator" / "phase-overlays" / f"{phase}.md")
 
-    planning_payload = build_planning_payload(project_root, run_id, objective_id)
+    planning_payload = build_planning_prompt_payload(project_root, run_id, objective_id)
     runtime_context = build_planning_runtime_context(
         objective_id=objective_id,
         phase=phase,
@@ -158,7 +163,7 @@ def render_capability_planning_prompt(
 
     add(project_root / "orchestrator" / "phase-overlays" / f"{phase}.md")
 
-    planning_payload = build_capability_planning_payload(project_root, run_id, objective_id, capability, objective_outline)
+    planning_payload = build_capability_prompt_payload(project_root, run_id, objective_id, capability, objective_outline)
     runtime_context = build_capability_planning_runtime_context(
         objective_id=objective_id,
         phase=phase,
@@ -262,6 +267,8 @@ def build_planning_payload(project_root: Path, run_id: str, objective_id: str) -
     team_registry = read_json(run_dir / "team-registry.json")
     objective = next(item for item in objective_map["objectives"] if item["objective_id"] == objective_id)
     team = next(item for item in team_registry["teams"] if item["objective_id"] == objective_id)
+    objective_root = find_objective_root(project_root, objective_id)
+    app_root = find_objective_app_root(project_root, objective_id)
     existing_phase_tasks = []
     for path in sorted((run_dir / "tasks").glob("*.json")):
         task = read_json(path)
@@ -275,6 +282,10 @@ def build_planning_payload(project_root: Path, run_id: str, objective_id: str) -
         "goal_markdown": read_text(run_dir / "goal.md"),
         "objective": objective,
         "team": team,
+        "workspace_hints": {
+            "objective_role_root": str(objective_root.relative_to(project_root)),
+            "objective_app_root": str(app_root.relative_to(project_root)) if app_root is not None else None,
+        },
         "existing_phase_tasks": existing_phase_tasks,
         "prior_phase_reports": prior_phase_reports,
         "prior_phase_artifacts": prior_phase_artifacts,
@@ -300,17 +311,57 @@ def build_capability_planning_payload(
         for task in planning_payload["existing_phase_tasks"]
         if task.get("capability") in {capability, None}
     ]
+    required_handoffs = [
+        edge
+        for edge in objective_outline.get("collaboration_edges", [])
+        if edge["from_capability"] == capability or edge["to_capability"] == capability
+    ]
     return {
         "goal_markdown": planning_payload["goal_markdown"],
         "objective": planning_payload["objective"],
         "team": planning_payload["team"],
+        "workspace_hints": planning_payload["workspace_hints"],
         "objective_outline": objective_outline,
         "capability_lane": lane,
         "existing_capability_tasks": existing_capability_tasks,
+        "capability_scope_hints": {
+            "owned_path_hints": capability_owned_path_hints(project_root, objective_id, capability),
+            "shared_asset_hints": capability_shared_asset_hints(objective_id, capability),
+        },
+        "required_handoffs": required_handoffs,
         "prior_phase_reports": planning_payload["prior_phase_reports"],
         "prior_phase_artifacts": planning_payload["prior_phase_artifacts"],
         "approved_inputs_catalog": planning_payload["approved_inputs_catalog"],
     }
+
+
+def build_planning_prompt_payload(project_root: Path, run_id: str, objective_id: str) -> dict[str, Any]:
+    planning_payload = build_planning_payload(project_root, run_id, objective_id)
+    compacted = dict(planning_payload)
+    compacted["goal_context"] = compact_goal_context(planning_payload["goal_markdown"])
+    compacted.pop("goal_markdown", None)
+    compacted["existing_phase_tasks"] = summarize_existing_phase_tasks(planning_payload["existing_phase_tasks"])
+    compacted["prior_phase_reports"] = planning_payload["prior_phase_reports"][:6]
+    compacted["prior_phase_artifacts"] = planning_payload["prior_phase_artifacts"][:8]
+    return compacted
+
+
+def build_capability_prompt_payload(
+    project_root: Path,
+    run_id: str,
+    objective_id: str,
+    capability: str,
+    objective_outline: dict[str, Any],
+) -> dict[str, Any]:
+    payload = build_capability_planning_payload(project_root, run_id, objective_id, capability, objective_outline)
+    compacted = dict(payload)
+    compacted["goal_context"] = compact_goal_context(payload["goal_markdown"])
+    compacted.pop("goal_markdown", None)
+    compacted["existing_capability_tasks"] = summarize_existing_phase_tasks(payload["existing_capability_tasks"])
+    compacted["objective_outline"] = compact_objective_outline_for_prompt(objective_outline, capability=capability)
+    compacted["prior_phase_reports"] = payload["prior_phase_reports"][:6]
+    compacted["prior_phase_artifacts"] = payload["prior_phase_artifacts"][:8]
+    return compacted
 
 
 def resolve_task_inputs(
@@ -607,6 +658,85 @@ def compact_text(value: str, *, max_length: int = 240) -> str:
     if len(normalized) <= max_length:
         return normalized
     return normalized[: max_length - 3].rstrip() + "..."
+
+
+def summarize_existing_phase_tasks(tasks: list[dict[str, Any]], *, limit: int = 8) -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+    for task in tasks[:limit]:
+        summaries.append(
+            {
+                "task_id": task["task_id"],
+                "capability": task.get("capability"),
+                "objective": compact_text(task.get("objective", ""), max_length=160),
+                "execution_mode": task.get("execution_mode"),
+                "parallel_policy": task.get("parallel_policy"),
+                "owned_paths": list(task.get("owned_paths", []))[:4],
+                "shared_asset_ids": list(task.get("shared_asset_ids", []))[:6],
+                "depends_on": list(task.get("depends_on", [])),
+                "handoff_dependencies": list(task.get("handoff_dependencies", [])),
+                "expected_outputs": list(task.get("expected_outputs", []))[:4],
+            }
+        )
+    return summaries
+
+
+def compact_goal_context(goal_markdown: str) -> dict[str, Any]:
+    parsed_goal = parse_goal_sections(goal_markdown)
+    sections = parsed_goal["sections"]
+    ordered_keys = [
+        "Summary",
+        "Objectives",
+        "Users And Stakeholders",
+        "Desired Outcomes",
+        "Success Criteria",
+        "Constraints",
+        "In Scope",
+        "Out Of Scope",
+        "Existing Systems And Dependencies",
+        "Known Risks",
+        "Known Unknowns",
+        "Discovery Expectations",
+        "Design Expectations",
+        "MVP Build Expectations",
+        "Polish Expectations",
+        "Human Approval Notes",
+    ]
+    compact_sections = {
+        key: sections[key]
+        for key in ordered_keys
+        if sections.get(key)
+    }
+    objective_details = {
+        key: value
+        for key, value in parsed_goal.get("objective_details", {}).items()
+    }
+    return {
+        "sections": compact_sections,
+        "objective_details": objective_details,
+    }
+
+
+def compact_objective_outline_for_prompt(objective_outline: dict[str, Any], *, capability: str) -> dict[str, Any]:
+    return {
+        "summary": objective_outline.get("summary"),
+        "dependency_notes": list(objective_outline.get("dependency_notes", []))[:8],
+        "capability_lanes": [
+            {
+                "capability": lane.get("capability"),
+                "objective": compact_text(lane.get("objective", ""), max_length=160),
+                "inputs": list(lane.get("inputs", []))[:6],
+                "expected_outputs": list(lane.get("expected_outputs", []))[:6],
+                "depends_on": list(lane.get("depends_on", [])),
+                "assigned_manager_role": lane.get("assigned_manager_role"),
+            }
+            for lane in objective_outline.get("capability_lanes", [])
+        ],
+        "relevant_collaboration_edges": [
+            edge
+            for edge in objective_outline.get("collaboration_edges", [])
+            if edge.get("from_capability") == capability or edge.get("to_capability") == capability
+        ],
+    }
 
 
 def collect_completed_phase_reports(run_dir: Path, phase_plan: dict[str, Any], current_phase: str) -> list[str]:

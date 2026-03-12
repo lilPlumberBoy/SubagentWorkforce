@@ -67,12 +67,13 @@
     },
     "runtime_recovery": {
       "type": "object",
-      "required": ["attempt", "recovery_action", "workspace_reused"],
+      "required": ["attempt", "recovery_action", "workspace_reused", "timeout_retries_used"],
       "additionalProperties": false,
       "properties": {
         "attempt": {"type": "number"},
         "recovery_action": {"type": ["string", "null"]},
-        "workspace_reused": {"type": "boolean"}
+        "workspace_reused": {"type": "boolean"},
+        "timeout_retries_used": {"type": "number"}
       }
     },
     "context_echo": {
