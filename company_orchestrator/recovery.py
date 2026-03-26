@@ -9,6 +9,7 @@ from .live import (
     list_activities,
     mark_activity_interrupted,
     mark_activity_recovered,
+    now_timestamp,
     process_alive,
     read_run_state,
     record_event,
@@ -49,7 +50,7 @@ def reconcile_run(project_root: Path, run_id: str, *, apply: bool = False) -> di
         result = reconcile_activity(project_root, run_id, activity, apply=apply)
         if result is not None:
             summary["activities"].append(result)
-            if result["status"] == "blocked":
+            if result["status"] == "blocked" and result.get("blocking", True):
                 summary["blocked"].append(result)
     bundle_incidents = reconcile_bundle_landings(
         project_root,
@@ -58,8 +59,9 @@ def reconcile_run(project_root: Path, run_id: str, *, apply: bool = False) -> di
         apply=apply,
     )
     summary["bundle_incidents"] = bundle_incidents
-    if bundle_incidents:
-        summary["blocked"].extend(bundle_incidents)
+    for incident in bundle_incidents:
+        if incident.get("status") == "blocked":
+            summary["blocked"].append(incident)
     if apply:
         refresh_run_state(project_root, run_id)
     return summary
@@ -142,16 +144,26 @@ def reconcile_activity(
     next_status = None
     recovery_action = None
     artifact_reconciliation = inspect_activity_artifacts(project_root, run_id, activity)
+    recovered_from_artifact = False
 
     if process_alive(activity.get("process_metadata")):
         return None
 
-    if artifact_reconciliation["status"] == "completed":
-        if status not in {"completed", "recovered"}:
-            next_status = "recovered" if status in RECOVERABLE_ACTIVE_STATUSES or status == "interrupted" else "completed"
-            reason = "Validated final artifacts on disk after interruption."
+    artifact_status = artifact_reconciliation["status"]
+    if artifact_status in {"completed", "ready_for_bundle_review", "blocked", "needs_revision"}:
+        if status not in {artifact_status, "recovered"}:
+            if artifact_status == "completed":
+                next_status = "recovered" if status in RECOVERABLE_ACTIVE_STATUSES or status == "interrupted" else "completed"
+            else:
+                next_status = artifact_status
+                recovered_from_artifact = True
+            reason = (
+                "Recovered task status from validated final report on disk."
+                if activity["kind"] == "task_execution" and artifact_status != "completed"
+                else "Validated final artifacts on disk after interruption."
+            )
             recovery_action = "validated_artifact"
-    elif artifact_reconciliation["status"] == "failed":
+    elif artifact_status == "failed":
         if status != "failed":
             next_status = "failed"
             reason = "Recovered terminal failure from persisted execution artifacts."
@@ -175,6 +187,7 @@ def reconcile_activity(
         "status": next_status,
         "reason": reason,
         "artifact_reconciliation": artifact_reconciliation,
+        "blocking": not (activity["kind"] == "task_execution" and next_status == "blocked"),
     }
     if not apply:
         return payload
@@ -216,17 +229,17 @@ def reconcile_activity(
             payload={"reason": reason, "attempt": activity.get("attempt", 1)},
         )
     else:
-        update_activity(
-            project_root,
-            run_id,
-            activity_id,
-            status=next_status,
-            progress_stage=next_status,
-            status_reason=reason,
-            recovery_action=recovery_action,
-            artifact_reconciliation=artifact_reconciliation,
-            current_activity=reason,
-        )
+        update_kwargs = {
+            "status": next_status,
+            "progress_stage": next_status,
+            "status_reason": reason,
+            "recovery_action": recovery_action,
+            "artifact_reconciliation": artifact_reconciliation,
+            "current_activity": reason,
+        }
+        if recovered_from_artifact:
+            update_kwargs["recovered_at"] = now_timestamp()
+        update_activity(project_root, run_id, activity_id, **update_kwargs)
         record_event(
             project_root,
             run_id,
@@ -267,7 +280,12 @@ def inspect_planning_artifacts(project_root: Path, run_id: str, activity: dict[s
         prefix = output_path.stem
         plans_dir = output_path.parent
         for path in sorted(plans_dir.glob(f"{prefix}-*.json")):
-            if path.name.endswith(".summary.json") or path.name.endswith(".last-message.json"):
+            if (
+                path.name.endswith(".summary.json")
+                or path.name.endswith(".last-message.json")
+                or path.name.endswith(".prompt.json")
+                or path.name.endswith(".outline.json")
+            ):
                 continue
             try:
                 validate_document(read_json(path), "capability-plan.v1", project_root)
@@ -286,9 +304,13 @@ def inspect_task_artifacts(project_root: Path, run_id: str, activity: dict[str, 
     details: list[str] = []
     if output_path and output_path.exists():
         try:
-            validate_document(read_json(output_path), "completion-report.v1", project_root)
+            payload = read_json(output_path)
+            validate_document(payload, "completion-report.v1", project_root)
             details.append(f"valid completion report at {activity['output_path']}")
-            return {"status": "completed", "details": details}
+            report_status = str(payload.get("status", "completed"))
+            if report_status not in {"completed", "ready_for_bundle_review", "blocked", "needs_revision"}:
+                report_status = "completed"
+            return {"status": report_status, "details": details}
         except SchemaValidationError:
             details.append(f"invalid completion report at {activity['output_path']}")
     summary_path = execution_summary_path(project_root, activity)
@@ -346,6 +368,8 @@ def reconcile_bundle_landings(project_root: Path, run_id: str, *, phase: str, ap
     for path in sorted((run_dir / "bundles").glob("*.json")):
         bundle = read_json(path)
         if bundle.get("phase") != phase:
+            continue
+        if bundle.get("status") != "accepted":
             continue
         landing_results = bundle.get("landing_results", [])
         if landing_results:

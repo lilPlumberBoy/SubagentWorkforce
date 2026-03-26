@@ -21,6 +21,8 @@ CAPABILITY_KEYWORDS = {
 
 
 def initialize_run(project_root: Path, run_id: str, goal_text: str) -> Path:
+    from .autonomy import initialize_autonomy_state
+
     run_dir = project_root / "runs" / run_id
     for child in [
         "tasks",
@@ -41,6 +43,7 @@ def initialize_run(project_root: Path, run_id: str, goal_text: str) -> Path:
     write_json(run_dir / "objective-map.json", default_objective_map(run_id))
     write_json(run_dir / "team-registry.json", default_team_registry(run_id))
     initialize_live_run(project_root, run_id)
+    initialize_autonomy_state(project_root, run_id)
     return run_dir
 
 
@@ -103,7 +106,8 @@ def decompose_goal(project_root: Path, run_id: str) -> dict[str, Any]:
                 "capabilities": capabilities,
             }
         )
-    payload = {"schema": "objective-map.v1", "run_id": run_id, "objectives": objectives, "dependencies": []}
+    dependencies = rebalance_integration_objectives(objectives)
+    payload = {"schema": "objective-map.v1", "run_id": run_id, "objectives": objectives, "dependencies": dependencies}
     validate_document(payload, "objective-map.v1", project_root)
     write_json(run_dir / "objective-map.json", payload)
     return payload
@@ -139,6 +143,10 @@ def generate_role_files(project_root: Path, run_id: str, approve: bool = False) 
         write_text(objective_root / "charter.md", objective_charter(team["objective_id"], team["capabilities"]))
         target_dir = objective_root / ("approved" if approve else "proposed")
         ensure_dir(target_dir)
+        expected_role_files = {f"{role['role_id'].split('.')[-1]}.md" for role in team["roles"]}
+        for path in target_dir.glob("*.md"):
+            if path.name not in expected_role_files:
+                path.unlink()
         for role in team["roles"]:
             capability = role.get("capability")
             content = role_markdown(team["objective_id"], role["role_id"], role["role_kind"], capability)
@@ -168,6 +176,36 @@ def suggest_capabilities(description: str) -> list[str]:
     return capabilities or ["general"]
 
 
+def rebalance_integration_objectives(objectives: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    standalone_frontend = [
+        objective["objective_id"]
+        for objective in objectives
+        if list(objective.get("capabilities", [])) == ["frontend"]
+    ]
+    standalone_backend = [
+        objective["objective_id"]
+        for objective in objectives
+        if list(objective.get("capabilities", [])) == ["backend"]
+    ]
+    dependencies: list[dict[str, Any]] = []
+    if not standalone_frontend or not standalone_backend:
+        return dependencies
+    for objective in objectives:
+        capabilities = list(objective.get("capabilities", []))
+        if "middleware" not in capabilities or len(capabilities) <= 1:
+            continue
+        objective["capabilities"] = ["middleware"]
+        for dependency_objective_id in standalone_frontend + standalone_backend:
+            dependencies.append(
+                {
+                    "from_objective_id": dependency_objective_id,
+                    "to_objective_id": objective["objective_id"],
+                    "kind": "integration_input",
+                }
+            )
+    return dependencies
+
+
 def suggested_roles(capabilities: list[str]) -> list[dict[str, Any]]:
     roles = [
         {"role_id": "objective-manager", "role_kind": "manager"},
@@ -184,6 +222,12 @@ def suggested_roles(capabilities: list[str]) -> list[dict[str, Any]]:
 
 def objective_charter(objective_id: str, capabilities: list[str]) -> str:
     capabilities_text = ", ".join(capabilities)
+    integration_note = ""
+    if capabilities == ["middleware"]:
+        integration_note = (
+            "\nMiddleware-only objectives own integration, runtime wiring, and cross-boundary validation.\n"
+            "They do not own primary frontend or backend implementation.\n"
+        )
     return f"""# Objective Charter
 
 Objective: `{objective_id}`
@@ -191,6 +235,7 @@ Objective: `{objective_id}`
 Allowed capabilities: {capabilities_text}
 
 This charter defines the durable boundary for the objective team. The current phase overlay further restricts what this team may do in the active phase.
+{integration_note}
 """
 
 

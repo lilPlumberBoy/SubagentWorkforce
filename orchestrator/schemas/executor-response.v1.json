@@ -5,9 +5,9 @@
     "status",
     "artifacts",
     "validation_results",
-    "dependency_impact",
     "open_issues",
-    "follow_up_requests",
+    "produced_outputs",
+    "change_requests",
     "context_echo",
     "collaboration_request"
   ],
@@ -40,9 +40,92 @@
         }
       }
     },
-    "dependency_impact": {"type": "array", "items": {"type": "string"}},
     "open_issues": {"type": "array", "items": {"type": "string"}},
-    "follow_up_requests": {"type": "array", "items": {"type": "string"}},
+    "change_requests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "change_category",
+          "summary",
+          "blocking_reason",
+          "why_local_resolution_is_invalid",
+          "blocking",
+          "goal_critical",
+          "affected_output_ids",
+          "affected_handoff_ids",
+          "impacted_objective_ids",
+          "impacted_task_ids",
+          "conflicting_input_refs",
+          "required_reentry_phase",
+          "impact"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "change_category": {
+            "type": "string",
+            "enum": ["interface_contract", "shared_behavior", "ownership_boundary", "acceptance_rule"]
+          },
+          "summary": {"type": "string"},
+          "blocking_reason": {"type": "string"},
+          "why_local_resolution_is_invalid": {"type": "string"},
+          "blocking": {"type": "boolean"},
+          "goal_critical": {"type": "boolean"},
+          "affected_output_ids": {"type": "array", "items": {"type": "string"}},
+          "affected_handoff_ids": {"type": "array", "items": {"type": "string"}},
+          "impacted_objective_ids": {"type": "array", "items": {"type": "string"}},
+          "impacted_task_ids": {"type": "array", "items": {"type": "string"}},
+          "conflicting_input_refs": {"type": "array", "items": {"type": "string"}},
+          "required_reentry_phase": {"type": "string", "enum": ["discovery", "design", "mvp-build", "polish"]},
+          "impact": {
+            "type": "object",
+            "required": [
+              "goal_changed",
+              "scope_changed",
+              "boundary_changed",
+              "interface_changed",
+              "architecture_changed",
+              "team_changed",
+              "implementation_changed"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "goal_changed": {"type": "boolean"},
+              "scope_changed": {"type": "boolean"},
+              "boundary_changed": {"type": "boolean"},
+              "interface_changed": {"type": "boolean"},
+              "architecture_changed": {"type": "boolean"},
+              "team_changed": {"type": "boolean"},
+              "implementation_changed": {"type": "boolean"}
+            }
+          }
+        }
+      }
+    },
+    "produced_outputs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind", "output_id", "path", "asset_id", "description", "evidence"],
+        "additionalProperties": false,
+        "properties": {
+          "kind": {"type": "string", "enum": ["artifact", "asset", "assertion"]},
+          "output_id": {"type": "string"},
+          "path": {"type": ["string", "null"]},
+          "asset_id": {"type": ["string", "null"]},
+          "description": {"type": ["string", "null"]},
+          "evidence": {
+            "type": ["object", "null"],
+            "required": ["validation_ids", "artifact_paths"],
+            "additionalProperties": false,
+            "properties": {
+              "validation_ids": {"type": "array", "items": {"type": "string"}},
+              "artifact_paths": {"type": "array", "items": {"type": "string"}}
+            }
+          }
+        }
+      }
+    },
     "context_echo": {
       "type": ["object", "null"],
       "required": ["role_id", "objective_id", "phase", "prompt_layers", "schema"],

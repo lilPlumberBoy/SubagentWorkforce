@@ -5,15 +5,22 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any
 
-from .bundle_plans import objective_bundle_specs
+from .bundle_plans import objective_bundle_specs, objective_plan_has_no_phase_work
 from .bundles import assemble_review_bundle, land_accepted_bundle, review_bundle
+from .changes import active_approved_change_requests
 from .executor import ExecutorError, TaskExecutionRuntime, execute_task
 from .filesystem import ensure_dir, load_optional_json, read_json, write_json
 from .handoffs import HANDOFF_BLOCKED, blocking_handoffs_for_task, list_handoffs, refresh_handoffs_for_phase
+from .impact import stale_task_notifications
 from .live import activity_path, ensure_activity, initialize_live_run, list_activities, record_event, update_activity
+from .objective_planner import plan_objective
 from .parallelism import classify_parallel_safety, parallel_requested, warning
-from .recovery import reconcile_for_command
+from .recovery import load_optional_event_lines, reconcile_for_command
 from .reports import generate_phase_report
+
+
+MAX_OBJECTIVE_BUNDLE_REPAIR_ATTEMPTS = 1
+MAX_POLISH_RELEASE_REPAIR_ATTEMPTS = 1
 
 
 def run_phase(
@@ -30,7 +37,13 @@ def run_phase(
     run_dir = project_root / "runs" / run_id
     phase = active_phase(run_dir)
     tasks = phase_tasks(run_dir, phase)
-    objective_ids = sorted({task["objective_id"] for task in tasks})
+    objective_map = read_json(run_dir / "objective-map.json")
+    planned_objective_ids = {
+        objective["objective_id"]
+        for objective in objective_map["objectives"]
+        if (run_dir / "manager-plans" / f"{phase}-{objective['objective_id']}.json").exists()
+    }
+    objective_ids = sorted({task["objective_id"] for task in tasks} | planned_objective_ids)
     scheduler_summary = schedule_tasks(
         project_root,
         run_id,
@@ -43,8 +56,36 @@ def run_phase(
     )
     objective_summaries = {}
     for objective_id in objective_ids:
-        objective_summaries[objective_id] = finalize_objective_bundle(project_root, run_id, phase, objective_id)
+        objective_summaries[objective_id] = finalize_objective_bundle(
+            project_root,
+            run_id,
+            phase,
+            objective_id,
+            sandbox_mode=sandbox_mode,
+            codex_path=codex_path,
+            timeout_seconds=timeout_seconds,
+            max_concurrency=max_concurrency,
+        )
     phase_report, phase_report_path = generate_phase_report(project_root, run_id)
+    release_repair_summary = None
+    if phase == "polish":
+        release_repair_summary = attempt_polish_release_repair(
+            project_root,
+            run_id,
+            phase=phase,
+            phase_report=phase_report,
+            sandbox_mode=sandbox_mode,
+            codex_path=codex_path,
+            timeout_seconds=timeout_seconds,
+            max_concurrency=max_concurrency,
+        )
+        if release_repair_summary is not None:
+            post_repair_report = release_repair_summary.get("post_repair_report")
+            if isinstance(post_repair_report, dict):
+                phase_report = post_repair_report
+                phase_report_path = run_dir / "phase-reports" / f"{phase}.json"
+            else:
+                phase_report, phase_report_path = generate_phase_report(project_root, run_id)
     summary = {
         "run_id": run_id,
         "phase": phase,
@@ -54,6 +95,8 @@ def run_phase(
         "recommendation": phase_report["recommendation"],
         "recommended_next_command": suggested_recovery_command(project_root, run_id, phase, tasks, scheduler_summary),
     }
+    if release_repair_summary is not None:
+        summary["release_repair"] = release_repair_summary
     write_manager_summary(run_dir, f"phase-{phase}", summary)
     return summary
 
@@ -85,7 +128,16 @@ def run_objective(
         timeout_seconds=timeout_seconds,
         max_concurrency=max_concurrency,
     )
-    objective_summary = finalize_objective_bundle(project_root, run_id, phase, objective_id)
+    objective_summary = finalize_objective_bundle(
+        project_root,
+        run_id,
+        phase,
+        objective_id,
+        sandbox_mode=sandbox_mode,
+        codex_path=codex_path,
+        timeout_seconds=timeout_seconds,
+        max_concurrency=max_concurrency,
+    )
     summary = {
         "run_id": run_id,
         "phase": phase,
@@ -112,6 +164,391 @@ def phase_tasks(run_dir: Path, phase: str) -> list[dict[str, Any]]:
     return tasks
 
 
+def bundle_repair_attempts(
+    project_root: Path,
+    run_id: str,
+    *,
+    phase: str,
+    objective_id: str,
+    bundle_id: str,
+) -> int:
+    attempts = 0
+    for event in load_optional_event_lines(project_root, run_id):
+        if event.get("phase") != phase or event.get("event_type") != "bundle.repair_requested":
+            continue
+        payload = event.get("payload", {})
+        if payload.get("objective_id") != objective_id or payload.get("bundle_id") != bundle_id:
+            continue
+        attempts += 1
+    return attempts
+
+
+def build_bundle_repair_context(
+    *,
+    phase: str,
+    objective_id: str,
+    bundle: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "source": "bundle_review",
+        "reason": f"Repair the {phase} objective plan for {objective_id} so the rejected bundle can pass acceptance review.",
+        "bundle_id": bundle.get("bundle_id"),
+        "included_task_ids": list(bundle.get("included_tasks", [])),
+        "rejection_reasons": list(bundle.get("rejection_reasons", [])),
+    }
+
+
+def polish_release_repair_attempts(project_root: Path, run_id: str) -> int:
+    attempts = 0
+    for event in load_optional_event_lines(project_root, run_id):
+        if event.get("phase") != "polish" or event.get("event_type") != "phase.release_repair_requested":
+            continue
+        attempts += 1
+    return attempts
+
+
+def actionable_release_repair_diagnostics(phase_report: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(phase_report, dict) or phase_report.get("phase") != "polish":
+        return []
+    release_validation = phase_report.get("release_validation_summary")
+    if not isinstance(release_validation, dict) or release_validation.get("status") != "failed":
+        return []
+    diagnostics = release_validation.get("failure_diagnostics")
+    if not isinstance(diagnostics, list):
+        return []
+    return [
+        item
+        for item in diagnostics
+        if isinstance(item, dict) and item.get("repairable") and item.get("owner_objective_id")
+    ]
+
+
+def build_polish_release_repair_context(
+    *,
+    phase_report: dict[str, Any],
+    objective_id: str,
+    objective_diagnostics: list[dict[str, Any]],
+    included_task_ids: list[str],
+) -> dict[str, Any]:
+    release_validation = phase_report.get("release_validation_summary") or {}
+    rejection_reasons: list[str] = []
+    focus_paths: list[str] = []
+    owner_capabilities: set[str] = set()
+    for diagnostic in objective_diagnostics:
+        source_test = str(diagnostic.get("source_test") or "release validation").strip()
+        excerpt = str(diagnostic.get("excerpt") or "").strip()
+        paths = [
+            str(value).strip()
+            for value in diagnostic.get("paths", [])
+            if isinstance(value, str) and str(value).strip()
+        ]
+        focus_paths.extend(paths)
+        owner_capability = str(diagnostic.get("owner_capability") or "").strip()
+        if owner_capability:
+            owner_capabilities.add(owner_capability)
+        reason = f"{source_test}: {excerpt}" if excerpt else source_test
+        if paths:
+            reason = f"{reason} [paths: {', '.join(paths)}]"
+        rejection_reasons.append(reason)
+    return {
+        "source": "polish_release_validation",
+        "compact_prompt": True,
+        "reason": (
+            "Repair only the owned polish work needed for this objective so the integrated "
+            "release-readiness gate passes."
+        ),
+        "included_task_ids": included_task_ids,
+        "rejection_reasons": rejection_reasons,
+        "focus_paths": sorted({path for path in focus_paths if path}),
+        "owner_capability": next(iter(owner_capabilities)) if len(owner_capabilities) == 1 else None,
+        "release_validation_command": release_validation.get("command"),
+        "release_validation_report_path": release_validation.get("report_path"),
+    }
+
+
+def attempt_polish_release_repair(
+    project_root: Path,
+    run_id: str,
+    *,
+    phase: str,
+    phase_report: dict[str, Any],
+    sandbox_mode: str,
+    codex_path: str,
+    timeout_seconds: int | None,
+    max_concurrency: int,
+) -> dict[str, Any] | None:
+    if phase != "polish":
+        return None
+    diagnostics = actionable_release_repair_diagnostics(phase_report)
+    if not diagnostics:
+        return None
+    if polish_release_repair_attempts(project_root, run_id) >= MAX_POLISH_RELEASE_REPAIR_ATTEMPTS:
+        record_event(
+            project_root,
+            run_id,
+            phase=phase,
+            activity_id=None,
+            event_type="phase.release_repair_exhausted",
+            message="Integrated polish release validation still fails and the repair budget is exhausted.",
+            payload={
+                "diagnostic_count": len(diagnostics),
+                "objective_ids": sorted({item["owner_objective_id"] for item in diagnostics}),
+            },
+        )
+        return None
+
+    grouped_diagnostics: dict[str, list[dict[str, Any]]] = {}
+    for diagnostic in diagnostics:
+        objective_id = str(diagnostic["owner_objective_id"]).strip()
+        grouped_diagnostics.setdefault(objective_id, []).append(diagnostic)
+
+    record_event(
+        project_root,
+        run_id,
+        phase=phase,
+        activity_id=None,
+        event_type="phase.release_repair_requested",
+        message="Retrying polish objectives after integrated release validation failed.",
+        payload={
+            "objective_ids": sorted(grouped_diagnostics),
+            "diagnostic_count": len(diagnostics),
+            "report_path": phase_report.get("release_validation_summary", {}).get("report_path"),
+        },
+    )
+
+    objective_summaries: dict[str, Any] = {}
+    for objective_id in sorted(grouped_diagnostics):
+        objective_tasks = [
+            task
+            for task in phase_tasks(project_root / "runs" / run_id, phase)
+            if task["objective_id"] == objective_id
+        ]
+        repair_context = build_polish_release_repair_context(
+            phase_report=phase_report,
+            objective_id=objective_id,
+            objective_diagnostics=grouped_diagnostics[objective_id],
+            included_task_ids=[task["task_id"] for task in objective_tasks],
+        )
+        try:
+            plan_summary = plan_objective(
+                project_root,
+                run_id,
+                objective_id,
+                sandbox_mode=sandbox_mode,
+                codex_path=codex_path,
+                replace=True,
+                timeout_seconds=timeout_seconds,
+                max_concurrency=max_concurrency,
+                allow_recovery_blocked=True,
+                refresh_phase_summary=False,
+                repair_context=repair_context,
+            )
+            refreshed_tasks = [
+                task
+                for task in phase_tasks(project_root / "runs" / run_id, phase)
+                if task["objective_id"] == objective_id
+            ]
+            scheduler_summary = schedule_tasks(
+                project_root,
+                run_id,
+                refreshed_tasks,
+                sandbox_mode=sandbox_mode,
+                codex_path=codex_path,
+                force=False,
+                timeout_seconds=timeout_seconds,
+                max_concurrency=max_concurrency,
+            )
+            objective_summary = finalize_objective_bundle(
+                project_root,
+                run_id,
+                phase,
+                objective_id,
+                sandbox_mode=sandbox_mode,
+                codex_path=codex_path,
+                timeout_seconds=timeout_seconds,
+                max_concurrency=max_concurrency,
+            )
+            objective_summaries[objective_id] = {
+                "plan_summary": plan_summary,
+                "scheduler_summary": scheduler_summary,
+                "objective_summary": objective_summary,
+            }
+        except BaseException as exc:
+            record_event(
+                project_root,
+                run_id,
+                phase=phase,
+                activity_id=None,
+                event_type="phase.release_repair_failed",
+                message=f"Polish release repair failed for objective {objective_id}.",
+                payload={"objective_id": objective_id, "error": str(exc)},
+            )
+            return {
+                "status": "failed",
+                "objective_ids": sorted(grouped_diagnostics),
+                "error": str(exc),
+                "objective_summaries": objective_summaries,
+            }
+
+    post_repair_report, _ = generate_phase_report(project_root, run_id)
+    completed_status = "completed" if post_repair_report["release_validation_summary"]["status"] == "passed" else "failed"
+    record_event(
+        project_root,
+        run_id,
+        phase=phase,
+        activity_id=None,
+        event_type=f"phase.release_repair_{completed_status}",
+        message=(
+            "Polish release repair completed and the integrated release gate passed."
+            if completed_status == "completed"
+            else "Polish release repair completed, but the integrated release gate still fails."
+        ),
+        payload={
+            "objective_ids": sorted(grouped_diagnostics),
+            "release_validation_status": post_repair_report["release_validation_summary"]["status"],
+        },
+    )
+    return {
+        "status": completed_status,
+        "objective_ids": sorted(grouped_diagnostics),
+        "objective_summaries": objective_summaries,
+        "post_repair_report_path": f"runs/{run_id}/phase-reports/polish.json",
+        "post_repair_report": post_repair_report,
+    }
+
+
+def attempt_bundle_repair(
+    project_root: Path,
+    run_id: str,
+    *,
+    phase: str,
+    objective_id: str,
+    bundle: dict[str, Any],
+    sandbox_mode: str,
+    codex_path: str,
+    timeout_seconds: int | None,
+    max_concurrency: int,
+) -> dict[str, Any] | None:
+    bundle_id = str(bundle.get("bundle_id", "")).strip()
+    if not bundle_id:
+        return None
+    if bundle_repair_attempts(
+        project_root,
+        run_id,
+        phase=phase,
+        objective_id=objective_id,
+        bundle_id=bundle_id,
+    ) >= MAX_OBJECTIVE_BUNDLE_REPAIR_ATTEMPTS:
+        return None
+
+    repair_context = build_bundle_repair_context(
+        phase=phase,
+        objective_id=objective_id,
+        bundle=bundle,
+    )
+    record_event(
+        project_root,
+        run_id,
+        phase=phase,
+        activity_id=None,
+        event_type="bundle.repair_requested",
+        message=f"Retrying objective {objective_id} after bundle {bundle_id} rejection.",
+        payload={
+            "objective_id": objective_id,
+            "bundle_id": bundle_id,
+            "rejection_reasons": list(bundle.get("rejection_reasons", [])),
+        },
+    )
+
+    try:
+        plan_summary = plan_objective(
+            project_root,
+            run_id,
+            objective_id,
+            sandbox_mode=sandbox_mode,
+            codex_path=codex_path,
+            replace=True,
+            timeout_seconds=timeout_seconds,
+            max_concurrency=max_concurrency,
+            allow_recovery_blocked=True,
+            refresh_phase_summary=False,
+            repair_context=repair_context,
+        )
+        objective_tasks = [
+            task
+            for task in phase_tasks(project_root / "runs" / run_id, phase)
+            if task["objective_id"] == objective_id
+        ]
+        scheduler_summary = schedule_tasks(
+            project_root,
+            run_id,
+            objective_tasks,
+            sandbox_mode=sandbox_mode,
+            codex_path=codex_path,
+            force=False,
+            timeout_seconds=timeout_seconds,
+            max_concurrency=max_concurrency,
+        )
+        repaired_summary = finalize_objective_bundle(
+            project_root,
+            run_id,
+            phase,
+            objective_id,
+            sandbox_mode=sandbox_mode,
+            codex_path=codex_path,
+            timeout_seconds=timeout_seconds,
+            max_concurrency=max_concurrency,
+            allow_bundle_repair=False,
+        )
+    except BaseException as exc:
+        record_event(
+            project_root,
+            run_id,
+            phase=phase,
+            activity_id=None,
+            event_type="bundle.repair_failed",
+            message=f"Bundle repair for {bundle_id} failed.",
+            payload={
+                "objective_id": objective_id,
+                "bundle_id": bundle_id,
+                "error": str(exc),
+            },
+        )
+        return None
+
+    if repaired_summary["status"] == "accepted":
+        record_event(
+            project_root,
+            run_id,
+            phase=phase,
+            activity_id=None,
+            event_type="bundle.repair_completed",
+            message=f"Bundle repair for {bundle_id} succeeded.",
+            payload={
+                "objective_id": objective_id,
+                "bundle_id": bundle_id,
+                "plan_recovery_action": plan_summary.get("recovery_action"),
+            },
+        )
+    else:
+        record_event(
+            project_root,
+            run_id,
+            phase=phase,
+            activity_id=None,
+            event_type="bundle.repair_failed",
+            message=f"Bundle repair for {bundle_id} did not produce an accepted bundle.",
+            payload={
+                "objective_id": objective_id,
+                "bundle_id": bundle_id,
+                "status": repaired_summary.get("status"),
+                "scheduler_summary": scheduler_summary,
+                "rejection_reasons": repaired_summary.get("rejection_reasons", []),
+            },
+        )
+    return repaired_summary
+
+
 def schedule_tasks(
     project_root: Path,
     run_id: str,
@@ -134,13 +571,22 @@ def schedule_tasks(
         failed: set[str] = set()
     else:
         completed = {task_id for task_id, report in all_reports.items() if report["status"] == "ready_for_bundle_review"}
-        failed = {task_id for task_id, report in all_reports.items() if report["status"] != "ready_for_bundle_review"}
+        # A blocked task report is recoverable: the scheduler should retry it on
+        # a later resume after planning inputs, handoffs, or other external
+        # blockers have changed. Treat only non-recoverable terminal states as
+        # failed here.
+        failed = {
+            task_id
+            for task_id, report in all_reports.items()
+            if report["status"] not in {"ready_for_bundle_review", "blocked"}
+        }
     pending = dict(tasks_by_id)
     executed: list[dict[str, Any]] = []
     skipped_existing: list[str] = []
     skipped_dependency: dict[str, list[str]] = {}
     unresolved_dependencies: dict[str, list[str]] = {}
     blocked_handoffs: dict[str, list[str]] = {}
+    stale_tasks: dict[str, list[str]] = {}
     failures: list[dict[str, str]] = []
     running: dict[str, dict[str, Any]] = {}
     warning_events_emitted: set[tuple[str, str]] = set()
@@ -402,6 +848,7 @@ def schedule_tasks(
         while pending or running:
             progressed = False
             handoffs_by_id = refresh_handoffs_for_phase(project_root, run_id, tasks[0]["phase"], tasks_by_id) if tasks else {}
+            stale_notifications = stale_task_notifications(project_root, run_id, phase=tasks[0]["phase"] if tasks else None)
 
             for task_id, info in list(running.items()):
                 future: Future[dict[str, Any]] = info["future"]
@@ -450,11 +897,39 @@ def schedule_tasks(
                 )
                 if execution_summary["status"] == "ready_for_bundle_review":
                     completed.add(task_id)
-                else:
+                elif execution_summary["status"] != "blocked":
                     failed.add(task_id)
 
             ready: list[dict[str, Any]] = []
             for task_id, task in list(pending.items()):
+                task_stale_notifications = stale_notifications.get(task_id, [])
+                if task_stale_notifications:
+                    reasons = [item["reason"] for item in task_stale_notifications]
+                    stale_tasks[task_id] = reasons
+                    update_activity(
+                        project_root,
+                        run_id,
+                        task_id,
+                        status="needs_revision",
+                        progress_stage="needs_revision",
+                        current_activity="Inputs stale after approved change request.",
+                        dependency_blockers=[],
+                        dependency_blocker_fingerprint=None,
+                        handoff_blocker_fingerprint=None,
+                        queue_position=None,
+                        status_reason="; ".join(reasons),
+                    )
+                    record_event(
+                        project_root,
+                        run_id,
+                        phase=task["phase"],
+                        activity_id=task_id,
+                        event_type="task.stale_inputs",
+                        message=f"Task {task_id} is stale after an approved change request.",
+                        payload={"reasons": reasons},
+                    )
+                    pending.pop(task_id)
+                    continue
                 failed_deps = [dependency for dependency in task["depends_on"] if dependency in failed or dependency in skipped_dependency]
                 if failed_deps:
                     skipped_dependency[task_id] = failed_deps
@@ -710,14 +1185,34 @@ def schedule_tasks(
         "skipped_dependency": skipped_dependency,
         "unresolved_dependencies": unresolved_dependencies,
         "blocked_handoffs": blocked_handoffs,
+        "stale_tasks": stale_tasks,
         "failures": failures,
         "max_concurrency": max_concurrency,
     }
 
 
-def finalize_objective_bundle(project_root: Path, run_id: str, phase: str, objective_id: str) -> dict[str, Any]:
+def finalize_objective_bundle(
+    project_root: Path,
+    run_id: str,
+    phase: str,
+    objective_id: str,
+    *,
+    sandbox_mode: str,
+    codex_path: str,
+    timeout_seconds: int | None,
+    max_concurrency: int,
+    allow_bundle_repair: bool = True,
+) -> dict[str, Any]:
     run_dir = project_root / "runs" / run_id
     tasks = {task["task_id"]: task for task in phase_tasks(run_dir, phase) if task["objective_id"] == objective_id}
+    if objective_plan_has_no_phase_work(run_dir, phase, objective_id):
+        return {
+            "objective_id": objective_id,
+            "status": "accepted",
+            "bundle_ids": [],
+            "included_tasks": [],
+            "rejection_reasons": [],
+        }
     bundle_specs = objective_bundle_specs(run_dir, phase, objective_id, list(tasks))
     accepted_bundles = []
     rejected_bundles = []
@@ -747,6 +1242,20 @@ def finalize_objective_bundle(project_root: Path, run_id: str, phase: str, objec
         )
         bundle = review_bundle(project_root, run_id, bundle_spec["bundle_id"])
         if bundle["status"] != "accepted":
+            if allow_bundle_repair:
+                repaired_summary = attempt_bundle_repair(
+                    project_root,
+                    run_id,
+                    phase=phase,
+                    objective_id=objective_id,
+                    bundle=bundle,
+                    sandbox_mode=sandbox_mode,
+                    codex_path=codex_path,
+                    timeout_seconds=timeout_seconds,
+                    max_concurrency=max_concurrency,
+                )
+                if repaired_summary is not None:
+                    return repaired_summary
             rejected_bundles.append(bundle)
             continue
         landing = land_accepted_bundle(project_root, run_id, bundle)
@@ -793,6 +1302,8 @@ def write_manager_summary(run_dir: Path, summary_id: str, payload: dict[str, Any
 
 def default_operator_command(run_id: str, action: str, *, phase: str | None = None) -> str:
     suffix = "--sandbox read-only --max-concurrency 2 --timeout-seconds 600 --watch"
+    if action == "apply-approved-changes":
+        return f"python3 -m company_orchestrator apply-approved-changes {run_id} {suffix}"
     if action == "plan-phase":
         return f"python3 -m company_orchestrator plan-phase {run_id} {suffix}"
     if action == "plan-phase-replace":
@@ -822,6 +1333,29 @@ def run_guidance(
     phase_plan = read_json(run_dir / "phase-plan.json")
     active_phase_name = phase or phase_plan["current_phase"]
     phase_state = next(item for item in phase_plan["phases"] if item["phase"] == active_phase_name)
+    if (
+        phase_state.get("status") == "complete"
+        and active_phase_name == phase_plan["phases"][-1]["phase"]
+        and all(item.get("status") == "complete" for item in phase_plan.get("phases", []))
+    ):
+        phase_report_json_path = run_dir / "phase-reports" / f"{active_phase_name}.json"
+        phase_report_md_path = run_dir / "phase-reports" / f"{active_phase_name}.md"
+        phase_report = load_optional_json(phase_report_json_path)
+        phase_report_path = (
+            str(phase_report_json_path.relative_to(project_root)) if phase_report_json_path.exists() else None
+        )
+        review_doc_path = (
+            str(phase_report_md_path.relative_to(project_root)) if phase_report_md_path.exists() else phase_report_path
+        )
+        return {
+            "run_status": "complete",
+            "run_status_reason": f"{active_phase_name.title()} is complete and the run has finished successfully.",
+            "next_action_command": None,
+            "next_action_reason": "No further action is required.",
+            "review_doc_path": review_doc_path,
+            "phase_report_path": phase_report_path,
+            "phase_recommendation": phase_report.get("recommendation") if phase_report else None,
+        }
     phase_tasks_payload = tasks if tasks is not None else phase_tasks(run_dir, active_phase_name)
     phase_task_ids = {task["task_id"] for task in phase_tasks_payload}
     activities = list_activities(project_root, run_id, phase=active_phase_name)
@@ -847,7 +1381,7 @@ def run_guidance(
     ]
     queued_activities = [activity for activity in activities if activity["status"] == "queued"]
     blocked_activities = [
-        activity for activity in activities if activity["status"] in {"waiting_dependencies", "blocked"}
+        activity for activity in activities if activity["status"] in {"waiting_dependencies", "blocked", "needs_revision"}
     ]
     interrupted_activities = [
         activity for activity in activities if activity["status"] in {"interrupted", "failed", "abandoned"}
@@ -870,6 +1404,58 @@ def run_guidance(
         phase_tasks_payload,
         effective_scheduler_summary or {},
     )
+
+    if active_activities:
+        return {
+            "run_status": "working",
+            "run_status_reason": (
+                f"{len(active_activities)} active activities, {len(queued_activities)} queued, "
+                f"{len(blocked_activities)} blocked in {active_phase_name}."
+            ),
+            "next_action_command": None,
+            "next_action_reason": "Monitor the run. No manual action is required while work is active.",
+            "review_doc_path": review_doc_path,
+            "phase_report_path": phase_report_path,
+            "phase_recommendation": phase_report.get("recommendation") if phase_report else None,
+        }
+
+    if queued_activities and next_action_command is not None:
+        return {
+            "run_status": "recoverable",
+            "run_status_reason": (
+                f"{active_phase_name.title()} has queued work but no active workers; the run can continue automatically."
+            ),
+            "next_action_command": next_action_command,
+            "next_action_reason": "Resume the phase to continue queued work from the current checkpoint.",
+            "review_doc_path": review_doc_path,
+            "phase_report_path": phase_report_path,
+            "phase_recommendation": phase_report.get("recommendation") if phase_report else None,
+        }
+
+    if next_action_command is not None and "apply-approved-changes" in next_action_command:
+        return {
+            "run_status": "recoverable",
+            "run_status_reason": "Approved change requests are waiting to be applied before the run can continue.",
+            "next_action_command": next_action_command,
+            "next_action_reason": "Apply approved changes to replan only the producer and impacted consumer objectives.",
+            "review_doc_path": review_doc_path,
+            "phase_report_path": phase_report_path,
+            "phase_recommendation": phase_report.get("recommendation") if phase_report else None,
+        }
+
+    if active_phase_name == "polish" and actionable_release_repair_diagnostics(phase_report):
+        if polish_release_repair_attempts(project_root, run_id) < MAX_POLISH_RELEASE_REPAIR_ATTEMPTS:
+            return {
+                "run_status": "recoverable",
+                "run_status_reason": (
+                    "Integrated polish release validation failed, but the run can retry targeted owner repairs."
+                ),
+                "next_action_command": default_operator_command(run_id, "run-phase"),
+                "next_action_reason": "Rerun polish to trigger the targeted release-repair loop and revalidate the integrated product.",
+                "review_doc_path": review_doc_path,
+                "phase_report_path": phase_report_path,
+                "phase_recommendation": phase_report.get("recommendation") if phase_report else None,
+            }
 
     if phase_report is not None and not phase_state.get("human_approved", False):
         recommendation = phase_report["recommendation"]
@@ -923,20 +1509,6 @@ def run_guidance(
             "review_doc_path": review_doc_path,
             "phase_report_path": phase_report_path,
             "phase_recommendation": phase_report.get("recommendation"),
-        }
-
-    if active_activities or queued_activities:
-        return {
-            "run_status": "working",
-            "run_status_reason": (
-                f"{len(active_activities)} active activities, {len(queued_activities)} queued, "
-                f"{len(blocked_activities)} blocked in {active_phase_name}."
-            ),
-            "next_action_command": None,
-            "next_action_reason": "Monitor the run. No manual action is required while work is active.",
-            "review_doc_path": review_doc_path,
-            "phase_report_path": phase_report_path,
-            "phase_recommendation": phase_report.get("recommendation") if phase_report else None,
         }
 
     if next_action_command is not None:
@@ -995,11 +1567,23 @@ def suggested_recovery_command(
     tasks: list[dict[str, Any]],
     scheduler_summary: dict[str, Any],
 ) -> str | None:
-    if scheduler_summary.get("executed"):
-        return None
+    if active_approved_change_requests(project_root, run_id):
+        return default_operator_command(run_id, "apply-approved-changes")
     task_ids = {task["task_id"] for task in tasks}
     handoff_ids = {handoff["handoff_id"] for handoff in list_handoffs(project_root / "runs" / run_id, phase=phase)}
     unresolved = scheduler_summary.get("unresolved_dependencies", {})
+    skipped_dependency = scheduler_summary.get("skipped_dependency", {})
+    failures = scheduler_summary.get("failures") or []
+    blocked_handoffs = scheduler_summary.get("blocked_handoffs") or {}
+    activities = list_activities(project_root, run_id, phase=phase)
+    interrupted_planning = any(
+        activity["kind"] in {"objective_plan", "capability_plan"} and activity["status"] in {"interrupted", "failed"}
+        for activity in activities
+    )
+    blocked_or_interrupted_tasks = any(
+        activity["kind"] == "task_execution" and activity["status"] in {"waiting_dependencies", "blocked", "needs_revision", "interrupted", "failed"}
+        for activity in activities
+    )
     has_non_runtime_blockers = any(
         blocker not in task_ids and blocker not in handoff_ids
         for blockers in unresolved.values()
@@ -1007,6 +1591,8 @@ def suggested_recovery_command(
     )
     if has_non_runtime_blockers:
         return default_operator_command(run_id, "plan-phase-replace")
-    if unresolved or scheduler_summary.get("blocked_handoffs") or scheduler_summary.get("failures"):
+    if interrupted_planning and not blocked_or_interrupted_tasks:
+        return default_operator_command(run_id, "plan-phase-replace")
+    if unresolved or skipped_dependency or blocked_handoffs or failures or blocked_or_interrupted_tasks:
         return default_operator_command(run_id, "resume-phase")
     return None

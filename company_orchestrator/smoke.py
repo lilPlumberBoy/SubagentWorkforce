@@ -57,7 +57,19 @@ def smoke_task(run_id: str, objective_id: str, capability: str, task_id: str) ->
         "acceptance_role": f"objectives.{objective_id}.acceptance-manager",
         "objective": "Echo prompt context for smoke verification.",
         "inputs": [],
-        "expected_outputs": ["completion-report.v1"],
+        "expected_outputs": [
+            {
+                "kind": "assertion",
+                "output_id": "smoke.context-echo",
+                "path": None,
+                "asset_id": None,
+                "description": "Smoke task echoed the assigned role, objective id, phase, and prompt layers.",
+                "evidence": {
+                    "validation_ids": ["context-echo"],
+                    "artifact_paths": [],
+                },
+            }
+        ],
         "done_when": [
             "role id is echoed",
             "objective id is echoed",
@@ -67,6 +79,7 @@ def smoke_task(run_id: str, objective_id: str, capability: str, task_id: str) ->
         "execution_mode": "read_only",
         "parallel_policy": "allow",
         "owned_paths": [],
+        "writes_existing_paths": [],
         "shared_asset_ids": [],
         "depends_on": [],
         "validation": [{"id": "context-echo", "command": "mock-runtime"}],
@@ -89,9 +102,21 @@ def simulate_context_echo_completion(project_root: Path, run_id: str, task_id: s
         "summary": "Context echo simulation complete.",
         "artifacts": [{"path": prompt_log["prompt_path"], "status": "referenced"}],
         "validation_results": [{"id": "context-echo", "status": "passed", "evidence": "mock-runtime returned expected fields"}],
-        "dependency_impact": [],
         "open_issues": [],
-        "follow_up_requests": [],
+        "change_requests": [],
+        "produced_outputs": [
+            {
+                "kind": "assertion",
+                "output_id": "smoke.context-echo",
+                "path": None,
+                "asset_id": None,
+                "description": "Smoke task echoed the assigned role, objective id, phase, and prompt layers.",
+                "evidence": {
+                    "validation_ids": ["context-echo"],
+                    "artifact_paths": [],
+                },
+            }
+        ],
         "context_echo": {
             "role_id": task["assigned_role"],
             "objective_id": task["objective_id"],

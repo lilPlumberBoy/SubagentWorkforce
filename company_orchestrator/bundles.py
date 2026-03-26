@@ -81,15 +81,6 @@ def review_bundle(project_root: Path, run_id: str, bundle_id: str) -> dict[str, 
         for result in report.get("validation_results", []):
             if result["status"] != "passed":
                 failures.append(f"{task_id}: validation {result['id']} did not pass")
-        for request_id in report.get("follow_up_requests", []):
-            if request_id not in known_collaboration_ids:
-                continue
-            request_path = collaboration_dir / f"{request_id}.json"
-            if request_path.exists():
-                request = read_json(request_path)
-                if request.get("blocking") and request.get("status", "open") != "resolved":
-                    failures.append(f"{task_id}: collaboration request {request_id} is still blocking")
-
     if failures:
         bundle["status"] = "rejected"
         bundle["rejection_reasons"] = failures

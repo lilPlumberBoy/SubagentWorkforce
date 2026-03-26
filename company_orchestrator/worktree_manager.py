@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,9 @@ class WorktreeError(RuntimeError):
 class WorkspaceInfo:
     branch_name: str
     workspace_path: Path
+
+
+_WORKTREE_MUTATION_LOCK = threading.RLock()
 
 
 def sanitize_ref_component(value: str) -> str:
@@ -50,20 +54,41 @@ def ensure_run_integration_workspace(project_root: Path, run_id: str) -> Workspa
     repo_root = git_root(project_root)
     branch_name = integration_branch_name(run_id)
     workspace_path = integration_workspace_path(project_root, run_id)
-    if not branch_exists(repo_root, branch_name):
-        git(repo_root, ["branch", branch_name, "HEAD"])
-    ensure_worktree(repo_root, branch_name, workspace_path)
+    with _WORKTREE_MUTATION_LOCK:
+        ensure_branch(repo_root, branch_name, "HEAD")
+        ensure_worktree(repo_root, branch_name, workspace_path)
     return WorkspaceInfo(branch_name=branch_name, workspace_path=workspace_path)
 
 
 def ensure_task_workspace(project_root: Path, run_id: str, task_id: str) -> WorkspaceInfo:
+    return ensure_task_workspace_with_refresh(project_root, run_id, task_id, refresh=False)
+
+
+def ensure_task_workspace_with_refresh(project_root: Path, run_id: str, task_id: str, *, refresh: bool) -> WorkspaceInfo:
     repo_root = git_root(project_root)
-    integration = ensure_run_integration_workspace(project_root, run_id)
     branch_name = task_branch_name(run_id, task_id)
     workspace_path = task_workspace_path(project_root, run_id, task_id)
-    if not branch_exists(repo_root, branch_name):
-        git(repo_root, ["branch", branch_name, integration.branch_name])
-    ensure_worktree(repo_root, branch_name, workspace_path)
+    if refresh:
+        return recreate_task_workspace(project_root, run_id, task_id)
+    with _WORKTREE_MUTATION_LOCK:
+        integration = ensure_run_integration_workspace(project_root, run_id)
+        ensure_branch(repo_root, branch_name, integration.branch_name)
+        ensure_worktree(repo_root, branch_name, workspace_path)
+    return WorkspaceInfo(branch_name=branch_name, workspace_path=workspace_path)
+
+
+def recreate_task_workspace(project_root: Path, run_id: str, task_id: str) -> WorkspaceInfo:
+    repo_root = git_root(project_root)
+    branch_name = task_branch_name(run_id, task_id)
+    workspace_path = task_workspace_path(project_root, run_id, task_id)
+    with _WORKTREE_MUTATION_LOCK:
+        integration = ensure_run_integration_workspace(project_root, run_id)
+        if workspace_path.exists():
+            git(repo_root, ["worktree", "remove", "--force", str(workspace_path)], check=False)
+        if branch_exists(repo_root, branch_name):
+            git(repo_root, ["branch", "-D", branch_name], check=False)
+        ensure_branch(repo_root, branch_name, integration.branch_name)
+        ensure_worktree(repo_root, branch_name, workspace_path)
     return WorkspaceInfo(branch_name=branch_name, workspace_path=workspace_path)
 
 
@@ -95,13 +120,14 @@ def merge_task_branch(
     *,
     bundle_id: str,
 ) -> dict[str, Any]:
-    integration = ensure_run_integration_workspace(project_root, run_id)
-    branch_name = task_branch_name(run_id, task_id)
-    completed = git(
-        integration.workspace_path,
-        ["merge", "--no-ff", "--no-edit", branch_name],
-        check=False,
-    )
+    with _WORKTREE_MUTATION_LOCK:
+        integration = ensure_run_integration_workspace(project_root, run_id)
+        branch_name = task_branch_name(run_id, task_id)
+        completed = git(
+            integration.workspace_path,
+            ["merge", "--no-ff", "--no-edit", branch_name],
+            check=False,
+        )
     if completed.returncode == 0:
         return {
             "status": "merged",
@@ -140,11 +166,23 @@ def cleanup_phase_task_worktrees(project_root: Path, run_id: str, phase_task_ids
             git(repo_root, ["branch", "-D", branch_name], check=False)
 
 
+def ensure_branch(repo_root: Path, branch_name: str, start_point: str) -> None:
+    if branch_exists(repo_root, branch_name):
+        return
+    completed = git(repo_root, ["branch", branch_name, start_point], check=False)
+    if completed.returncode == 0 or branch_exists(repo_root, branch_name):
+        return
+    raise WorktreeError(completed.stderr.strip() or f"git branch {branch_name} {start_point} failed")
+
+
 def ensure_worktree(repo_root: Path, branch_name: str, workspace_path: Path) -> None:
     ensure_dir(workspace_path.parent)
     if workspace_path.exists():
         return
-    git(repo_root, ["worktree", "add", str(workspace_path), branch_name])
+    completed = git(repo_root, ["worktree", "add", str(workspace_path), branch_name], check=False)
+    if completed.returncode == 0 or workspace_path.exists():
+        return
+    raise WorktreeError(completed.stderr.strip() or f"git worktree add {workspace_path} {branch_name} failed")
 
 
 def branch_exists(repo_root: Path, branch_name: str) -> bool:

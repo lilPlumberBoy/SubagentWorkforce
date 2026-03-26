@@ -30,6 +30,13 @@ Or use the higher-level bootstrap path to initialize the run, generate roles, an
 company-orchestrator bootstrap-run run-001 path/to/goal.md --sandbox read-only --max-concurrency 3 --watch
 ```
 
+Or let the orchestrator keep going autonomously with policy guardrails:
+
+```bash
+company-orchestrator bootstrap-run run-001 path/to/goal.md --autonomous --approval-scope planning-only --stop-before-phase mvp-build --watch
+company-orchestrator run-autonomous run-001 --approval-scope all --stop-before-phase polish --stop-on-recovery --watch
+```
+
 Start from the fill-in template at [orchestrator/templates/goal-template.md](/Users/mike/projects/personal/SubagentWorkforce/orchestrator/templates/goal-template.md). The example todo-app goal lives at [goal-draft.md](/Users/mike/projects/personal/SubagentWorkforce/apps/todo/goal-draft.md).
 
 - Keep the `## Objectives` heading exactly as written.
@@ -63,8 +70,11 @@ Prompts are assembled in this order:
 2. `orchestrator/roles/base/<manager|worker|acceptance-manager>.md`
 3. `orchestrator/roles/capabilities/<capability>.md` when present
 4. `orchestrator/roles/objectives/<objective-id>/approved/<role>.md` or `charter.md`
-5. `orchestrator/phase-overlays/<current-phase>.md`
-6. The rendered `task-assignment.v1` JSON
+5. A prompt-kind-specific phase overlay:
+   - `orchestrator/phase-overlays/<current-phase>/objective-planning.md`
+   - `orchestrator/phase-overlays/<current-phase>/capability-planning.md`
+   - `orchestrator/phase-overlays/<current-phase>/task-execution.md`
+6. The rendered planning or task JSON payload
 
 Every render writes a prompt log under `runs/<run-id>/prompt-logs/`.
 
@@ -99,6 +109,9 @@ The orchestrator now writes live monitoring state under `runs/<run-id>/live/` wh
 - `run-state.json` tracks the active phase plus aggregate activity counts.
 - `activities/<activity-id>.json` tracks the status, stage, progress, prompt path, and artifact paths for each planning or execution activity.
 - `events.jsonl` captures normalized lifecycle events from the scheduler, planner, executor, bundle review, and phase reporting.
+- `llm-calls.jsonl` records one structured observability entry per Codex call attempt, including latency, prompt size, queue wait, retries, timeout flags, and token usage.
+- `observability.json` stores the aggregated run-level observability summary used by the dashboard and phase reports.
+- `autonomy-history.jsonl` records one operator-readable audit entry per autonomous decision, including the applied policy, guidance snapshot, and any adaptive tuning decision.
 
 Use the terminal monitor to inspect a run while it is active:
 
@@ -117,6 +130,24 @@ company-orchestrator run-phase run-001 --sandbox read-only --watch
 ```
 
 `watch-run` shows the run header, a `Next Action` panel, summary counts, objective progress, active planning activities, active task activities, queued work, blocked work, collaboration handoffs, parallelism warnings, and a phase-level progress bar.
+
+The `Autonomy` panel now also shows:
+- approval scope
+- stop-before phases
+- whether the run stops on recovery
+- whether adaptive tuning is enabled
+- the last tuning decision, when one was applied
+- the autonomy audit-log path
+
+It also includes an `LLM Observability` panel with:
+- total/completed/failed/timed out calls
+- input, cached-input, and output token totals
+- total prompt chars and lines
+- average/max latency
+- average queue wait
+- retry counts
+- active process count
+- call counts by activity kind
 
 The `Next Action` panel and command JSON output both surface:
 - `run_status`
@@ -161,6 +192,35 @@ company-orchestrator retry-activity run-001 APP-A-DISC-001 --sandbox read-only
 
 `reconcile-run` is a dry run by default and reports what would be reclassified. `resume-phase` applies reconciliation and continues safe incomplete work for the active phase. `retry-activity` starts a new attempt for a specific interrupted activity while preserving attempt lineage in the live dashboard and event history.
 
+## Autonomous Mode
+
+`run-autonomous` uses the same planning/execution/recovery engine as the manual CLI, but it can move a run forward without manual approval steps when policy allows it.
+
+Autonomy policy controls:
+- `--approval-scope {all,planning-only,none}`
+- `--stop-before-phase <phase>` (repeatable)
+- `--stop-on-recovery`
+- `--no-adaptive-tuning`
+- `--max-iterations N`
+
+Examples:
+
+```bash
+company-orchestrator run-autonomous run-001 --approval-scope planning-only --stop-before-phase mvp-build
+company-orchestrator run-autonomous run-001 --approval-scope all --stop-before-phase polish --stop-on-recovery
+```
+
+Autonomous mode writes persistent state to:
+- `runs/<run-id>/autonomy.json`
+- `runs/<run-id>/live/autonomy-history.jsonl`
+
+The audit history is intended to answer:
+- what action autonomy took
+- why it took that action
+- which policy was active
+- what the run guidance said at the time
+- whether adaptive tuning changed concurrency
+
 ## Objective Planning
 
 `plan-objective` and `plan-phase` now run a two-stage planning flow through Codex:
@@ -175,6 +235,8 @@ company-orchestrator retry-activity run-001 APP-A-DISC-001 --sandbox read-only
 - `run-phase` continues to honor the resulting `bundle_plan` during deterministic acceptance review.
 - Planning prompts are intended to be self-contained. Objective and capability managers should use the injected runtime context and planning inputs directly rather than exploring the repository.
 - Planning prompts now use a compact goal/context view for manager reasoning, while worker input resolution still retains the full run payload.
+- Planning prompt compaction is observability-driven. When recent planning calls in the same phase are large, slow, or timed out, later prompts automatically switch from `standard` to `compact` or `aggressive` payload shaping.
+- Autonomous mode uses the same observability to tune runtime behavior. If recent planning or execution calls in the active phase timed out or became slow, autonomy can reduce its effective concurrency before launching the next action.
 - Use `--replace` if you want a new manager plan to overwrite the current objective's tasks for the active phase.
 
 ## Running Tests

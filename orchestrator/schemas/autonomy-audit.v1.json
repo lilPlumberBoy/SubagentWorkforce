@@ -1,0 +1,81 @@
+{
+  "type": "object",
+  "required": [
+    "schema",
+    "run_id",
+    "timestamp",
+    "phase",
+    "event_type",
+    "action",
+    "status",
+    "reason",
+    "policy_snapshot",
+    "guidance_snapshot",
+    "tuning_snapshot"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"type": "string", "enum": ["autonomy-audit.v1"]},
+    "run_id": {"type": "string"},
+    "timestamp": {"type": "string"},
+    "phase": {"type": ["string", "null"]},
+    "event_type": {"type": "string"},
+    "action": {"type": ["string", "null"]},
+    "status": {"type": "string"},
+    "reason": {"type": ["string", "null"]},
+    "policy_snapshot": {
+      "type": "object",
+      "required": [
+        "approval_scope",
+        "stop_before_phases",
+        "stop_on_recovery",
+        "adaptive_tuning"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "approval_scope": {"type": "string", "enum": ["all", "planning-only", "none"]},
+        "stop_before_phases": {"type": "array", "items": {"type": "string"}},
+        "stop_on_recovery": {"type": "boolean"},
+        "adaptive_tuning": {"type": "boolean"}
+      }
+    },
+    "guidance_snapshot": {
+      "type": ["object", "null"],
+      "required": [
+        "run_status",
+        "phase_recommendation",
+        "next_action_command"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "run_status": {"type": ["string", "null"]},
+        "phase_recommendation": {"type": ["string", "null"]},
+        "next_action_command": {"type": ["string", "null"]}
+      }
+    },
+    "tuning_snapshot": {
+      "type": ["object", "null"],
+      "required": [
+        "action_kind",
+        "requested_max_concurrency",
+        "effective_max_concurrency",
+        "reason",
+        "observed_calls",
+        "timed_out_calls",
+        "retry_scheduled_calls",
+        "average_latency_ms"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "action_kind": {"type": ["string", "null"]},
+        "requested_max_concurrency": {"type": ["number", "null"]},
+        "effective_max_concurrency": {"type": ["number", "null"]},
+        "reason": {"type": ["string", "null"]},
+        "observed_calls": {"type": ["number", "null"]},
+        "timed_out_calls": {"type": ["number", "null"]},
+        "retry_scheduled_calls": {"type": ["number", "null"]},
+        "average_latency_ms": {"type": ["number", "null"]}
+      }
+    }
+  }
+}

@@ -26,7 +26,7 @@ Authoritative reference documents for the workflow under review:
 
 ## Integrated Smoke Coverage
 
-`npm run validate:todo-e2e-smoke` drives the full approved MVP path against the integrated runtime created by `apps/todo/runtime/src/runtime.js`.
+`npm run validate:todo-e2e-smoke` drives the full approved MVP path against the existing integrated runtime hosted under `apps/todo/runtime/src/runtime.js`.
 
 Observed smoke coverage:
 1. Starts from an empty SQLite-backed store and confirms `GET /api/todos` returns `{"items":[]}`.
@@ -47,7 +47,7 @@ Use this order so failures remain attributable to one layer instead of becoming 
 
 - `backend layer`: run `npm run validate:todo-backend-contract` and `npm run validate:todo-backend-persistence`. These isolate CRUD envelopes, validation semantics, no-op behavior, and restart durability at `/api/todos` without the browser host.
 - `frontend layer`: run `npm run validate:todo-frontend-flows` and `npm run validate:todo-frontend-reload`. These isolate the React feature module, its shared-client wiring, and reload behavior without the integrated frontend host.
-- `integration layer`: run `npm run validate:todo-runtime-startup` and `npm run validate:todo-runtime-connectivity`. These isolate startup wiring, runtime config injection, CORS allowance, and frontend-to-backend connectivity for the integrated host.
+- `integration layer`: run `npm run validate:todo-runtime-startup` and `npm run validate:todo-runtime-connectivity`. These isolate startup wiring, runtime config injection, CORS allowance, and frontend-to-backend connectivity for the existing integrated host, not a separately planned replacement runtime tree.
 
 Practical triage rule:
 - If the integrated smoke fails and backend or frontend layer commands also fail, route the issue to that owning layer first.

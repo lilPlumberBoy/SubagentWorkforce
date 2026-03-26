@@ -14,21 +14,35 @@ from rich.progress_bar import ProgressBar
 from rich.table import Table
 from rich.text import Text
 
+from .autonomy import autonomy_history_path, read_autonomy_state
 from .filesystem import load_optional_json, read_text
 from .handoffs import list_handoffs
 from .live import list_activities, read_activity, read_activity_history, read_events, read_run_state
 from .management import run_guidance
+from .observability import read_run_observability
 
 T = TypeVar("T")
 
 
-def watch_run(project_root: Path, run_id: str, *, refresh_seconds: float = 1.0) -> None:
+def watch_run(
+    project_root: Path,
+    run_id: str,
+    *,
+    refresh_seconds: float = 1.0,
+) -> None:
     console = Console()
     try:
-        with Live(build_run_dashboard(project_root, run_id), console=console, refresh_per_second=4) as live:
+        with Live(
+            build_run_dashboard(project_root, run_id),
+            console=console,
+            refresh_per_second=4,
+        ) as live:
             while True:
                 time.sleep(refresh_seconds)
-                live.update(build_run_dashboard(project_root, run_id), refresh=True)
+                live.update(
+                    build_run_dashboard(project_root, run_id),
+                    refresh=True,
+                )
     except KeyboardInterrupt:
         return
 
@@ -80,10 +94,20 @@ def run_with_watch(
 
     thread = threading.Thread(target=runner, name=f"watch-run:{run_id}")
     thread.start()
-    with Live(build_run_dashboard(project_root, run_id), console=console, refresh_per_second=4) as live:
+    with Live(
+        build_run_dashboard(project_root, run_id),
+        console=console,
+        refresh_per_second=4,
+    ) as live:
         while not completed.wait(refresh_seconds):
-            live.update(build_run_dashboard(project_root, run_id), refresh=True)
-        live.update(build_run_dashboard(project_root, run_id), refresh=True)
+            live.update(
+                build_run_dashboard(project_root, run_id),
+                refresh=True,
+            )
+        live.update(
+            build_run_dashboard(project_root, run_id),
+            refresh=True,
+        )
     thread.join()
     if "value" in error:
         raise error["value"]
@@ -118,9 +142,11 @@ def build_run_dashboard(project_root: Path, run_id: str):
     objectives = objective_map.get("objectives", [])
     objective_lookup = build_objective_lookup(objectives)
 
-    renderables = [
+    return Group(
         build_run_header(run_id, run_state),
+        build_autonomy_panel(project_root, run_id),
         build_counts_table(run_state),
+        build_observability_panel(project_root, run_id),
         build_objective_progress_table(objectives, activities, objective_lookup),
         build_activity_table("Active Planning Activities", active_plans, objective_lookup),
         build_activity_table("Active Task Activities", active_tasks, objective_lookup),
@@ -133,8 +159,7 @@ def build_run_dashboard(project_root: Path, run_id: str):
         build_phase_progress_panel(objectives, activities),
         build_activity_history_panel(history, objective_lookup),
         build_run_guidance_panel(project_root, run_id, current_phase),
-    ]
-    return Group(*renderables)
+    )
 
 
 def build_activity_detail(project_root: Path, run_id: str, activity_id: str, *, events: int = 20):
@@ -155,6 +180,49 @@ def build_run_header(run_id: str, run_state: dict[str, Any]) -> Panel:
     text.append(f"Phase: {run_state['current_phase']}\n")
     text.append(f"Updated: {run_state['updated_at']} ({age_text(run_state['updated_at'])})")
     return Panel(text, title="Run Status", border_style="green")
+
+
+def build_autonomy_panel(project_root: Path, run_id: str) -> Panel:
+    state = read_autonomy_state(project_root, run_id)
+    run_state = read_run_state(project_root, run_id)
+    guidance = run_guidance(project_root, run_id, phase=run_state["current_phase"])
+    border_style = {
+        "inactive": "blue",
+        "active": "green",
+        "stopped": "yellow",
+        "completed": "cyan",
+    }.get(state["status"], "blue")
+    lines = [
+        f"Controller status: {state['status']}",
+        f"Run status: {guidance['run_status']}",
+        f"Auto approve: {state['auto_approve']}",
+        f"Approval scope: {state.get('approval_scope', 'all')}",
+        f"Stop before phases: {', '.join(state.get('stop_before_phases', [])) or 'none'}",
+        f"Stop on recovery: {state.get('stop_on_recovery', False)}",
+        f"Adaptive tuning: {state.get('adaptive_tuning', True)}",
+        f"Sandbox: {state['sandbox_mode']}",
+        f"Max concurrency: {state['max_concurrency']}",
+        f"Timeout: {state['timeout_seconds'] if state['timeout_seconds'] is not None else 'policy default'}",
+        f"Active phase: {state.get('active_phase') or 'none'}",
+        f"Last action: {state.get('last_action') or 'none'}",
+        f"Last action status: {state.get('last_action_status') or 'none'}",
+        f"Stop reason: {state.get('stop_reason') or 'none'}",
+    ]
+    if state["status"] != "active" and guidance["run_status"] == "working":
+        lines.append("Execution note: run work is active outside the autonomous controller.")
+    elif state["status"] != "active" and guidance["run_status"] == "recoverable":
+        lines.append("Execution note: the run can continue, but the autonomous controller is not currently attached.")
+    tuning = state.get("last_tuning_decision")
+    if tuning:
+        lines.append(
+            "Last tuning: "
+            f"{tuning.get('action_kind') or 'n/a'} "
+            f"{tuning.get('requested_max_concurrency')}→{tuning.get('effective_max_concurrency')} "
+            f"({tuning.get('reason')})"
+        )
+    audit_path = autonomy_history_path(project_root, run_id)
+    lines.append(f"Audit log: {audit_path.relative_to(project_root) if audit_path.exists() else 'not written yet'}")
+    return Panel("\n".join(lines), title="Autonomy Controller", border_style=border_style)
 
 
 def build_counts_table(run_state: dict[str, Any]) -> Table:
@@ -225,6 +293,7 @@ def build_activity_table(title: str, activities: list[dict[str, Any]], objective
 
 
 def build_activity_summary_panel(activity: dict[str, Any]) -> Panel:
+    observability = activity.get("observability", {})
     lines = [
         f"Display ID: {activity_code(activity)}",
         f"Activity: {activity['activity_id']}",
@@ -248,6 +317,14 @@ def build_activity_summary_panel(activity: dict[str, Any]) -> Panel:
         f"Fallback reason: {activity.get('parallel_fallback_reason') or '-'}",
         f"Workspace: {activity.get('workspace_path') or '-'}",
         f"Branch: {activity.get('branch_name') or '-'}",
+        f"Prompt size: {observability.get('prompt_char_count', 0)} chars / {observability.get('prompt_line_count', 0)} lines",
+        f"LLM calls: {observability.get('llm_call_count', 0)}",
+        f"Tokens: in={observability.get('input_tokens', 0)} cached={observability.get('cached_input_tokens', 0)} out={observability.get('output_tokens', 0)}",
+        f"Latency: last={humanize_ms(int(observability.get('last_call_latency_ms', 0)))} runtime={humanize_ms(int(observability.get('runtime_ms', 0)))} queue={humanize_ms(int(observability.get('queue_wait_ms', 0)))}",
+        f"Timeouts / retries: {observability.get('timeout_count', 0)} / {observability.get('timeout_retry_count', 0)}",
+        f"LLM stream bytes: stdout={observability.get('stdout_bytes', 0)} stderr={observability.get('stderr_bytes', 0)}",
+        f"In-flight signal: last={relative_timestamp(observability.get('last_signal_at'))} stdout={relative_timestamp(observability.get('last_stdout_at'))} stderr={relative_timestamp(observability.get('last_stderr_at'))}",
+        f"In-flight stream bytes: stdout={observability.get('stream_stdout_bytes', 0)} stderr={observability.get('stream_stderr_bytes', 0)}",
         f"Current: {activity.get('current_activity') or '-'}",
         f"Updated: {activity['updated_at']}",
     ]
@@ -257,6 +334,24 @@ def build_activity_summary_panel(activity: dict[str, Any]) -> Panel:
         for item in warnings:
             lines.append(f"- {item['code']}: {item['message']}")
     return Panel("\n".join(lines), title="Activity", border_style="yellow")
+
+
+def build_observability_panel(project_root: Path, run_id: str) -> Panel:
+    summary = read_run_observability(project_root, run_id)
+    lines = [
+        f"Calls: {summary['total_calls']} total, {summary['completed_calls']} completed, {summary['failed_calls']} failed, {summary['timed_out_calls']} timed out",
+        f"Tokens: in={summary['total_input_tokens']} cached={summary['total_cached_input_tokens']} out={summary['total_output_tokens']}",
+        f"Prompt volume: {summary['total_prompt_chars']} chars across {summary['total_prompt_lines']} lines",
+        f"Latency: avg={humanize_ms(int(summary['average_latency_ms']))} max={humanize_ms(int(summary['max_latency_ms']))}",
+        f"Queue wait: avg={humanize_ms(int(summary['average_queue_wait_ms']))}",
+        f"Retries scheduled: {summary['retry_scheduled_calls']}",
+        f"Active processes: {summary['active_processes']}",
+        f"Active stream bytes: stdout={summary['active_stream_stdout_bytes']} stderr={summary['active_stream_stderr_bytes']}",
+        f"Oldest active runtime / signal age: {humanize_ms(int(summary['max_active_runtime_ms']))} / {humanize_ms(int(summary['max_last_signal_age_ms']))}",
+        f"Active calls by kind: {format_counts(summary['active_calls_by_kind'])}",
+        f"Calls by kind: {format_counts(summary['calls_by_kind'])}",
+    ]
+    return Panel("\n".join(lines), title="LLM Observability", border_style="blue")
 
 
 def build_handoff_table(title: str, handoffs: list[dict[str, Any]], objective_lookup: dict[str, dict[str, str]]) -> Table:
@@ -419,6 +514,33 @@ def percent_text(fraction: float) -> str:
     return f"{int(max(0.0, min(1.0, fraction)) * 100)}%"
 
 
+def humanize_ms(value: int) -> str:
+    if value <= 0:
+        return "0ms"
+    if value < 1000:
+        return f"{value}ms"
+    seconds = value / 1000
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    remaining = int(seconds % 60)
+    return f"{minutes}m {remaining}s"
+
+
+def format_counts(payload: dict[str, Any]) -> str:
+    if not payload:
+        return "none"
+    return ", ".join(f"{key}:{value}" for key, value in sorted(payload.items()))
+
+
+def format_prompt_tokens(payload: dict[str, Any]) -> str:
+    return (
+        f"in={int(payload.get('input_tokens', 0))} "
+        f"cached={int(payload.get('cached_input_tokens', 0))} "
+        f"out={int(payload.get('output_tokens', 0))}"
+    )
+
+
 def is_active(activity: dict[str, Any]) -> bool:
     return activity["status"] not in {
         "queued",
@@ -522,3 +644,7 @@ def elapsed_text(activity: dict[str, Any]) -> str:
 def last_event_age_text(activity: dict[str, Any]) -> str:
     latest_event = activity.get("latest_event") or {}
     return age_text(latest_event.get("timestamp") or activity.get("updated_at"))
+
+
+def relative_timestamp(timestamp: str | None) -> str:
+    return age_text(timestamp)

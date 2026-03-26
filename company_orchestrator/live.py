@@ -47,6 +47,28 @@ TERMINAL_ACTIVITY_STATUSES = {
 
 HISTORY_ACTIVITY_STATUSES = TERMINAL_ACTIVITY_STATUSES | {"ready_for_bundle_review"}
 
+ATTEMPT_RESET_FIELDS = {
+    "queued_at": None,
+    "launched_at": None,
+    "completed_at": None,
+    "queue_wait_ms": 0,
+    "runtime_ms": 0,
+    "last_call_latency_ms": 0,
+    "llm_call_count": 0,
+    "timeout_count": 0,
+    "timeout_retry_count": 0,
+    "last_signal_at": None,
+    "last_stdout_at": None,
+    "last_stderr_at": None,
+    "stream_stdout_bytes": 0,
+    "stream_stderr_bytes": 0,
+    "input_tokens": 0,
+    "cached_input_tokens": 0,
+    "output_tokens": 0,
+    "stdout_bytes": 0,
+    "stderr_bytes": 0,
+}
+
 _RUN_LOCKS: dict[str, threading.RLock] = {}
 _RUN_LOCKS_GUARD = threading.Lock()
 
@@ -121,6 +143,7 @@ def ensure_activity(
     stderr_path: str | None = None,
     output_path: str | None = None,
     dependency_blockers: list[str] | None = None,
+    observability: dict[str, Any] | None = None,
     latest_event: dict[str, str] | None = None,
     warnings: list[dict[str, str]] | None = None,
     parallel_execution_requested: bool | None = None,
@@ -146,10 +169,17 @@ def ensure_activity(
         activity_file = activity_path(run_dir, activity_id)
         existing_payload = load_optional_json(activity_file)
         existing = normalize_activity_payload(existing_payload) if existing_payload is not None else None
-        started_at = existing["started_at"] if existing else now_timestamp()
+        started_at = now_timestamp() if begin_attempt or not existing else existing["started_at"]
         attempt_value = int(existing.get("attempt", 1)) if existing else 1
         if begin_attempt:
             attempt_value = (int(existing.get("attempt", 1)) + 1) if existing else 1
+        existing_observability = existing.get("observability") if existing else None
+        if begin_attempt and existing_observability is not None:
+            existing_observability = reset_attempt_observability(existing_observability)
+        observability_payload = normalize_observability_payload(
+            observability,
+            existing_observability,
+        )
         payload = {
             "schema": "activity-live-state.v1",
             "run_id": run_id,
@@ -166,16 +196,40 @@ def ensure_activity(
             "queue_position": queue_position,
             "runner_id": runner_id,
             "attempt": attempt if attempt is not None else attempt_value,
-            "status_reason": status_reason if status_reason is not None else (existing.get("status_reason") if existing else None),
-            "interrupted_at": interrupted_at if interrupted_at is not None else (existing.get("interrupted_at") if existing else None),
-            "recovered_at": recovered_at if recovered_at is not None else (existing.get("recovered_at") if existing else None),
-            "recovery_action": recovery_action if recovery_action is not None else (existing.get("recovery_action") if existing else None),
-            "superseded_by": superseded_by if superseded_by is not None else (existing.get("superseded_by") if existing else None),
-            "process_metadata": process_metadata if process_metadata is not None else (existing.get("process_metadata") if existing else None),
+            "status_reason": (
+                status_reason
+                if status_reason is not None
+                else (None if begin_attempt else (existing.get("status_reason") if existing else None))
+            ),
+            "interrupted_at": (
+                interrupted_at
+                if interrupted_at is not None
+                else (None if begin_attempt else (existing.get("interrupted_at") if existing else None))
+            ),
+            "recovered_at": (
+                recovered_at
+                if recovered_at is not None
+                else (None if begin_attempt else (existing.get("recovered_at") if existing else None))
+            ),
+            "recovery_action": (
+                recovery_action
+                if recovery_action is not None
+                else (None if begin_attempt else (existing.get("recovery_action") if existing else None))
+            ),
+            "superseded_by": (
+                superseded_by
+                if superseded_by is not None
+                else (None if begin_attempt else (existing.get("superseded_by") if existing else None))
+            ),
+            "process_metadata": (
+                process_metadata
+                if process_metadata is not None
+                else (None if begin_attempt else (existing.get("process_metadata") if existing else None))
+            ),
             "artifact_reconciliation": (
                 artifact_reconciliation
                 if artifact_reconciliation is not None
-                else (existing.get("artifact_reconciliation") if existing else None)
+                else (None if begin_attempt else (existing.get("artifact_reconciliation") if existing else None))
             ),
             "warnings": warnings if warnings is not None else (existing.get("warnings", []) if existing else []),
             "parallel_execution_requested": (
@@ -211,10 +265,12 @@ def ensure_activity(
             "stderr_path": stderr_path,
             "output_path": output_path,
             "dependency_blockers": dependency_blockers or [],
+            "observability": observability_payload,
             "started_at": started_at,
             "updated_at": now_timestamp(),
             "latest_event": latest_event,
         }
+        payload["observability"] = apply_observability_transitions(payload, observability_payload, previous=existing)
         validate_document(payload, "activity-live-state.v1", project_root)
         write_json_atomic(activity_file, payload)
         record_history_transition(project_root, run_id, payload, existing)
@@ -232,6 +288,7 @@ def update_activity(
     with run_lock(run_id):
         previous = normalize_activity_payload(read_json(activity_path(run_dir, activity_id)))
         payload = dict(previous)
+        observability_updates = updates.pop("observability", None) if "observability" in updates else None
         payload.update({key: value for key, value in updates.items() if value is not None or key in updates})
         payload["updated_at"] = now_timestamp()
         if "status" in updates and payload["status"] == "interrupted" and not payload.get("interrupted_at"):
@@ -243,6 +300,11 @@ def update_activity(
         progress_stage = payload.get("progress_stage") or payload["status"]
         payload["progress_stage"] = progress_stage
         payload["progress_fraction"] = updates.get("progress_fraction", progress_for_stage(progress_stage))
+        observability_payload = normalize_observability_payload(
+            observability_updates,
+            previous.get("observability"),
+        )
+        payload["observability"] = apply_observability_transitions(payload, observability_payload, previous=previous)
         validate_document(payload, "activity-live-state.v1", project_root)
         write_json_atomic(activity_path(run_dir, activity_id), payload)
         record_history_transition(project_root, run_id, payload, previous)
@@ -296,6 +358,29 @@ def refresh_run_state(project_root: Path, run_id: str) -> dict[str, Any]:
         ensure_dir(run_dir / "live" / "activities")
         phase_plan = read_json(run_dir / "phase-plan.json")
         current_phase = phase_plan["current_phase"]
+        current_phase_state = next(
+            (item for item in phase_plan.get("phases", []) if item.get("phase") == current_phase),
+            {},
+        )
+        run_complete = (
+            bool(current_phase_state)
+            and current_phase_state.get("status") == "complete"
+            and all(item.get("status") == "complete" for item in phase_plan.get("phases", []))
+        )
+        if run_complete:
+            payload = {
+                "schema": "run-live-state.v1",
+                "run_id": run_id,
+                "current_phase": current_phase,
+                "active_activity_ids": [],
+                "queued_activity_ids": [],
+                "counts_by_status": {},
+                "counts_by_kind": {},
+                "updated_at": now_timestamp(),
+            }
+            validate_document(payload, "run-live-state.v1", project_root)
+            write_json_atomic(run_dir / "live" / "run-state.json", payload)
+            return payload
         activities = list_activities(project_root, run_id, phase=current_phase)
         active_activity_ids = [
             activity["activity_id"]
@@ -487,7 +572,119 @@ def normalize_activity_payload(payload: dict[str, Any]) -> dict[str, Any]:
     normalized.setdefault("branch_name", None)
     normalized.setdefault("dependency_blocker_fingerprint", None)
     normalized.setdefault("handoff_blocker_fingerprint", None)
+    normalized["observability"] = normalize_observability_payload(normalized.get("observability"))
     return normalized
+
+
+def normalize_observability_payload(
+    payload: dict[str, Any] | None,
+    existing: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    normalized = {
+        "prompt_char_count": 0,
+        "prompt_line_count": 0,
+        "prompt_bytes": 0,
+        "queued_at": None,
+        "launched_at": None,
+        "completed_at": None,
+        "queue_wait_ms": 0,
+        "runtime_ms": 0,
+        "last_call_latency_ms": 0,
+        "llm_call_count": 0,
+        "timeout_count": 0,
+        "timeout_retry_count": 0,
+        "last_signal_at": None,
+        "last_stdout_at": None,
+        "last_stderr_at": None,
+        "stream_stdout_bytes": 0,
+        "stream_stderr_bytes": 0,
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "stdout_bytes": 0,
+        "stderr_bytes": 0,
+    }
+    if existing:
+        normalized.update(existing)
+    if payload:
+        normalized.update({key: value for key, value in payload.items() if value is not None or key in payload})
+    return normalized
+
+
+def reset_attempt_observability(existing: dict[str, Any]) -> dict[str, Any]:
+    reset = dict(existing)
+    reset.update(ATTEMPT_RESET_FIELDS)
+    return reset
+
+
+def apply_observability_transitions(
+    payload: dict[str, Any],
+    observability: dict[str, Any],
+    *,
+    previous: dict[str, Any] | None,
+) -> dict[str, Any]:
+    status = payload["status"]
+    updated_at = payload["updated_at"]
+    if status == "queued" and observability.get("queued_at") is None:
+        observability["queued_at"] = updated_at
+    if status in {"launching", "running", "recovering"}:
+        if observability.get("launched_at") is None:
+            observability["launched_at"] = updated_at
+        queued_at = observability.get("queued_at")
+        if queued_at and not observability.get("queue_wait_ms"):
+            observability["queue_wait_ms"] = timestamp_diff_ms(queued_at, updated_at)
+    if status in TERMINAL_ACTIVITY_STATUSES and observability.get("completed_at") is None:
+        observability["completed_at"] = updated_at
+    launched_at = observability.get("launched_at")
+    completed_at = observability.get("completed_at")
+    if launched_at:
+        end_timestamp = completed_at or updated_at
+        observability["runtime_ms"] = timestamp_diff_ms(launched_at, end_timestamp)
+    return observability
+
+
+def note_activity_stream(
+    project_root: Path,
+    run_id: str,
+    activity_id: str,
+    *,
+    stdout_bytes: int = 0,
+    stderr_bytes: int = 0,
+    timestamp: str | None = None,
+) -> dict[str, Any]:
+    run_dir = project_root / "runs" / run_id
+    with run_lock(run_id):
+        payload = normalize_activity_payload(read_json(activity_path(run_dir, activity_id)))
+        observability = dict(payload.get("observability", {}))
+        observed_at = timestamp or now_timestamp()
+        if stdout_bytes:
+            observability["stream_stdout_bytes"] = int(observability.get("stream_stdout_bytes", 0)) + int(stdout_bytes)
+            observability["last_stdout_at"] = observed_at
+        if stderr_bytes:
+            observability["stream_stderr_bytes"] = int(observability.get("stream_stderr_bytes", 0)) + int(stderr_bytes)
+            observability["last_stderr_at"] = observed_at
+        if stdout_bytes or stderr_bytes:
+            observability["last_signal_at"] = observed_at
+        payload["observability"] = apply_observability_transitions(payload, observability, previous=payload)
+        payload["updated_at"] = observed_at
+        validate_document(payload, "activity-live-state.v1", project_root)
+        write_json_atomic(activity_path(run_dir, activity_id), payload)
+        refresh_run_state(project_root, run_id)
+        from .observability import refresh_run_observability
+
+        refresh_run_observability(project_root, run_id)
+        return payload
+
+
+def timestamp_diff_ms(started_at: str | None, ended_at: str | None) -> int:
+    if not started_at or not ended_at:
+        return 0
+    try:
+        started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        ended = datetime.fromisoformat(ended_at.replace("Z", "+00:00"))
+    except ValueError:
+        return 0
+    return max(0, int((ended - started).total_seconds() * 1000))
 
 
 def record_history_transition(

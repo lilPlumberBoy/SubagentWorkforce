@@ -1,0 +1,76 @@
+{
+  "type": "object",
+  "required": [
+    "schema",
+    "run_id",
+    "change_id",
+    "source_task_id",
+    "source_objective_id",
+    "phase",
+    "affected_output_ids",
+    "affected_handoff_ids",
+    "source_revisions",
+    "directly_impacted_task_ids",
+    "directly_impacted_objective_ids",
+    "impacted_task_ids",
+    "impacted_objective_ids",
+    "notifications",
+    "updated_at"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"type": "string", "enum": ["change-impact.v1"]},
+    "run_id": {"type": "string"},
+    "change_id": {"type": "string"},
+    "source_task_id": {"type": "string"},
+    "source_objective_id": {"type": "string"},
+    "phase": {"type": "string", "enum": ["discovery", "design", "mvp-build", "polish"]},
+    "affected_output_ids": {"type": "array", "items": {"type": "string"}},
+    "affected_handoff_ids": {"type": "array", "items": {"type": "string"}},
+    "source_revisions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "output_id",
+          "handoff_id",
+          "producer_task_id",
+          "producer_objective_id",
+          "producer_phase",
+          "report_path",
+          "report_revision"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "output_id": {"type": ["string", "null"]},
+          "handoff_id": {"type": ["string", "null"]},
+          "producer_task_id": {"type": "string"},
+          "producer_objective_id": {"type": "string"},
+          "producer_phase": {"type": "string", "enum": ["discovery", "design", "mvp-build", "polish"]},
+          "report_path": {"type": ["string", "null"]},
+          "report_revision": {"type": ["string", "null"]}
+        }
+      }
+    },
+    "directly_impacted_task_ids": {"type": "array", "items": {"type": "string"}},
+    "directly_impacted_objective_ids": {"type": "array", "items": {"type": "string"}},
+    "impacted_task_ids": {"type": "array", "items": {"type": "string"}},
+    "impacted_objective_ids": {"type": "array", "items": {"type": "string"}},
+    "notifications": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["task_id", "objective_id", "phase", "activity_id", "action_required"],
+        "additionalProperties": false,
+        "properties": {
+          "task_id": {"type": "string"},
+          "objective_id": {"type": "string"},
+          "phase": {"type": "string", "enum": ["discovery", "design", "mvp-build", "polish"]},
+          "activity_id": {"type": "string"},
+          "action_required": {"type": "string", "enum": ["pause", "replan"]}
+        }
+      }
+    },
+    "updated_at": {"type": "string"}
+  }
+}

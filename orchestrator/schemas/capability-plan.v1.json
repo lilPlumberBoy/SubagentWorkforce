@@ -31,6 +31,7 @@
           "execution_mode",
           "parallel_policy",
           "owned_paths",
+          "writes_existing_paths",
           "shared_asset_ids",
           "objective",
           "inputs",
@@ -51,10 +52,34 @@
           "execution_mode": {"type": "string", "enum": ["read_only", "isolated_write"]},
           "parallel_policy": {"type": "string", "enum": ["allow", "serialize"]},
           "owned_paths": {"type": "array", "items": {"type": "string"}},
+          "writes_existing_paths": {"type": "array", "items": {"type": "string"}},
           "shared_asset_ids": {"type": "array", "items": {"type": "string"}},
           "objective": {"type": "string"},
           "inputs": {"type": "array", "items": {"type": "string"}},
-          "expected_outputs": {"type": "array", "items": {"type": "string"}},
+          "expected_outputs": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["kind", "output_id", "path", "asset_id", "description", "evidence"],
+              "additionalProperties": false,
+              "properties": {
+                "kind": {"type": "string", "enum": ["artifact", "asset", "assertion"]},
+                "output_id": {"type": "string"},
+                "path": {"type": ["string", "null"]},
+                "asset_id": {"type": ["string", "null"]},
+                "description": {"type": ["string", "null"]},
+                "evidence": {
+                  "type": ["object", "null"],
+                  "required": ["validation_ids", "artifact_paths"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "validation_ids": {"type": "array", "items": {"type": "string"}},
+                    "artifact_paths": {"type": "array", "items": {"type": "string"}}
+                  }
+                }
+              }
+            }
+          },
           "done_when": {"type": "array", "items": {"type": "string"}},
           "depends_on": {"type": "array", "items": {"type": "string"}},
           "validation": {
@@ -102,7 +127,7 @@
           "to_role",
           "handoff_type",
           "reason",
-          "deliverables",
+          "deliverable_output_ids",
           "blocking",
           "shared_asset_ids"
         ],
@@ -115,7 +140,7 @@
           "to_role": {"type": "string"},
           "handoff_type": {"type": "string"},
           "reason": {"type": "string"},
-          "deliverables": {"type": "array", "items": {"type": "string"}},
+          "deliverable_output_ids": {"type": "array", "items": {"type": "string"}},
           "blocking": {"type": "boolean"},
           "shared_asset_ids": {"type": "array", "items": {"type": "string"}}
         }

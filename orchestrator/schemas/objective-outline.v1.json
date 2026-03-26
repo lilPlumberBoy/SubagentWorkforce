@@ -38,7 +38,30 @@
           "assigned_manager_role": {"type": "string"},
           "objective": {"type": "string"},
           "inputs": {"type": "array", "items": {"type": "string"}},
-          "expected_outputs": {"type": "array", "items": {"type": "string"}},
+          "expected_outputs": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["kind", "output_id", "path", "asset_id", "description", "evidence"],
+              "additionalProperties": false,
+              "properties": {
+                "kind": {"type": "string", "enum": ["artifact", "asset", "assertion"]},
+                "output_id": {"type": "string"},
+                "path": {"type": ["string", "null"]},
+                "asset_id": {"type": ["string", "null"]},
+                "description": {"type": ["string", "null"]},
+                "evidence": {
+                  "type": ["object", "null"],
+                  "required": ["validation_ids", "artifact_paths"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "validation_ids": {"type": "array", "items": {"type": "string"}},
+                    "artifact_paths": {"type": "array", "items": {"type": "string"}}
+                  }
+                }
+              }
+            }
+          },
           "done_when": {"type": "array", "items": {"type": "string"}},
           "depends_on": {"type": "array", "items": {"type": "string"}},
           "planning_notes": {"type": "array", "items": {"type": "string"}},
@@ -70,7 +93,30 @@
           "to_role": {"type": "string"},
           "handoff_type": {"type": "string"},
           "reason": {"type": "string"},
-          "deliverables": {"type": "array", "items": {"type": "string"}},
+          "deliverables": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["kind", "output_id", "path", "asset_id", "description", "evidence"],
+              "additionalProperties": false,
+              "properties": {
+                "kind": {"type": "string", "enum": ["artifact", "asset", "assertion"]},
+                "output_id": {"type": "string"},
+                "path": {"type": ["string", "null"]},
+                "asset_id": {"type": ["string", "null"]},
+                "description": {"type": ["string", "null"]},
+                "evidence": {
+                  "type": ["object", "null"],
+                  "required": ["validation_ids", "artifact_paths"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "validation_ids": {"type": "array", "items": {"type": "string"}},
+                    "artifact_paths": {"type": "array", "items": {"type": "string"}}
+                  }
+                }
+              }
+            }
+          },
           "blocking": {"type": "boolean"},
           "shared_asset_ids": {"type": "array", "items": {"type": "string"}}
         }

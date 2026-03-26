@@ -22,6 +22,18 @@ def validate_document(document: Any, schema_name: str, start: str | Path | None 
 
 
 def _validate(schema_name: str, value: Any, schema: dict[str, Any], pointer: str) -> None:
+    one_of = schema.get("oneOf")
+    if isinstance(one_of, list):
+        errors: list[str] = []
+        for index, candidate_schema in enumerate(one_of):
+            try:
+                _validate(schema_name, value, candidate_schema, pointer)
+                return
+            except SchemaValidationError as exc:
+                errors.append(f"[{index}] {exc}")
+        raise SchemaValidationError(f"{schema_name}: {pointer} must match oneOf: {'; '.join(errors)}")
+    if "const" in schema and value != schema["const"]:
+        raise SchemaValidationError(f"{schema_name}: {pointer} must equal {schema['const']!r}")
     schema_type = schema.get("type")
     if isinstance(schema_type, list):
         if value is None and "null" in schema_type:

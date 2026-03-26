@@ -44,6 +44,19 @@ def write_text(path: Path, content: str) -> None:
     path.write_text(content.rstrip() + "\n", encoding="utf-8")
 
 
+def clear_text(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path_lock(path):
+        path.write_text("", encoding="utf-8")
+
+
+def append_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path_lock(path):
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(content)
+
+
 def write_text_atomic(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     normalized = content.rstrip() + "\n"

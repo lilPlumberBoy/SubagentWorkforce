@@ -10,7 +10,9 @@
     "unresolved_risks",
     "parallelism_summary",
     "collaboration_summary",
+    "observability_summary",
     "recovery_summary",
+    "release_validation_summary",
     "proposed_role_changes",
     "recommendation",
     "human_approved"
@@ -127,6 +129,40 @@
         }
       }
     },
+    "observability_summary": {
+      "type": "object",
+      "required": [
+        "total_calls",
+        "completed_calls",
+        "failed_calls",
+        "timed_out_calls",
+        "retry_scheduled_calls",
+        "total_input_tokens",
+        "total_cached_input_tokens",
+        "total_output_tokens",
+        "total_prompt_chars",
+        "total_prompt_lines",
+        "average_latency_ms",
+        "max_latency_ms",
+        "average_queue_wait_ms"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "total_calls": {"type": "number"},
+        "completed_calls": {"type": "number"},
+        "failed_calls": {"type": "number"},
+        "timed_out_calls": {"type": "number"},
+        "retry_scheduled_calls": {"type": "number"},
+        "total_input_tokens": {"type": "number"},
+        "total_cached_input_tokens": {"type": "number"},
+        "total_output_tokens": {"type": "number"},
+        "total_prompt_chars": {"type": "number"},
+        "total_prompt_lines": {"type": "number"},
+        "average_latency_ms": {"type": "number"},
+        "max_latency_ms": {"type": "number"},
+        "average_queue_wait_ms": {"type": "number"}
+      }
+    },
     "recovery_summary": {
       "type": "object",
       "required": [
@@ -151,6 +187,53 @@
               "status": {"type": "string"},
               "reason": {"type": "string"},
               "artifact_path": {"type": "string"}
+            }
+          }
+        }
+      }
+    },
+    "release_validation_summary": {
+      "type": ["object", "null"],
+      "required": [
+        "status",
+        "command",
+        "working_directory",
+        "report_path",
+        "stdout_path",
+        "stderr_path",
+        "summary"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {"type": "string", "enum": ["passed", "failed"]},
+        "command": {"type": ["string", "null"]},
+        "working_directory": {"type": "string"},
+        "report_path": {"type": "string"},
+        "stdout_path": {"type": "string"},
+        "stderr_path": {"type": "string"},
+        "summary": {"type": "string"},
+        "failure_diagnostics": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "category",
+              "owner_capability",
+              "owner_objective_id",
+              "source_test",
+              "paths",
+              "excerpt",
+              "repairable"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "category": {"type": "string"},
+              "owner_capability": {"type": ["string", "null"]},
+              "owner_objective_id": {"type": ["string", "null"]},
+              "source_test": {"type": ["string", "null"]},
+              "paths": {"type": "array", "items": {"type": "string"}},
+              "excerpt": {"type": "string"},
+              "repairable": {"type": "boolean"}
             }
           }
         }

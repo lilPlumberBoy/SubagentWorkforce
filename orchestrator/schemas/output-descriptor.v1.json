@@ -1,0 +1,51 @@
+{
+  "oneOf": [
+    {
+      "type": "object",
+      "required": ["kind", "output_id", "path", "asset_id", "description", "evidence"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {"const": "artifact"},
+        "output_id": {"type": "string"},
+        "path": {"type": "string"},
+        "asset_id": {"type": ["null"]},
+        "description": {"type": ["null"]},
+        "evidence": {"type": ["null"]}
+      }
+    },
+    {
+      "type": "object",
+      "required": ["kind", "output_id", "path", "asset_id", "description", "evidence"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {"const": "asset"},
+        "output_id": {"type": "string"},
+        "path": {"type": "string"},
+        "asset_id": {"type": "string"},
+        "description": {"type": ["null"]},
+        "evidence": {"type": ["null"]}
+      }
+    },
+    {
+      "type": "object",
+      "required": ["kind", "output_id", "path", "asset_id", "description", "evidence"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {"const": "assertion"},
+        "output_id": {"type": "string"},
+        "path": {"type": ["null"]},
+        "asset_id": {"type": ["null"]},
+        "description": {"type": "string"},
+        "evidence": {
+          "type": "object",
+          "required": ["validation_ids", "artifact_paths"],
+          "additionalProperties": false,
+          "properties": {
+            "validation_ids": {"type": "array", "items": {"type": "string"}},
+            "artifact_paths": {"type": "array", "items": {"type": "string"}}
+          }
+        }
+      }
+    }
+  ]
+}

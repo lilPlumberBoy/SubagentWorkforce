@@ -1,0 +1,60 @@
+{
+  "type": "object",
+  "required": [
+    "schema",
+    "run_id",
+    "total_calls",
+    "completed_calls",
+    "failed_calls",
+    "timed_out_calls",
+    "retry_scheduled_calls",
+    "total_input_tokens",
+    "total_cached_input_tokens",
+    "total_output_tokens",
+    "total_prompt_chars",
+    "total_prompt_lines",
+    "average_latency_ms",
+    "max_latency_ms",
+    "average_queue_wait_ms",
+    "active_processes",
+    "active_stream_stdout_bytes",
+    "active_stream_stderr_bytes",
+    "max_active_runtime_ms",
+    "max_last_signal_age_ms",
+    "active_calls_by_kind",
+    "calls_by_kind",
+    "updated_at"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"type": "string", "enum": ["run-observability.v1"]},
+    "run_id": {"type": "string"},
+    "total_calls": {"type": "number"},
+    "completed_calls": {"type": "number"},
+    "failed_calls": {"type": "number"},
+    "timed_out_calls": {"type": "number"},
+    "retry_scheduled_calls": {"type": "number"},
+    "total_input_tokens": {"type": "number"},
+    "total_cached_input_tokens": {"type": "number"},
+    "total_output_tokens": {"type": "number"},
+    "total_prompt_chars": {"type": "number"},
+    "total_prompt_lines": {"type": "number"},
+    "average_latency_ms": {"type": "number"},
+    "max_latency_ms": {"type": "number"},
+    "average_queue_wait_ms": {"type": "number"},
+    "active_processes": {"type": "number"},
+    "active_stream_stdout_bytes": {"type": "number"},
+    "active_stream_stderr_bytes": {"type": "number"},
+    "max_active_runtime_ms": {"type": "number"},
+    "max_last_signal_age_ms": {"type": "number"},
+    "active_calls_by_kind": {
+      "type": "object",
+      "additionalProperties": {"type": "number"}
+    },
+    "calls_by_kind": {
+      "type": "object",
+      "additionalProperties": {"type": "number"}
+    },
+    "updated_at": {"type": "string"}
+  }
+}

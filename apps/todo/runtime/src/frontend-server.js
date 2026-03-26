@@ -1,4 +1,5 @@
 const http = require('node:http');
+const fs = require('node:fs');
 const path = require('node:path');
 const express = require('express');
 const { createTodoBrowserBundle } = require('./browser-bundle');
@@ -31,10 +32,12 @@ function createTodoFrontendServer(options = {}) {
     response.send(bundleSource);
   });
   app.get('/assets/react.js', (_request, response) => {
-    response.sendFile(REACT_UMD_PATH);
+    response.type('application/javascript');
+    response.send(fs.readFileSync(REACT_UMD_PATH, 'utf8'));
   });
   app.get('/assets/react-dom.js', (_request, response) => {
-    response.sendFile(REACT_DOM_UMD_PATH);
+    response.type('application/javascript');
+    response.send(fs.readFileSync(REACT_DOM_UMD_PATH, 'utf8'));
   });
   app.get('/health', (_request, response) => {
     response.json({

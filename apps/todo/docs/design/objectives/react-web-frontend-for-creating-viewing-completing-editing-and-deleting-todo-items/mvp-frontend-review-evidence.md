@@ -38,14 +38,14 @@ Approved design package under review:
 
 ## Build And Runtime Artifacts
 
-`npm run build` writes a static runtime preview bundle under `apps/todo/runtime/dist/`:
+`npm run build` writes a static preview bundle under the existing integrated runtime surface at `apps/todo/runtime/dist/`:
 - `apps/todo/runtime/dist/index.html`
 - `apps/todo/runtime/dist/app.js`
 - `apps/todo/runtime/dist/assets/react.js`
 - `apps/todo/runtime/dist/assets/react-dom.js`
 - `apps/todo/runtime/dist/manifest.json`
 
-The build output is intended for acceptance packaging and sanity review. The live runtime still uses `npm run todo-runtime:start` for integrated execution.
+The build output is intended for acceptance packaging and sanity review. The live runtime still uses `npm run todo-runtime:start` for integrated execution, and this evidence does not authorize planning a separate replacement runtime tree.
 
 ## Known Limitations And Follow-Up
 

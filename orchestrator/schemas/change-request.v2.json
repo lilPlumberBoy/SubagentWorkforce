@@ -1,0 +1,80 @@
+{
+  "type": "object",
+  "required": [
+    "schema",
+    "run_id",
+    "change_id",
+    "source_task_id",
+    "source_objective_id",
+    "phase",
+    "change_category",
+    "summary",
+    "blocking_reason",
+    "why_local_resolution_is_invalid",
+    "blocking",
+    "goal_critical",
+    "affected_output_ids",
+    "affected_handoff_ids",
+    "impacted_objective_ids",
+    "impacted_task_ids",
+    "required_reentry_phase",
+    "impact",
+    "approval",
+    "replacement_plan_revision"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"type": "string", "enum": ["change-request.v2"]},
+    "run_id": {"type": "string"},
+    "change_id": {"type": "string"},
+    "source_task_id": {"type": "string"},
+    "source_objective_id": {"type": "string"},
+    "phase": {"type": "string", "enum": ["discovery", "design", "mvp-build", "polish"]},
+    "change_category": {
+      "type": "string",
+      "enum": ["interface_contract", "shared_behavior", "ownership_boundary", "acceptance_rule"]
+    },
+    "summary": {"type": "string"},
+    "blocking_reason": {"type": "string"},
+    "why_local_resolution_is_invalid": {"type": "string"},
+    "blocking": {"type": "boolean"},
+    "goal_critical": {"type": "boolean"},
+    "affected_output_ids": {"type": "array", "items": {"type": "string"}},
+    "affected_handoff_ids": {"type": "array", "items": {"type": "string"}},
+    "impacted_objective_ids": {"type": "array", "items": {"type": "string"}},
+    "impacted_task_ids": {"type": "array", "items": {"type": "string"}},
+    "required_reentry_phase": {"type": "string", "enum": ["discovery", "design", "mvp-build", "polish"]},
+    "impact": {
+      "type": "object",
+      "required": [
+        "goal_changed",
+        "scope_changed",
+        "boundary_changed",
+        "interface_changed",
+        "architecture_changed",
+        "team_changed",
+        "implementation_changed"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "goal_changed": {"type": "boolean"},
+        "scope_changed": {"type": "boolean"},
+        "boundary_changed": {"type": "boolean"},
+        "interface_changed": {"type": "boolean"},
+        "architecture_changed": {"type": "boolean"},
+        "team_changed": {"type": "boolean"},
+        "implementation_changed": {"type": "boolean"}
+      }
+    },
+    "approval": {
+      "type": "object",
+      "required": ["mode", "status"],
+      "additionalProperties": false,
+      "properties": {
+        "mode": {"type": "string", "enum": ["auto", "human"]},
+        "status": {"type": "string", "enum": ["approved", "pending_human_review"]}
+      }
+    },
+    "replacement_plan_revision": {"type": ["string", "null"]}
+  }
+}

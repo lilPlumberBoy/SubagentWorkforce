@@ -5,8 +5,9 @@ import json
 from pathlib import Path
 from typing import Any, Callable
 
+from .autonomy import run_autonomous
 from .bundles import assemble_review_bundle, review_bundle
-from .changes import analyze_change_request, approve_change, create_change_request, scaffold_delta_run
+from .change_replan import apply_approved_changes_and_resume
 from .collaboration import create_collaboration_request, resolve_collaboration_request
 from .executor import execute_task
 from .filesystem import read_json
@@ -26,6 +27,10 @@ def main() -> None:
     parser.add_argument("--json", dest="json_output", action="store_true")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    def add_watch_options(command_parser: argparse.ArgumentParser) -> None:
+        command_parser.add_argument("--watch", action="store_true")
+        command_parser.add_argument("--watch-refresh-seconds", type=float, default=1.0)
+
     init_parser = subparsers.add_parser("init-run")
     init_parser.add_argument("run_id")
     init_parser.add_argument("goal_file")
@@ -38,9 +43,14 @@ def main() -> None:
     bootstrap_parser.add_argument("--timeout-seconds", type=int, default=None)
     bootstrap_parser.add_argument("--max-concurrency", type=int, default=3)
     bootstrap_parser.add_argument("--skip-plan", action="store_true")
+    bootstrap_parser.add_argument("--autonomous", action="store_true")
     bootstrap_parser.add_argument("--no-approve-roles", action="store_true")
-    bootstrap_parser.add_argument("--watch", action="store_true")
-    bootstrap_parser.add_argument("--watch-refresh-seconds", type=float, default=1.0)
+    bootstrap_parser.add_argument("--max-iterations", type=int, default=40)
+    bootstrap_parser.add_argument("--approval-scope", choices=["all", "planning-only", "none"], default="all")
+    bootstrap_parser.add_argument("--stop-before-phase", action="append", default=[])
+    bootstrap_parser.add_argument("--stop-on-recovery", action="store_true")
+    bootstrap_parser.add_argument("--no-adaptive-tuning", action="store_true")
+    add_watch_options(bootstrap_parser)
 
     subparsers.add_parser("decompose-goal").add_argument("run_id")
     subparsers.add_parser("suggest-teams").add_argument("run_id")
@@ -66,8 +76,7 @@ def main() -> None:
     execute_parser.add_argument("--sandbox", default="read-only")
     execute_parser.add_argument("--codex-path", default="codex")
     execute_parser.add_argument("--timeout-seconds", type=int, default=None)
-    execute_parser.add_argument("--watch", action="store_true")
-    execute_parser.add_argument("--watch-refresh-seconds", type=float, default=1.0)
+    add_watch_options(execute_parser)
 
     plan_objective_parser = subparsers.add_parser("plan-objective")
     plan_objective_parser.add_argument("run_id")
@@ -77,8 +86,7 @@ def main() -> None:
     plan_objective_parser.add_argument("--replace", action="store_true")
     plan_objective_parser.add_argument("--timeout-seconds", type=int, default=None)
     plan_objective_parser.add_argument("--max-concurrency", type=int, default=3)
-    plan_objective_parser.add_argument("--watch", action="store_true")
-    plan_objective_parser.add_argument("--watch-refresh-seconds", type=float, default=1.0)
+    add_watch_options(plan_objective_parser)
 
     plan_phase_parser = subparsers.add_parser("plan-phase")
     plan_phase_parser.add_argument("run_id")
@@ -87,8 +95,7 @@ def main() -> None:
     plan_phase_parser.add_argument("--replace", action="store_true")
     plan_phase_parser.add_argument("--timeout-seconds", type=int, default=None)
     plan_phase_parser.add_argument("--max-concurrency", type=int, default=3)
-    plan_phase_parser.add_argument("--watch", action="store_true")
-    plan_phase_parser.add_argument("--watch-refresh-seconds", type=float, default=1.0)
+    add_watch_options(plan_phase_parser)
 
     run_objective_parser = subparsers.add_parser("run-objective")
     run_objective_parser.add_argument("run_id")
@@ -98,8 +105,7 @@ def main() -> None:
     run_objective_parser.add_argument("--force", action="store_true")
     run_objective_parser.add_argument("--timeout-seconds", type=int, default=None)
     run_objective_parser.add_argument("--max-concurrency", type=int, default=3)
-    run_objective_parser.add_argument("--watch", action="store_true")
-    run_objective_parser.add_argument("--watch-refresh-seconds", type=float, default=1.0)
+    add_watch_options(run_objective_parser)
 
     run_phase_parser = subparsers.add_parser("run-phase")
     run_phase_parser.add_argument("run_id")
@@ -108,8 +114,29 @@ def main() -> None:
     run_phase_parser.add_argument("--force", action="store_true")
     run_phase_parser.add_argument("--timeout-seconds", type=int, default=None)
     run_phase_parser.add_argument("--max-concurrency", type=int, default=3)
-    run_phase_parser.add_argument("--watch", action="store_true")
-    run_phase_parser.add_argument("--watch-refresh-seconds", type=float, default=1.0)
+    add_watch_options(run_phase_parser)
+
+    apply_changes_parser = subparsers.add_parser("apply-approved-changes")
+    apply_changes_parser.add_argument("run_id")
+    apply_changes_parser.add_argument("--change-id", action="append", default=[])
+    apply_changes_parser.add_argument("--sandbox", default="read-only")
+    apply_changes_parser.add_argument("--codex-path", default="codex")
+    apply_changes_parser.add_argument("--timeout-seconds", type=int, default=None)
+    apply_changes_parser.add_argument("--max-concurrency", type=int, default=3)
+    add_watch_options(apply_changes_parser)
+
+    auto_parser = subparsers.add_parser("run-autonomous")
+    auto_parser.add_argument("run_id")
+    auto_parser.add_argument("--sandbox", default="read-only")
+    auto_parser.add_argument("--codex-path", default="codex")
+    auto_parser.add_argument("--timeout-seconds", type=int, default=None)
+    auto_parser.add_argument("--max-concurrency", type=int, default=3)
+    auto_parser.add_argument("--max-iterations", type=int, default=40)
+    auto_parser.add_argument("--approval-scope", choices=["all", "planning-only", "none"], default="all")
+    auto_parser.add_argument("--stop-before-phase", action="append", default=[])
+    auto_parser.add_argument("--stop-on-recovery", action="store_true")
+    auto_parser.add_argument("--no-adaptive-tuning", action="store_true")
+    add_watch_options(auto_parser)
 
     watch_parser = subparsers.add_parser("watch-run")
     watch_parser.add_argument("run_id")
@@ -132,8 +159,7 @@ def main() -> None:
     resume_parser.add_argument("--force", action="store_true")
     resume_parser.add_argument("--timeout-seconds", type=int, default=None)
     resume_parser.add_argument("--max-concurrency", type=int, default=3)
-    resume_parser.add_argument("--watch", action="store_true")
-    resume_parser.add_argument("--watch-refresh-seconds", type=float, default=1.0)
+    add_watch_options(resume_parser)
 
     retry_parser = subparsers.add_parser("retry-activity")
     retry_parser.add_argument("run_id")
@@ -141,8 +167,7 @@ def main() -> None:
     retry_parser.add_argument("--sandbox", default="read-only")
     retry_parser.add_argument("--codex-path", default="codex")
     retry_parser.add_argument("--timeout-seconds", type=int, default=None)
-    retry_parser.add_argument("--watch", action="store_true")
-    retry_parser.add_argument("--watch-refresh-seconds", type=float, default=1.0)
+    add_watch_options(retry_parser)
 
     bundle_parser = subparsers.add_parser("assemble-bundle")
     bundle_parser.add_argument("run_id")
@@ -189,30 +214,6 @@ def main() -> None:
     verify_smoke_parser = subparsers.add_parser("verify-smoke")
     verify_smoke_parser.add_argument("run_id")
 
-    change_parser = subparsers.add_parser("create-change")
-    change_parser.add_argument("run_id")
-    change_parser.add_argument("change_id")
-    change_parser.add_argument("summary")
-    change_parser.add_argument("--goal-changed", action="store_true")
-    change_parser.add_argument("--scope-changed", action="store_true")
-    change_parser.add_argument("--boundary-changed", action="store_true")
-    change_parser.add_argument("--interface-changed", action="store_true")
-    change_parser.add_argument("--architecture-changed", action="store_true")
-    change_parser.add_argument("--team-changed", action="store_true")
-    change_parser.add_argument("--implementation-changed", action="store_true")
-
-    analyze_parser = subparsers.add_parser("analyze-change")
-    analyze_parser.add_argument("run_id")
-    analyze_parser.add_argument("change_id")
-
-    approve_change_parser = subparsers.add_parser("approve-change")
-    approve_change_parser.add_argument("run_id")
-    approve_change_parser.add_argument("change_id")
-
-    delta_parser = subparsers.add_parser("scaffold-delta")
-    delta_parser.add_argument("run_id")
-    delta_parser.add_argument("change_id")
-
     args = parser.parse_args()
     project_root = Path(args.project_root).resolve()
 
@@ -231,7 +232,28 @@ def main() -> None:
                 approve_roles=not args.no_approve_roles,
             )
         }
-        if not args.skip_plan:
+        if args.autonomous:
+            operation = lambda: run_autonomous(
+                project_root,
+                args.run_id,
+                sandbox_mode=args.sandbox,
+                codex_path=args.codex_path,
+                timeout_seconds=args.timeout_seconds,
+                max_concurrency=args.max_concurrency,
+                max_iterations=args.max_iterations,
+                approval_scope=args.approval_scope,
+                stop_before_phases=args.stop_before_phase,
+                stop_on_recovery=args.stop_on_recovery,
+                adaptive_tuning=not args.no_adaptive_tuning,
+            )
+            result["autonomy"] = run_maybe_watched(
+                project_root,
+                args.run_id,
+                args.watch,
+                args.watch_refresh_seconds,
+                operation,
+            )
+        elif not args.skip_plan:
             operation = lambda: plan_phase(
                 project_root,
                 args.run_id,
@@ -248,12 +270,12 @@ def main() -> None:
                 args.watch_refresh_seconds,
                 operation,
             )
-        if should_print_result(args.json_output, watched=args.watch and not args.skip_plan):
+        if should_print_result(args.json_output, watched=args.watch and (args.autonomous or not args.skip_plan)):
             print_result(
                 project_root,
                 result,
                 run_id=args.run_id,
-                leading_blank_line=args.watch and not args.skip_plan,
+                leading_blank_line=args.watch and (args.autonomous or not args.skip_plan),
                 json_output=args.json_output,
             )
         return
@@ -286,7 +308,13 @@ def main() -> None:
                 codex_path=args.codex_path,
                 timeout_seconds=args.timeout_seconds,
             )
-        result = run_maybe_watched(project_root, args.run_id, args.watch, args.watch_refresh_seconds, operation)
+        result = run_maybe_watched(
+            project_root,
+            args.run_id,
+            args.watch,
+            args.watch_refresh_seconds,
+            operation,
+        )
         if should_print_result(args.json_output, watched=args.watch):
             print_result(
                 project_root,
@@ -307,7 +335,13 @@ def main() -> None:
                 timeout_seconds=args.timeout_seconds,
                 max_concurrency=args.max_concurrency,
             )
-        result = run_maybe_watched(project_root, args.run_id, args.watch, args.watch_refresh_seconds, operation)
+        result = run_maybe_watched(
+            project_root,
+            args.run_id,
+            args.watch,
+            args.watch_refresh_seconds,
+            operation,
+        )
         if should_print_result(args.json_output, watched=args.watch):
             print_result(
                 project_root,
@@ -327,7 +361,13 @@ def main() -> None:
                 timeout_seconds=args.timeout_seconds,
                 max_concurrency=args.max_concurrency,
             )
-        result = run_maybe_watched(project_root, args.run_id, args.watch, args.watch_refresh_seconds, operation)
+        result = run_maybe_watched(
+            project_root,
+            args.run_id,
+            args.watch,
+            args.watch_refresh_seconds,
+            operation,
+        )
         if should_print_result(args.json_output, watched=args.watch):
             print_result(
                 project_root,
@@ -348,7 +388,13 @@ def main() -> None:
                 timeout_seconds=args.timeout_seconds,
                 max_concurrency=args.max_concurrency,
             )
-        result = run_maybe_watched(project_root, args.run_id, args.watch, args.watch_refresh_seconds, operation)
+        result = run_maybe_watched(
+            project_root,
+            args.run_id,
+            args.watch,
+            args.watch_refresh_seconds,
+            operation,
+        )
         if should_print_result(args.json_output, watched=args.watch):
             print_result(
                 project_root,
@@ -368,7 +414,43 @@ def main() -> None:
                 timeout_seconds=args.timeout_seconds,
                 max_concurrency=args.max_concurrency,
             )
-        result = run_maybe_watched(project_root, args.run_id, args.watch, args.watch_refresh_seconds, operation)
+        result = run_maybe_watched(
+            project_root,
+            args.run_id,
+            args.watch,
+            args.watch_refresh_seconds,
+            operation,
+        )
+        if should_print_result(args.json_output, watched=args.watch):
+            print_result(
+                project_root,
+                result,
+                run_id=args.run_id,
+                leading_blank_line=args.watch,
+                json_output=args.json_output,
+            )
+        return
+    if args.command == "run-autonomous":
+        operation = lambda: run_autonomous(
+                project_root,
+                args.run_id,
+                sandbox_mode=args.sandbox,
+                codex_path=args.codex_path,
+                timeout_seconds=args.timeout_seconds,
+                max_concurrency=args.max_concurrency,
+                max_iterations=args.max_iterations,
+                approval_scope=args.approval_scope,
+                stop_before_phases=args.stop_before_phase,
+                stop_on_recovery=args.stop_on_recovery,
+                adaptive_tuning=not args.no_adaptive_tuning,
+            )
+        result = run_maybe_watched(
+            project_root,
+            args.run_id,
+            args.watch,
+            args.watch_refresh_seconds,
+            operation,
+        )
         if should_print_result(args.json_output, watched=args.watch):
             print_result(
                 project_root,
@@ -379,7 +461,11 @@ def main() -> None:
             )
         return
     if args.command == "watch-run":
-        watch_run(project_root, args.run_id, refresh_seconds=args.refresh_seconds)
+        watch_run(
+            project_root,
+            args.run_id,
+            refresh_seconds=args.refresh_seconds,
+        )
         return
     if args.command == "inspect-activity":
         inspect_activity(project_root, args.run_id, args.activity_id, follow=args.follow, events=args.events)
@@ -397,7 +483,39 @@ def main() -> None:
                 timeout_seconds=args.timeout_seconds,
                 max_concurrency=args.max_concurrency,
             )
-        result = run_maybe_watched(project_root, args.run_id, args.watch, args.watch_refresh_seconds, operation)
+        result = run_maybe_watched(
+            project_root,
+            args.run_id,
+            args.watch,
+            args.watch_refresh_seconds,
+            operation,
+        )
+        if should_print_result(args.json_output, watched=args.watch):
+            print_result(
+                project_root,
+                result,
+                run_id=args.run_id,
+                leading_blank_line=args.watch,
+                json_output=args.json_output,
+            )
+        return
+    if args.command == "apply-approved-changes":
+        operation = lambda: apply_approved_changes_and_resume(
+                project_root,
+                args.run_id,
+                change_ids=args.change_id,
+                sandbox_mode=args.sandbox,
+                codex_path=args.codex_path,
+                timeout_seconds=args.timeout_seconds,
+                max_concurrency=args.max_concurrency,
+            )
+        result = run_maybe_watched(
+            project_root,
+            args.run_id,
+            args.watch,
+            args.watch_refresh_seconds,
+            operation,
+        )
         if should_print_result(args.json_output, watched=args.watch):
             print_result(
                 project_root,
@@ -416,7 +534,13 @@ def main() -> None:
                 codex_path=args.codex_path,
                 timeout_seconds=args.timeout_seconds,
             )
-        result = run_maybe_watched(project_root, args.run_id, args.watch, args.watch_refresh_seconds, operation)
+        result = run_maybe_watched(
+            project_root,
+            args.run_id,
+            args.watch,
+            args.watch_refresh_seconds,
+            operation,
+        )
         if should_print_result(args.json_output, watched=args.watch):
             print_result(
                 project_root,
@@ -478,27 +602,6 @@ def main() -> None:
         return
     if args.command == "verify-smoke":
         print_json(verify_smoke_reports(project_root, args.run_id))
-        return
-    if args.command == "create-change":
-        impact = {
-            "goal_changed": args.goal_changed,
-            "scope_changed": args.scope_changed,
-            "boundary_changed": args.boundary_changed,
-            "interface_changed": args.interface_changed,
-            "architecture_changed": args.architecture_changed,
-            "team_changed": args.team_changed,
-            "implementation_changed": args.implementation_changed,
-        }
-        print_json(create_change_request(project_root, args.run_id, args.change_id, args.summary, impact))
-        return
-    if args.command == "analyze-change":
-        print_json(analyze_change_request(project_root, args.run_id, args.change_id))
-        return
-    if args.command == "approve-change":
-        print_json(approve_change(project_root, args.run_id, args.change_id, True))
-        return
-    if args.command == "scaffold-delta":
-        print(scaffold_delta_run(project_root, args.run_id, args.change_id))
         return
     raise ValueError(f"Unknown command {args.command}")
 
@@ -583,7 +686,12 @@ def run_maybe_watched(
 ) -> dict[str, Any]:
     if not watch:
         return operation()
-    return run_with_watch(project_root, run_id, operation, refresh_seconds=refresh_seconds)
+    return run_with_watch(
+        project_root,
+        run_id,
+        operation,
+        refresh_seconds=refresh_seconds,
+    )
 
 
 def retry_activity(
