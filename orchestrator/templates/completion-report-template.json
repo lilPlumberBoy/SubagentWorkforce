@@ -10,5 +10,6 @@
   "artifacts": [{"path": "<artifact path>", "status": "created"}],
   "validation_results": [{"id": "required-check-1", "status": "passed", "evidence": "command returned success"}],
   "open_issues": [],
+  "blockers": [],
   "change_requests": []
 }

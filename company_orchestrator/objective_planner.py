@@ -8,7 +8,7 @@ import shutil
 import subprocess
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from contextlib import contextmanager
 from pathlib import Path
 import tempfile
@@ -65,6 +65,7 @@ from .output_descriptors import (
     looks_like_repo_path,
     normalize_output_descriptors,
     output_descriptor_ids,
+    sanitize_output_descriptors,
 )
 from .parallelism import (
     canonicalize_validation_commands,
@@ -75,17 +76,34 @@ from .parallelism import (
     path_pattern_conflict,
 )
 from .prompts import (
+    PHASE_SEQUENCE,
+    approved_scope_overrides_for_objective,
+    build_capability_planning_prompt_packet,
+    build_capability_prompt_payload,
+    build_objective_planning_prompt_packet,
+    build_planning_prompt_payload,
+    objective_summary_text,
+    build_validation_environment_hints,
     build_release_repair_inputs,
+    compile_task_context_packet,
+    collect_prior_phase_artifacts,
+    collect_prior_phase_reports,
     collect_related_app_prior_phase_reports,
+    infer_report_capability,
+    lookup_dotted_path,
     preview_resolved_inputs,
     release_repair_input_refs,
     render_capability_planning_prompt,
     render_objective_planning_prompt,
+    scope_override_phrases,
+    scope_override_tokens,
 )
 from .recovery import prepare_activity_retry, reconcile_for_command
 from .schemas import SchemaValidationError, validate_document
+from .task_graph import write_objective_task_graph_manifest
+from .task_graph import update_run_file_graph_capability_plan
 from .timeout_policy import resolve_planning_timeout_policy, timeout_final_message, timeout_retry_message
-from .worktree_manager import cleanup_phase_task_worktrees, integration_workspace_path
+from .worktree_manager import cleanup_phase_task_worktrees, integration_workspace_path, normalize_repo_relative_path
 
 
 class PlanningLimiter:
@@ -115,6 +133,7 @@ MAX_MANAGER_PLANNING_REPAIR_ATTEMPTS = 1
 MAX_MANAGER_PLANNING_MISSING_FINAL_MESSAGE_RETRIES = 1
 PLANNING_STALL_TIMEOUT_MIN_SECONDS = 60
 PLANNING_STALL_TIMEOUT_MAX_SECONDS = 180
+MANAGER_FIXABLE_PLANNING_ERROR_TYPES = (ExecutorError, SchemaValidationError, ValueError)
 
 
 def planning_stall_timeout_seconds(timeout_seconds: int) -> int:
@@ -128,6 +147,235 @@ def planning_stall_timeout_seconds(timeout_seconds: int) -> int:
             ),
         ),
     )
+
+
+def planning_attempt_stream_name(output_prefix: str, attempt: int, suffix: str) -> str:
+    if attempt <= 1:
+        return f"{output_prefix}.{suffix}"
+    return f"{output_prefix}.attempt-{attempt}.{suffix}"
+
+
+def validate_scope_override_coverage_for_objective_outline(
+    project_root: Path,
+    run_id: str,
+    phase: str,
+    objective_id: str,
+    outline: dict[str, Any],
+) -> None:
+    overrides = approved_scope_overrides_for_objective(
+        project_root,
+        run_id,
+        objective_id,
+        phase=phase,
+    )
+    if not overrides:
+        return
+    text = " ".join(
+        [
+            str(outline.get("summary") or ""),
+            " ".join(str(item) for item in outline.get("dependency_notes", []) if item),
+            " ".join(str(lane.get("objective") or "") for lane in outline.get("capability_lanes", [])),
+            " ".join(str(edge.get("reason") or "") for edge in outline.get("collaboration_edges", [])),
+            " ".join(
+                str(deliverable.get("description") or deliverable.get("output_id") or deliverable.get("path") or "")
+                for edge in outline.get("collaboration_edges", [])
+                for deliverable in edge.get("deliverables", [])
+                if isinstance(deliverable, dict)
+            ),
+        ]
+    )
+    missing = [item["summary"] for item in overrides if not _plan_text_covers_scope_override(text, item["summary"])]
+    if missing:
+        raise ValueError(
+            "Objective outline does not materially incorporate approved scope overrides: " + "; ".join(missing)
+        )
+
+
+def validate_scope_override_coverage_for_capability_plan(
+    project_root: Path,
+    run_id: str,
+    phase: str,
+    objective_id: str,
+    capability_plan: dict[str, Any],
+) -> None:
+    overrides = approved_scope_overrides_for_objective(
+        project_root,
+        run_id,
+        objective_id,
+        phase=phase,
+    )
+    if not overrides:
+        return
+    text = " ".join(
+        [
+            str(capability_plan.get("summary") or ""),
+            " ".join(
+                str(task.get("objective") or "")
+                + " "
+                + " ".join(str(item) for item in task.get("done_when", []) if item)
+                + " "
+                + " ".join(
+                    str(output.get("description") or output.get("output_id") or output.get("path") or "")
+                    for output in task.get("expected_outputs", [])
+                    if isinstance(output, dict)
+                )
+                for task in capability_plan.get("tasks", [])
+                if isinstance(task, dict)
+            ),
+        ]
+    )
+    missing = [item["summary"] for item in overrides if not _plan_text_covers_scope_override(text, item["summary"])]
+    if missing:
+        raise ValueError(
+            "Capability plan does not materially incorporate approved scope overrides: " + "; ".join(missing)
+        )
+
+
+def _plan_text_covers_scope_override(plan_text: str, summary: str) -> bool:
+    searchable = plan_text.lower()
+    phrases = [phrase for phrase in scope_override_phrases(summary) if phrase]
+    if any(phrase in searchable for phrase in phrases):
+        return True
+    summary_tokens = set(scope_override_tokens(summary))
+    plan_tokens = set(scope_override_tokens(plan_text))
+    return len(summary_tokens & plan_tokens) >= 2
+
+
+def _normalize_and_validate_objective_outline(
+    project_root: Path,
+    run_id: str,
+    phase: str,
+    objective_id: str,
+    objective: dict[str, Any],
+    payload: Any,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    outline, identity_adjustments = normalize_objective_outline(
+        project_root,
+        payload,
+        run_id=run_id,
+        phase=phase,
+        objective=objective,
+    )
+    validate_scope_override_coverage_for_objective_outline(
+        project_root,
+        run_id,
+        phase,
+        objective_id,
+        outline,
+    )
+    validate_objective_outline_planning_input_addressability(
+        project_root,
+        run_id,
+        phase,
+        objective_id,
+        outline,
+    )
+    return outline, identity_adjustments
+
+
+def _normalize_and_validate_capability_plan(
+    project_root: Path,
+    run_id: str,
+    phase: str,
+    objective_id: str,
+    capability: str,
+    objective_outline: dict[str, Any],
+    default_sandbox_mode: str,
+    payload: Any,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    plan, identity_adjustments = normalize_capability_plan(
+        project_root,
+        payload,
+        run_id=run_id,
+        phase=phase,
+        objective_id=objective_id,
+        capability=capability,
+        objective_outline=objective_outline,
+        default_sandbox_mode=default_sandbox_mode,
+    )
+    validate_scope_override_coverage_for_capability_plan(
+        project_root,
+        run_id,
+        phase,
+        objective_id,
+        plan,
+    )
+    validate_capability_plan_planning_input_addressability(
+        project_root,
+        run_id,
+        objective_id,
+        capability,
+        objective_outline,
+        plan,
+    )
+    return plan, identity_adjustments
+
+
+def validate_prompt_packet_input_refs(
+    input_refs: list[Any],
+    planning_packet: dict[str, Any],
+    *,
+    owner_label: str,
+) -> None:
+    invalid_refs: list[str] = []
+    for value in input_refs:
+        if not isinstance(value, str):
+            continue
+        input_ref = value.strip()
+        if not input_ref.startswith("Planning Inputs."):
+            continue
+        resolved = lookup_dotted_path(planning_packet, input_ref.removeprefix("Planning Inputs."))
+        if isinstance(resolved, dict) and isinstance(resolved.get("missing_path"), str):
+            invalid_refs.append(input_ref)
+            continue
+        if resolved is None:
+            invalid_refs.append(input_ref)
+    if invalid_refs:
+        joined = ", ".join(sorted(dedupe_strings(invalid_refs)))
+        raise ExecutorError(f"{owner_label} referenced unavailable planning inputs: {joined}")
+
+
+def validate_objective_outline_planning_input_addressability(
+    project_root: Path,
+    run_id: str,
+    phase: str,
+    objective_id: str,
+    outline: dict[str, Any],
+) -> None:
+    planning_payload = build_planning_prompt_payload(project_root, run_id, objective_id)
+    planning_packet = build_objective_planning_prompt_packet(planning_payload)
+    for lane in outline.get("capability_lanes", []):
+        capability = str(lane.get("capability") or "").strip() or "unknown"
+        validate_prompt_packet_input_refs(
+            list(lane.get("inputs", [])),
+            planning_packet,
+            owner_label=f"Objective outline capability lane {capability}",
+        )
+
+
+def validate_capability_plan_planning_input_addressability(
+    project_root: Path,
+    run_id: str,
+    objective_id: str,
+    capability: str,
+    objective_outline: dict[str, Any],
+    capability_plan: dict[str, Any],
+) -> None:
+    planning_payload = build_capability_prompt_payload(
+        project_root,
+        run_id,
+        objective_id,
+        capability,
+        objective_outline,
+    )
+    planning_packet = build_capability_planning_prompt_packet(planning_payload)
+    for task in capability_plan.get("tasks", []):
+        task_id = str(task.get("task_id") or "").strip() or "unknown-task"
+        validate_prompt_packet_input_refs(
+            list(task.get("inputs", [])),
+            planning_packet,
+            owner_label=f"Capability plan task {task_id}",
+        )
 
 
 @contextmanager
@@ -337,6 +585,14 @@ def plan_objective(
         "recovery_action": None,
     }
     outline_path = plans_dir / f"{phase}-{objective_id}.outline.json"
+    has_scope_overrides = bool(
+        approved_scope_overrides_for_objective(
+            project_root,
+            run_id,
+            objective_id,
+            phase=phase,
+        )
+    )
     reuse_outline_for_repair = should_reuse_existing_outline_for_repair(
         replace=replace,
         objective=objective,
@@ -354,70 +610,73 @@ def plan_objective(
                 repair_context=repair_context,
             )
     with quarantined_objective_phase_artifacts(project_root, run_id, phase, objective_id, enabled=replace) as replace_artifacts:
-        outline = preloaded_outline if preloaded_outline is not None else (
-            None if replace and not reuse_outline_for_repair else load_valid_document(project_root, outline_path, "objective-outline.v1")
-        )
-        fast_path_used = False
-        if objective_uses_single_capability_fast_path(phase, objective) and (replace or outline is None):
-            outline = build_single_capability_fast_path_outline(
+        if phase == "polish":
+            outline = build_deterministic_polish_outline(
                 project_root,
-                run_dir,
                 run_id=run_id,
-                phase=phase,
                 objective=objective,
             )
             write_json(outline_path, outline)
-            fast_path_used = True
-            record_event(
+            plan, capability_summaries = build_deterministic_polish_objective_plan(
                 project_root,
                 run_id,
-                phase=phase,
-                activity_id=plan_activity_id(phase, objective_id),
-                event_type="planning.fast_path",
-                message=f"Used single-capability fast path for objective {objective_id}.",
-                payload={"capabilities": list(objective.get("capabilities", []))},
+                objective=objective,
+                outline=outline,
+                sandbox_mode=sandbox_mode,
             )
-        elif outline is None:
-            objective_prompt = render_objective_planning_prompt(
-                project_root,
-                run_id,
-                objective_id,
-                ignore_existing_phase_tasks=replace,
-                repair_context=repair_context,
+            validate_objective_plan_contents(project_root, plan, objective)
+            validate_planned_task_inputs(project_root, run_id, phase, objective_id, plan["tasks"])
+            materialize_objective_plan(project_root, run_id, plan, replace=replace)
+            planning_mode = "deterministic_polish"
+            objective_result["recovery_action"] = "deterministic_polish_plan"
+        else:
+            outline = preloaded_outline if preloaded_outline is not None else (
+                None if replace and not reuse_outline_for_repair else load_valid_document(project_root, outline_path, "objective-outline.v1")
             )
-            objective_execution_prompt = build_planning_prompt(
-                (project_root / objective_prompt["prompt_path"]).read_text(encoding="utf-8")
-            )
-            try:
-                objective_result = execute_planning_activity(
+            if outline is not None:
+                try:
+                    validate_scope_override_coverage_for_objective_outline(
+                        project_root,
+                        run_id,
+                        phase,
+                        objective_id,
+                        outline,
+                    )
+                except ValueError:
+                    outline = None
+            fast_path_used = False
+            if objective_uses_single_capability_fast_path(phase, objective) and not has_scope_overrides and (replace or outline is None):
+                outline = build_single_capability_fast_path_outline(
+                    project_root,
+                    run_dir,
+                    run_id=run_id,
+                    phase=phase,
+                    objective=objective,
+                )
+                write_json(outline_path, outline)
+                fast_path_used = True
+                record_event(
                     project_root,
                     run_id,
                     phase=phase,
                     activity_id=plan_activity_id(phase, objective_id),
-                    kind="objective_plan",
-                    entity_id=objective_id,
-                    display_name=f"Plan {objective_id}",
-                    assigned_role=f"objectives.{objective_id}.objective-manager",
-                    prompt_metadata=objective_prompt,
-                    execution_prompt=objective_execution_prompt,
-                    output_schema_name="objective-outline.v1",
-                    output_prefix=f"{phase}-{objective_id}",
-                    failure_label=f"objective {objective_id}",
-                    sandbox_mode=sandbox_mode,
-                    codex_path=codex_path,
-                    timeout_seconds=timeout_seconds,
-                    planning_limiter=planning_limiter,
+                    event_type="planning.fast_path",
+                    message=f"Used single-capability fast path for objective {objective_id}.",
+                    payload={"capabilities": list(objective.get("capabilities", []))},
+                )
+            elif outline is None:
+                objective_prompt = render_objective_planning_prompt(
+                    project_root,
+                    run_id,
+                    objective_id,
+                    ignore_existing_phase_tasks=replace,
+                    repair_context=repair_context,
+                )
+                objective_execution_prompt = build_planning_prompt(
+                    (project_root / objective_prompt["prompt_path"]).read_text(encoding="utf-8")
                 )
                 try:
-                    outline, identity_adjustments = normalize_objective_outline(
-                        project_root,
-                        objective_result["payload"],
-                        run_id=run_id,
-                        phase=phase,
-                        objective=objective,
-                    )
-                except ExecutorError as exc:
-                    objective_result, outline, identity_adjustments = repair_invalid_planning_response(
+                    objective_result = execute_planning_activity(
                         project_root,
                         run_id,
                         phase=phase,
@@ -426,26 +685,190 @@ def plan_objective(
                         entity_id=objective_id,
                         display_name=f"Plan {objective_id}",
                         assigned_role=f"objectives.{objective_id}.objective-manager",
-                        base_prompt_metadata=objective_prompt,
-                        base_execution_prompt=objective_execution_prompt,
-                        output_schema_name="objective-outline.v1",
+                        prompt_metadata=objective_prompt,
+                        execution_prompt=objective_execution_prompt,
+                        output_schema_name="objective-outline.response.v1",
                         output_prefix=f"{phase}-{objective_id}",
                         failure_label=f"objective {objective_id}",
                         sandbox_mode=sandbox_mode,
                         codex_path=codex_path,
                         timeout_seconds=timeout_seconds,
                         planning_limiter=planning_limiter,
-                        previous_payload=objective_result["payload"],
-                        validation_error=str(exc),
-                        normalize_payload=lambda repair_payload: normalize_objective_outline(
+                    )
+                    try:
+                        outline, identity_adjustments = normalize_objective_outline(
                             project_root,
-                            repair_payload,
+                            objective_result["payload"],
                             run_id=run_id,
                             phase=phase,
                             objective=objective,
-                        ),
-                        repair_context=repair_context,
+                        )
+                        validate_scope_override_coverage_for_objective_outline(
+                            project_root,
+                            run_id,
+                            phase,
+                            objective_id,
+                            outline,
+                        )
+                    except MANAGER_FIXABLE_PLANNING_ERROR_TYPES as exc:
+                        objective_result, outline, identity_adjustments = repair_invalid_planning_response(
+                            project_root,
+                            run_id,
+                            phase=phase,
+                            activity_id=plan_activity_id(phase, objective_id),
+                            kind="objective_plan",
+                            entity_id=objective_id,
+                            display_name=f"Plan {objective_id}",
+                            assigned_role=f"objectives.{objective_id}.objective-manager",
+                            base_prompt_metadata=objective_prompt,
+                            base_execution_prompt=objective_execution_prompt,
+                            output_schema_name="objective-outline.response.v1",
+                            display_schema_name="objective-outline.v1",
+                            output_prefix=f"{phase}-{objective_id}",
+                            failure_label=f"objective {objective_id}",
+                            sandbox_mode=sandbox_mode,
+                            codex_path=codex_path,
+                            timeout_seconds=timeout_seconds,
+                            planning_limiter=planning_limiter,
+                            previous_payload=objective_result["payload"],
+                            validation_error=str(exc),
+                            normalize_payload=lambda repair_payload: _normalize_and_validate_objective_outline(
+                                project_root,
+                                run_id,
+                                phase,
+                                objective_id,
+                                objective,
+                                repair_payload,
+                            ),
+                            repair_context=repair_context,
+                        )
+                except BaseException as exc:
+                    mark_objective_planning_failed(
+                        project_root,
+                        run_id,
+                        phase=phase,
+                        objective_id=objective_id,
+                        assigned_role=f"objectives.{objective_id}.objective-manager",
+                        message=str(exc),
+                        reason="objective_planning_failed",
                     )
+                    raise
+                objective_result["identity_adjustments"].update(identity_adjustments)
+                write_json(outline_path, outline)
+            else:
+                objective_result["recovery_action"] = (
+                    "reused_valid_outline_for_release_repair" if reuse_outline_for_repair else "reused_valid_outline"
+                )
+                if reuse_outline_for_repair:
+                    write_json(outline_path, outline)
+                    record_event(
+                        project_root,
+                        run_id,
+                        phase=phase,
+                        activity_id=plan_activity_id(phase, objective_id),
+                        event_type="planning.reuse_outline",
+                        message=f"Reused existing outline for objective {objective_id} during polish release repair.",
+                        payload={"objective_id": objective_id},
+                    )
+            try:
+                capability_summaries, capability_plans = plan_capabilities_for_objective(
+                    project_root,
+                    run_id,
+                    objective_id,
+                    outline["capability_lanes"],
+                    objective_outline=outline,
+                    replace=replace,
+                    sandbox_mode=sandbox_mode,
+                    codex_path=codex_path,
+                    timeout_seconds=timeout_seconds,
+                    max_concurrency=max_concurrency,
+                    planning_limiter=planning_limiter,
+                    repair_context=repair_context,
+                )
+                post_validation_capability_repairs: set[str] = set()
+                objective_post_validation_repaired = False
+                while True:
+                    try:
+                        plan = aggregate_capability_plans(
+                            project_root,
+                            run_id,
+                            phase,
+                            objective_id,
+                            outline,
+                            capability_plans,
+                        )
+                        planning_mode = "capability_managed"
+                        if fast_path_used:
+                            planning_mode = "single_capability_fast_path"
+
+                        validate_objective_plan_contents(project_root, plan, objective)
+                        validate_planned_task_inputs(project_root, run_id, plan["phase"], plan["objective_id"], plan["tasks"])
+                        materialize_objective_plan(project_root, run_id, plan, replace=replace)
+                        break
+                    except MANAGER_FIXABLE_PLANNING_ERROR_TYPES as exc:
+                        task_id = extract_task_id_from_planning_error(str(exc))
+                        capability = capability_for_task_id(capability_plans, task_id) if task_id else None
+                        if capability and capability not in post_validation_capability_repairs:
+                            repaired_summary, repaired_plan = repair_capability_plan_after_validation_error(
+                                project_root,
+                                run_id,
+                                phase=phase,
+                                objective_id=objective_id,
+                                capability=capability,
+                                objective_outline=outline,
+                                objective=objective,
+                                capability_plans=capability_plans,
+                                validation_error=str(exc),
+                                sandbox_mode=sandbox_mode,
+                                codex_path=codex_path,
+                                timeout_seconds=timeout_seconds,
+                                planning_limiter=planning_limiter,
+                            )
+                            capability_summaries = [
+                                repaired_summary if summary.get("capability") == capability else summary
+                                for summary in capability_summaries
+                            ]
+                            capability_plans = [
+                                repaired_plan if str(plan_item.get("capability")) == capability else plan_item
+                                for plan_item in capability_plans
+                            ]
+                            post_validation_capability_repairs.add(capability)
+                            if not objective_result.get("recovery_action"):
+                                objective_result["recovery_action"] = "planning_repair"
+                            continue
+                        if not objective_post_validation_repaired:
+                            objective_result, outline, identity_adjustments = repair_objective_outline_after_validation_error(
+                                project_root,
+                                run_id,
+                                phase=phase,
+                                objective_id=objective_id,
+                                objective=objective,
+                                validation_error=str(exc),
+                                sandbox_mode=sandbox_mode,
+                                codex_path=codex_path,
+                                timeout_seconds=timeout_seconds,
+                                planning_limiter=planning_limiter,
+                            )
+                            objective_result["identity_adjustments"].update(identity_adjustments)
+                            write_json(outline_path, outline)
+                            capability_summaries, capability_plans = plan_capabilities_for_objective(
+                                project_root,
+                                run_id,
+                                objective_id,
+                                outline["capability_lanes"],
+                                objective_outline=outline,
+                                replace=True,
+                                sandbox_mode=sandbox_mode,
+                                codex_path=codex_path,
+                                timeout_seconds=timeout_seconds,
+                                max_concurrency=max_concurrency,
+                                planning_limiter=planning_limiter,
+                                repair_context=build_post_validation_repair_context("post-aggregation-objective-validation", str(exc)),
+                            )
+                            objective_post_validation_repaired = True
+                            post_validation_capability_repairs.clear()
+                            continue
+                        raise
             except BaseException as exc:
                 mark_objective_planning_failed(
                     project_root,
@@ -454,136 +877,9 @@ def plan_objective(
                     objective_id=objective_id,
                     assigned_role=f"objectives.{objective_id}.objective-manager",
                     message=str(exc),
-                    reason="objective_planning_failed",
+                    reason="capability_planning_failed" if outline is not None else "objective_planning_failed",
                 )
                 raise
-            objective_result["identity_adjustments"].update(identity_adjustments)
-            write_json(outline_path, outline)
-        else:
-            objective_result["recovery_action"] = (
-                "reused_valid_outline_for_release_repair" if reuse_outline_for_repair else "reused_valid_outline"
-            )
-            if reuse_outline_for_repair:
-                write_json(outline_path, outline)
-                record_event(
-                    project_root,
-                    run_id,
-                    phase=phase,
-                    activity_id=plan_activity_id(phase, objective_id),
-                    event_type="planning.reuse_outline",
-                    message=f"Reused existing outline for objective {objective_id} during polish release repair.",
-                    payload={"objective_id": objective_id},
-                )
-        try:
-            capability_summaries, capability_plans = plan_capabilities_for_objective(
-                project_root,
-                run_id,
-                objective_id,
-                outline["capability_lanes"],
-                objective_outline=outline,
-                replace=replace,
-                sandbox_mode=sandbox_mode,
-                codex_path=codex_path,
-                timeout_seconds=timeout_seconds,
-                max_concurrency=max_concurrency,
-                planning_limiter=planning_limiter,
-                repair_context=repair_context,
-            )
-            post_validation_capability_repairs: set[str] = set()
-            objective_post_validation_repaired = False
-            while True:
-                try:
-                    plan = aggregate_capability_plans(
-                        project_root,
-                        run_id,
-                        phase,
-                        objective_id,
-                        outline,
-                        capability_plans,
-                    )
-                    planning_mode = "capability_managed"
-                    if fast_path_used:
-                        planning_mode = "single_capability_fast_path"
-
-                    validate_objective_plan_contents(project_root, plan, objective)
-                    validate_planned_task_inputs(project_root, run_id, plan["phase"], plan["objective_id"], plan["tasks"])
-                    materialize_objective_plan(project_root, run_id, plan, replace=replace)
-                    break
-                except ExecutorError as exc:
-                    task_id = extract_task_id_from_planning_error(str(exc))
-                    capability = capability_for_task_id(capability_plans, task_id) if task_id else None
-                    if capability and capability not in post_validation_capability_repairs:
-                        repaired_summary, repaired_plan = repair_capability_plan_after_validation_error(
-                            project_root,
-                            run_id,
-                            phase=phase,
-                            objective_id=objective_id,
-                            capability=capability,
-                            objective_outline=outline,
-                            objective=objective,
-                            capability_plans=capability_plans,
-                            validation_error=str(exc),
-                            sandbox_mode=sandbox_mode,
-                            codex_path=codex_path,
-                            timeout_seconds=timeout_seconds,
-                            planning_limiter=planning_limiter,
-                        )
-                        capability_summaries = [
-                            repaired_summary if summary.get("capability") == capability else summary
-                            for summary in capability_summaries
-                        ]
-                        capability_plans = [
-                            repaired_plan if str(plan_item.get("capability")) == capability else plan_item
-                            for plan_item in capability_plans
-                        ]
-                        post_validation_capability_repairs.add(capability)
-                        if not objective_result.get("recovery_action"):
-                            objective_result["recovery_action"] = "planning_repair"
-                        continue
-                    if not objective_post_validation_repaired:
-                        objective_result, outline, identity_adjustments = repair_objective_outline_after_validation_error(
-                            project_root,
-                            run_id,
-                            phase=phase,
-                            objective_id=objective_id,
-                            objective=objective,
-                            validation_error=str(exc),
-                            sandbox_mode=sandbox_mode,
-                            codex_path=codex_path,
-                            timeout_seconds=timeout_seconds,
-                            planning_limiter=planning_limiter,
-                        )
-                        objective_result["identity_adjustments"].update(identity_adjustments)
-                        write_json(outline_path, outline)
-                        capability_summaries, capability_plans = plan_capabilities_for_objective(
-                            project_root,
-                            run_id,
-                            objective_id,
-                            outline["capability_lanes"],
-                            objective_outline=outline,
-                            replace=True,
-                            sandbox_mode=sandbox_mode,
-                            codex_path=codex_path,
-                            timeout_seconds=timeout_seconds,
-                            max_concurrency=max_concurrency,
-                            planning_limiter=planning_limiter,
-                            repair_context=build_post_validation_repair_context("post-aggregation-objective-validation", str(exc)),
-                        )
-                        objective_post_validation_repaired = True
-                        post_validation_capability_repairs.clear()
-                        continue
-                    raise
-        except BaseException as exc:
-            mark_objective_planning_failed(
-                project_root,
-                run_id,
-                phase=phase,
-                objective_id=objective_id,
-                assigned_role=f"objectives.{objective_id}.objective-manager",
-                message=str(exc),
-                reason="capability_planning_failed" if outline is not None else "objective_planning_failed",
-            )
-            raise
 
     summary_recovery_action = objective_result["recovery_action"]
     if not summary_recovery_action:
@@ -632,6 +928,8 @@ def plan_objective(
         status=activity_status,
         progress_stage=activity_status,
         current_activity=plan["summary"],
+        stdout_path=objective_result["stdout_path"],
+        stderr_path=objective_result["stderr_path"],
         output_path=f"runs/{run_id}/manager-plans/{phase}-{objective_id}.json",
         process_metadata=None,
         recovered_at=now_timestamp() if activity_status == "recovered" else None,
@@ -705,59 +1003,216 @@ def plan_phase(
     run_dir = project_root / "runs" / run_id
     phase = read_json(run_dir / "phase-plan.json")["current_phase"]
     objective_map = read_json(run_dir / "objective-map.json")
-    planning_limiter = PlanningLimiter(max_concurrency)
-    summaries = []
     objective_ids = [objective["objective_id"] for objective in objective_map["objectives"]]
-    if max_concurrency <= 1 or len(objective_ids) <= 1:
-        for objective_id in objective_ids:
-            summaries.append(
-                plan_objective(
-                    project_root,
-                    run_id,
-                    objective_id,
-                    sandbox_mode=sandbox_mode,
-                    codex_path=codex_path,
-                    replace=replace,
-                    timeout_seconds=timeout_seconds,
-                    max_concurrency=max_concurrency,
-                    skip_reconcile=True,
-                    planning_limiter=planning_limiter,
-                    refresh_phase_summary=False,
-                )
+    objective_parallelism = max(1, min(max_concurrency, len(objective_ids))) if objective_ids else 1
+    initialize_phase_objective_queue(
+        project_root,
+        run_id,
+        phase=phase,
+        objective_ids=objective_ids,
+    )
+    summaries_by_objective: dict[str, dict[str, Any]] = {}
+    running: dict[Any, str] = {}
+    pending_objective_ids = list(objective_ids)
+    first_error: BaseException | None = None
+
+    with ThreadPoolExecutor(max_workers=objective_parallelism) as pool:
+        while pending_objective_ids and len(running) < objective_parallelism and first_error is None:
+            objective_id = pending_objective_ids.pop(0)
+            refresh_phase_objective_queue_positions(
+                project_root,
+                run_id,
+                phase=phase,
+                queued_objective_ids=pending_objective_ids,
             )
-    else:
-        summaries_by_objective: dict[str, dict[str, Any]] = {}
-        first_error: BaseException | None = None
-        with ThreadPoolExecutor(max_workers=min(len(objective_ids), max_concurrency)) as pool:
-            futures = {
-                pool.submit(
-                    plan_objective,
-                    project_root,
-                    run_id,
-                    objective_id,
-                    sandbox_mode=sandbox_mode,
-                    codex_path=codex_path,
-                    replace=replace,
-                    timeout_seconds=timeout_seconds,
-                    max_concurrency=max_concurrency,
-                    skip_reconcile=True,
-                    planning_limiter=planning_limiter,
-                    refresh_phase_summary=False,
-                ): objective_id
-                for objective_id in objective_ids
-            }
-            for future in as_completed(futures):
-                objective_id = futures[future]
+            future = submit_phase_objective_planning(
+                pool,
+                project_root,
+                run_id,
+                objective_id,
+                phase=phase,
+                sandbox_mode=sandbox_mode,
+                codex_path=codex_path,
+                replace=replace,
+                timeout_seconds=timeout_seconds,
+            )
+            running[future] = objective_id
+        refresh_phase_objective_queue_positions(
+            project_root,
+            run_id,
+            phase=phase,
+            queued_objective_ids=pending_objective_ids,
+        )
+
+        while running:
+            done, _ = wait(tuple(running.keys()), return_when=FIRST_COMPLETED)
+            for future in done:
+                objective_id = running.pop(future)
                 try:
                     summaries_by_objective[objective_id] = future.result()
                 except BaseException as exc:  # pragma: no cover - exercised in failure tests via raise below
                     if first_error is None:
                         first_error = exc
-        if first_error is not None:
-            raise first_error
-        summaries = [summaries_by_objective[objective_id] for objective_id in objective_ids]
+            while pending_objective_ids and len(running) < objective_parallelism and first_error is None:
+                objective_id = pending_objective_ids.pop(0)
+                refresh_phase_objective_queue_positions(
+                    project_root,
+                    run_id,
+                    phase=phase,
+                    queued_objective_ids=pending_objective_ids,
+                )
+                future = submit_phase_objective_planning(
+                    pool,
+                    project_root,
+                    run_id,
+                    objective_id,
+                    phase=phase,
+                    sandbox_mode=sandbox_mode,
+                    codex_path=codex_path,
+                    replace=replace,
+                    timeout_seconds=timeout_seconds,
+                )
+                running[future] = objective_id
+            refresh_phase_objective_queue_positions(
+                project_root,
+                run_id,
+                phase=phase,
+                queued_objective_ids=pending_objective_ids,
+            )
+
+    if first_error is not None:
+        mark_phase_objectives_abandoned(
+            project_root,
+            run_id,
+            phase=phase,
+            objective_ids=pending_objective_ids,
+            reason="phase_planning_aborted",
+            message="Objective planning was not started because an earlier objective planning failure aborted the phase scheduler.",
+        )
+        raise first_error
+
     payload = write_phase_plan_summary(project_root, run_id, phase, max_concurrency=max_concurrency)
     return payload
+
+
+def initialize_phase_objective_queue(
+    project_root: Path,
+    run_id: str,
+    *,
+    phase: str,
+    objective_ids: list[str],
+) -> None:
+    for position, objective_id in enumerate(objective_ids, start=1):
+        ensure_activity(
+            project_root,
+            run_id,
+            activity_id=plan_activity_id(phase, objective_id),
+            kind="objective_plan",
+            entity_id=objective_id,
+            phase=phase,
+            objective_id=objective_id,
+            display_name=f"Plan {objective_id}",
+            assigned_role=f"objectives.{objective_id}.objective-manager",
+            status="queued",
+            progress_stage="queued",
+            queue_position=position,
+            current_activity="Waiting for objective planning slot.",
+        )
+
+
+def refresh_phase_objective_queue_positions(
+    project_root: Path,
+    run_id: str,
+    *,
+    phase: str,
+    queued_objective_ids: list[str],
+) -> None:
+    for position, objective_id in enumerate(queued_objective_ids, start=1):
+        update_activity(
+            project_root,
+            run_id,
+            plan_activity_id(phase, objective_id),
+            status="queued",
+            progress_stage="queued",
+            queue_position=position,
+            current_activity="Waiting for objective planning slot.",
+            status_reason=None,
+        )
+
+
+def submit_phase_objective_planning(
+    pool: ThreadPoolExecutor,
+    project_root: Path,
+    run_id: str,
+    objective_id: str,
+    *,
+    phase: str,
+    sandbox_mode: str,
+    codex_path: str,
+    replace: bool,
+    timeout_seconds: int | None,
+):
+    update_activity(
+        project_root,
+        run_id,
+        plan_activity_id(phase, objective_id),
+        status="running",
+        progress_stage="running",
+        queue_position=None,
+        current_activity="Objective planning workflow started.",
+        status_reason=None,
+    )
+    record_event(
+        project_root,
+        run_id,
+        phase=phase,
+        activity_id=plan_activity_id(phase, objective_id),
+        event_type="planning.slot_acquired",
+        message=f"Objective {objective_id} acquired a phase planning slot.",
+        payload={"objective_id": objective_id},
+    )
+    return pool.submit(
+        plan_objective,
+        project_root,
+        run_id,
+        objective_id,
+        sandbox_mode=sandbox_mode,
+        codex_path=codex_path,
+        replace=replace,
+        timeout_seconds=timeout_seconds,
+        max_concurrency=1,
+        skip_reconcile=True,
+        planning_limiter=PlanningLimiter(1),
+        refresh_phase_summary=False,
+    )
+
+
+def mark_phase_objectives_abandoned(
+    project_root: Path,
+    run_id: str,
+    *,
+    phase: str,
+    objective_ids: list[str],
+    reason: str,
+    message: str,
+) -> None:
+    for objective_id in objective_ids:
+        ensure_activity(
+            project_root,
+            run_id,
+            activity_id=plan_activity_id(phase, objective_id),
+            kind="objective_plan",
+            entity_id=objective_id,
+            phase=phase,
+            objective_id=objective_id,
+            display_name=f"Plan {objective_id}",
+            assigned_role=f"objectives.{objective_id}.objective-manager",
+            status="abandoned",
+            progress_stage="abandoned",
+            queue_position=None,
+            current_activity=message,
+            status_reason=reason,
+        )
 
 
 def plan_capabilities_for_objective(
@@ -861,25 +1316,101 @@ def plan_capability(
         "attempt": 1,
         "recovery_action": None,
     }
-    plan_path = run_dir / "manager-plans" / f"{phase}-{objective_id}-{capability}.json"
-    last_message_path = run_dir / "manager-plans" / f"{phase}-{objective_id}-{capability}.last-message.json"
+    plans_dir = run_dir / "manager-plans"
+    output_prefix = f"{phase}-{objective_id}-{capability}"
+    plan_path = plans_dir / f"{output_prefix}.json"
     plan = None if replace else load_valid_document(project_root, plan_path, "capability-plan.v1")
     if plan is None:
-        recovered_last_message = None if replace else load_valid_document(project_root, last_message_path, "capability-plan.v1")
-        if recovered_last_message is not None:
-            plan, identity_adjustments = normalize_capability_plan(
+        recovered_last_message = None
+        recovered_last_message_source = None
+        if not replace:
+            recovered_last_message, recovered_last_message_source = load_latest_valid_planning_last_message(
                 project_root,
-                recovered_last_message,
-                run_id=run_id,
-                phase=phase,
-                objective_id=objective_id,
-                capability=capability,
-                objective_outline=objective_outline,
-                default_sandbox_mode=sandbox_mode,
+                plans_dir,
+                output_prefix=output_prefix,
+                schema_name="capability-plan.v1",
             )
-            result["identity_adjustments"].update(identity_adjustments)
-            result["recovery_action"] = "reused_last_message_capability_plan"
-            write_json(plan_path, plan)
+        if recovered_last_message is not None:
+            try:
+                plan, identity_adjustments = _normalize_and_validate_capability_plan(
+                    project_root,
+                    run_id,
+                    phase,
+                    objective_id,
+                    capability,
+                    objective_outline,
+                    sandbox_mode,
+                    recovered_last_message,
+                )
+                result["identity_adjustments"].update(identity_adjustments)
+                result["recovery_action"] = (
+                    "reused_repaired_last_message_capability_plan"
+                    if recovered_last_message_source == "repair"
+                    else "reused_last_message_capability_plan"
+                )
+                write_json(plan_path, plan)
+                update_run_file_graph_capability_plan(
+                    run_dir,
+                    phase=phase,
+                    objective_id=objective_id,
+                    capability=capability,
+                    plan=plan,
+                )
+            except MANAGER_FIXABLE_PLANNING_ERROR_TYPES as exc:
+                prompt_metadata = render_capability_planning_prompt(
+                    project_root,
+                    run_id,
+                    objective_id,
+                    capability,
+                    objective_outline,
+                    ignore_existing_phase_tasks=replace,
+                    repair_context=repair_context,
+                )
+                execution_prompt = build_capability_planning_prompt(
+                    (project_root / prompt_metadata["prompt_path"]).read_text(encoding="utf-8")
+                )
+                result, plan, identity_adjustments = repair_invalid_planning_response(
+                    project_root,
+                    run_id,
+                    phase=phase,
+                    activity_id=capability_plan_activity_id(phase, objective_id, capability),
+                    kind="capability_plan",
+                    entity_id=f"{objective_id}:{capability}",
+                    display_name=f"Plan {objective_id}:{capability}",
+                    assigned_role=resolve_capability_manager_role(objective_outline, capability),
+                    base_prompt_metadata=prompt_metadata,
+                    base_execution_prompt=execution_prompt,
+                    output_schema_name="capability-plan.response.v1",
+                    display_schema_name="capability-plan.v1",
+                    output_prefix=output_prefix,
+                    failure_label=f"{objective_id}:{capability}",
+                    sandbox_mode=sandbox_mode,
+                    codex_path=codex_path,
+                    timeout_seconds=timeout_seconds,
+                    planning_limiter=planning_limiter,
+                    previous_payload=recovered_last_message,
+                    validation_error=str(exc),
+                    normalize_payload=lambda repair_payload: _normalize_and_validate_capability_plan(
+                        project_root,
+                        run_id,
+                        phase,
+                        objective_id,
+                        capability,
+                        objective_outline,
+                        sandbox_mode,
+                        repair_payload,
+                    ),
+                    repair_context=repair_context,
+                )
+                result["identity_adjustments"].update(identity_adjustments)
+                write_json(plan_path, plan)
+                update_run_file_graph_capability_plan(
+                    run_dir,
+                    phase=phase,
+                    objective_id=objective_id,
+                    capability=capability,
+                    plan=plan,
+                )
         else:
             prompt_metadata = None
             execution_prompt = ""
@@ -910,8 +1441,8 @@ def plan_capability(
                         assigned_role=resolve_capability_manager_role(objective_outline, capability),
                         prompt_metadata=prompt_metadata,
                         execution_prompt=execution_prompt,
-                        output_schema_name="capability-plan.v1",
-                        output_prefix=f"{phase}-{objective_id}-{capability}",
+                        output_schema_name="capability-plan.response.v1",
+                        output_prefix=output_prefix,
                         failure_label=f"{objective_id}:{capability}",
                         sandbox_mode=sandbox_mode,
                         codex_path=codex_path,
@@ -948,17 +1479,17 @@ def plan_capability(
                         continue
                     raise
             try:
-                plan, identity_adjustments = normalize_capability_plan(
+                plan, identity_adjustments = _normalize_and_validate_capability_plan(
                     project_root,
+                    run_id,
+                    phase,
+                    objective_id,
+                    capability,
+                    objective_outline,
+                    sandbox_mode,
                     result["payload"],
-                    run_id=run_id,
-                    phase=phase,
-                    objective_id=objective_id,
-                    capability=capability,
-                    objective_outline=objective_outline,
-                    default_sandbox_mode=sandbox_mode,
                 )
-            except ExecutorError as exc:
+            except MANAGER_FIXABLE_PLANNING_ERROR_TYPES as exc:
                 result, plan, identity_adjustments = repair_invalid_planning_response(
                     project_root,
                     run_id,
@@ -970,8 +1501,9 @@ def plan_capability(
                     assigned_role=resolve_capability_manager_role(objective_outline, capability),
                     base_prompt_metadata=prompt_metadata,
                     base_execution_prompt=execution_prompt,
-                    output_schema_name="capability-plan.v1",
-                    output_prefix=f"{phase}-{objective_id}-{capability}",
+                    output_schema_name="capability-plan.response.v1",
+                    display_schema_name="capability-plan.v1",
+                    output_prefix=output_prefix,
                     failure_label=f"{objective_id}:{capability}",
                     sandbox_mode=sandbox_mode,
                     codex_path=codex_path,
@@ -979,20 +1511,27 @@ def plan_capability(
                     planning_limiter=planning_limiter,
                     previous_payload=result["payload"],
                     validation_error=str(exc),
-                    normalize_payload=lambda repair_payload: normalize_capability_plan(
+                    normalize_payload=lambda repair_payload: _normalize_and_validate_capability_plan(
                         project_root,
+                        run_id,
+                        phase,
+                        objective_id,
+                        capability,
+                        objective_outline,
+                        sandbox_mode,
                         repair_payload,
-                        run_id=run_id,
-                        phase=phase,
-                        objective_id=objective_id,
-                        capability=capability,
-                        objective_outline=objective_outline,
-                        default_sandbox_mode=sandbox_mode,
                     ),
                     repair_context=repair_context,
                 )
             result["identity_adjustments"].update(identity_adjustments)
             write_json(plan_path, plan)
+            update_run_file_graph_capability_plan(
+                run_dir,
+                phase=phase,
+                objective_id=objective_id,
+                capability=capability,
+                plan=plan,
+            )
     else:
         plan, identity_adjustments = normalize_capability_plan(
             project_root,
@@ -1007,6 +1546,13 @@ def plan_capability(
         result["identity_adjustments"].update(identity_adjustments)
         result["recovery_action"] = "reused_valid_capability_plan"
         write_json(plan_path, plan)
+        update_run_file_graph_capability_plan(
+            run_dir,
+            phase=phase,
+            objective_id=objective_id,
+            capability=capability,
+            plan=plan,
+        )
     summary = {
         "run_id": run_id,
         "phase": phase,
@@ -1040,6 +1586,8 @@ def plan_capability(
         status=activity_status,
         progress_stage=activity_status,
         current_activity=plan["summary"],
+        stdout_path=result["stdout_path"],
+        stderr_path=result["stderr_path"],
         output_path=f"runs/{run_id}/manager-plans/{phase}-{objective_id}-{capability}.json",
         process_metadata=None,
         recovered_at=now_timestamp() if activity_status == "recovered" else None,
@@ -1085,11 +1633,7 @@ def execute_planning_activity(
     plans_dir = ensure_dir(run_dir / "manager-plans")
     output_schema_path = project_root / "orchestrator" / "schemas" / f"{output_schema_name}.json"
     last_message_path = plans_dir / f"{output_prefix}.last-message.json"
-    stdout_path = plans_dir / f"{output_prefix}.stdout.jsonl"
-    stderr_path = plans_dir / f"{output_prefix}.stderr.log"
     output_path = plans_dir / f"{output_prefix}.json"
-    clear_text(stdout_path)
-    clear_text(stderr_path)
     command = build_codex_command(
         codex_path=codex_path,
         working_directory=project_root,
@@ -1105,6 +1649,11 @@ def execute_planning_activity(
         reason="Starting a new planning attempt.",
     )
     attempt = (int(previous_activity.get("attempt", 1)) + 1) if previous_activity is not None else 1
+    stream_attempt = 1
+    stdout_path = plans_dir / planning_attempt_stream_name(output_prefix, stream_attempt, "stdout.jsonl")
+    stderr_path = plans_dir / planning_attempt_stream_name(output_prefix, stream_attempt, "stderr.log")
+    clear_text(stdout_path)
+    clear_text(stderr_path)
     timeout_policy = resolve_planning_timeout_policy(phase, timeout_seconds)
     prompt_observability = prompt_metrics(execution_prompt)
     activity_state = ensure_activity(
@@ -1129,6 +1678,22 @@ def execute_planning_activity(
         attempt=attempt,
         begin_attempt=previous_activity is not None,
     )
+
+    def rotate_stream_paths(next_stream_attempt: int) -> None:
+        nonlocal stream_attempt, stdout_path, stderr_path
+        stream_attempt = next_stream_attempt
+        stdout_path = plans_dir / planning_attempt_stream_name(output_prefix, stream_attempt, "stdout.jsonl")
+        stderr_path = plans_dir / planning_attempt_stream_name(output_prefix, stream_attempt, "stderr.log")
+        clear_text(stdout_path)
+        clear_text(stderr_path)
+        update_activity(
+            project_root,
+            run_id,
+            activity_id,
+            stdout_path=str(stdout_path.relative_to(project_root)),
+            stderr_path=str(stderr_path.relative_to(project_root)),
+        )
+
     record_event(
         project_root,
         run_id,
@@ -1267,7 +1832,7 @@ def execute_planning_activity(
                         command,
                         prompt=execution_prompt,
                         cwd=project_root,
-                        env=build_exec_environment(),
+                        env=build_exec_environment(project_root / "runs" / run_id / activity_id),
                         timeout_seconds=timeout_policy.timeout_seconds,
                         on_stdout_line=on_stdout_line,
                         on_stderr_line=on_stderr_line,
@@ -1373,6 +1938,7 @@ def execute_planning_activity(
                                 "max_attempts": total_attempts,
                             },
                         )
+                        rotate_stream_paths(stream_attempt + 1)
                         continue
                     failure_message = (
                         f"Planning activity for {failure_label} stalled after {exc.stall_seconds} seconds "
@@ -1486,6 +2052,7 @@ def execute_planning_activity(
                                 "max_attempts": total_attempts,
                             },
                         )
+                        rotate_stream_paths(stream_attempt + 1)
                         continue
                     failure_message = timeout_final_message(
                         "planning",
@@ -1619,6 +2186,7 @@ def execute_planning_activity(
                             "max_attempts": MAX_MANAGER_PLANNING_MISSING_FINAL_MESSAGE_RETRIES + 1,
                         },
                     )
+                    rotate_stream_paths(stream_attempt + 1)
                     continue
                 update_activity(
                     project_root,
@@ -1652,6 +2220,8 @@ def execute_planning_activity(
                 process_metadata=None,
             )
             raise ExecutorError(f"Planning response was not valid JSON: {final_response}") from exc
+        payload = strip_planner_managed_fields(payload)
+        write_json(last_message_path, payload)
     finally:
         planning_limiter.release()
 
@@ -1679,27 +2249,67 @@ def build_planning_repair_prompt(
     base_execution_prompt: str,
     *,
     output_schema_name: str,
+    display_schema_name: str | None,
     previous_payload: dict[str, Any],
     validation_error: str,
     repair_context: dict[str, Any] | None = None,
 ) -> str:
+    rendered_schema_name = str(display_schema_name or output_schema_name)
     relevant_payload = planning_repair_payload_slice(
         previous_payload,
         validation_error=validation_error,
         repair_context=repair_context,
     )
-    return (
-        base_execution_prompt
-        + "\n\n# Planning Repair\n\n"
-        + f"Your previous JSON response failed deterministic validation for schema `{output_schema_name}`.\n"
-        + "Return one corrected JSON object only. Do not explain the fix.\n"
-        + "Preserve valid content unless a change is required to satisfy the validation error.\n\n"
-        + "Validation error:\n"
-        + f"{validation_error}\n\n"
-        + "Previous relevant JSON slice:\n```json\n"
-        + json.dumps(relevant_payload, indent=2, sort_keys=True)
-        + "\n```\n"
+    repair_header = [
+        "# Repair Assignment",
+        "",
+        "You are repairing a previously returned planning response.",
+        "The previous response was not accepted because it failed deterministic validation.",
+        "",
+        f"Your job in this turn is to redo the same planning turn while correcting the invalid parts of the previous response.",
+        "Preserve as much of the previous valid plan as possible.",
+        "Do not broaden scope unless a change is required to make the response valid.",
+        "Do not redesign the plan from scratch unless the validation error makes that unavoidable.",
+        "",
+        f"Return exactly one corrected `{rendered_schema_name}` JSON object.",
+        "Return JSON only.",
+        "",
+        "# What Failed In The Previous Response",
+        "",
+        f"- Schema: `{rendered_schema_name}`",
+        f"- Validation error: {validation_error}",
+    ]
+    rejection_reasons = [
+        str(value).strip()
+        for value in (repair_context or {}).get("rejection_reasons", [])
+        if isinstance(value, str) and str(value).strip()
+    ]
+    if rejection_reasons:
+        repair_header.extend(["", "Additional repair constraints:"])
+        repair_header.extend(f"- {value}" for value in rejection_reasons)
+    repair_header.extend(
+        [
+            "",
+            "# How To Use This Repair Prompt",
+            "",
+            "This repair prompt contains:",
+            "- the previous invalid response slice, which shows the part of the old response that needs correction",
+            "- the planning prompt below, which is still the source of truth for the objective, scope, and response contract",
+            "",
+            "Use the previous invalid response slice to preserve valid content where possible.",
+            "Use the planning prompt below to decide what the corrected response must look like.",
+            "If the previous invalid response conflicts with the planning prompt below, follow the planning prompt below.",
+            "",
+            "# Previous Invalid Response Slice",
+            "",
+            "```json",
+            json.dumps(relevant_payload, indent=2, sort_keys=True),
+            "```",
+            "",
+            "# Planning Prompt To Redo",
+        ]
     )
+    return "\n".join(repair_header) + "\n\n" + base_execution_prompt
 
 
 def write_planning_repair_prompt_metadata(
@@ -1743,6 +2353,7 @@ def repair_invalid_planning_response(
     base_prompt_metadata: dict[str, Any],
     base_execution_prompt: str,
     output_schema_name: str,
+    display_schema_name: str | None,
     output_prefix: str,
     failure_label: str,
     sandbox_mode: str,
@@ -1761,6 +2372,7 @@ def repair_invalid_planning_response(
         repair_prompt = build_planning_repair_prompt(
             base_execution_prompt,
             output_schema_name=output_schema_name,
+            display_schema_name=display_schema_name,
             previous_payload=last_payload,
             validation_error=last_error,
             repair_context=repair_context,
@@ -1805,7 +2417,7 @@ def repair_invalid_planning_response(
             plan, identity_adjustments = normalize_payload(repair_result["payload"])
             if validate_plan is not None:
                 validate_plan(plan)
-        except ExecutorError as exc:
+        except MANAGER_FIXABLE_PLANNING_ERROR_TYPES as exc:
             last_error = str(exc)
             last_payload = repair_result["payload"]
             continue
@@ -1977,7 +2589,8 @@ def repair_capability_plan_after_validation_error(
         assigned_role=resolve_capability_manager_role(objective_outline, capability),
         base_prompt_metadata=prompt_metadata,
         base_execution_prompt=execution_prompt,
-        output_schema_name="capability-plan.v1",
+        output_schema_name="capability-plan.response.v1",
+        display_schema_name="capability-plan.v1",
         output_prefix=f"{phase}-{objective_id}-{capability}",
         failure_label=f"{objective_id}:{capability}",
         sandbox_mode=sandbox_mode,
@@ -2001,6 +2614,13 @@ def repair_capability_plan_after_validation_error(
     result["identity_adjustments"].update(identity_adjustments)
     plan_path = project_root / "runs" / run_id / "manager-plans" / f"{phase}-{objective_id}-{capability}.json"
     write_json(plan_path, repaired_plan)
+    update_run_file_graph_capability_plan(
+        project_root / "runs" / run_id,
+        phase=phase,
+        objective_id=objective_id,
+        capability=capability,
+        plan=repaired_plan,
+    )
     summary = rewrite_capability_summary(
         project_root,
         run_id,
@@ -2049,7 +2669,8 @@ def repair_objective_outline_after_validation_error(
         assigned_role=f"objectives.{objective_id}.objective-manager",
         base_prompt_metadata=prompt_metadata,
         base_execution_prompt=execution_prompt,
-        output_schema_name="objective-outline.v1",
+        output_schema_name="objective-outline.response.v1",
+        display_schema_name="objective-outline.v1",
         output_prefix=f"{phase}-{objective_id}",
         failure_label=f"objective {objective_id}",
         sandbox_mode=sandbox_mode,
@@ -2079,6 +2700,31 @@ def load_valid_document(project_root: Path, path: Path, schema_name: str) -> dic
     return payload
 
 
+def load_latest_valid_planning_last_message(
+    project_root: Path,
+    plans_dir: Path,
+    *,
+    output_prefix: str,
+    schema_name: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    repair_paths: list[tuple[int, Path]] = []
+    repair_pattern = re.compile(rf"^{re.escape(output_prefix)}\.repair-(?P<attempt>\d+)\.last-message\.json$")
+    for path in plans_dir.glob(f"{output_prefix}.repair-*.last-message.json"):
+        match = repair_pattern.match(path.name)
+        if match is None:
+            continue
+        repair_paths.append((int(match.group("attempt")), path))
+    for _attempt, path in sorted(repair_paths, key=lambda item: item[0], reverse=True):
+        payload = load_valid_document(project_root, path, schema_name)
+        if payload is not None:
+            return payload, "repair"
+    base_path = plans_dir / f"{output_prefix}.last-message.json"
+    payload = load_valid_document(project_root, base_path, schema_name)
+    if payload is not None:
+        return payload, "base"
+    return None, None
+
+
 def find_objective(run_dir: Path, objective_id: str) -> dict[str, Any]:
     objective_map = read_json(run_dir / "objective-map.json")
     for objective in objective_map["objectives"]:
@@ -2098,13 +2744,23 @@ def is_polish_release_repair_context(repair_context: dict[str, Any] | None) -> b
     return str(repair_context.get("source") or "").strip() == "polish_release_validation"
 
 
+def is_user_feedback_repair_context(repair_context: dict[str, Any] | None) -> bool:
+    if not isinstance(repair_context, dict):
+        return False
+    return str(repair_context.get("source") or "").strip() == "user_feedback"
+
+
+def is_outline_reuse_repair_context(repair_context: dict[str, Any] | None) -> bool:
+    return is_polish_release_repair_context(repair_context) or is_user_feedback_repair_context(repair_context)
+
+
 def should_reuse_existing_outline_for_repair(
     *,
     replace: bool,
     objective: dict[str, Any],
     repair_context: dict[str, Any] | None,
 ) -> bool:
-    if not replace or not is_polish_release_repair_context(repair_context):
+    if not replace or not is_outline_reuse_repair_context(repair_context):
         return False
     capabilities = [value for value in objective.get("capabilities", []) if isinstance(value, str) and value]
     return len(capabilities) == 1
@@ -2116,7 +2772,7 @@ def should_retry_compact_release_repair(
     *,
     compact_retry_used: bool,
 ) -> bool:
-    if compact_retry_used or not is_polish_release_repair_context(repair_context):
+    if compact_retry_used or not is_outline_reuse_repair_context(repair_context):
         return False
     message = str(exc)
     return "stalled after" in message or "stall_after_" in message
@@ -2137,6 +2793,27 @@ def sanitize_outline_for_release_repair(
     outline: dict[str, Any],
     repair_context: dict[str, Any] | None,
 ) -> dict[str, Any]:
+    if is_user_feedback_repair_context(repair_context):
+        updated = normalize_outline_run_relative_paths_copy(outline, run_id=run_id)
+        existing_file_hints = [
+            str(value).strip()
+            for value in (repair_context or {}).get("existing_file_hints", [])
+            if isinstance(value, str) and str(value).strip()
+        ]
+        if not existing_file_hints:
+            return updated
+        owner_capability = str((repair_context or {}).get("owner_capability") or "").strip()
+        updated_lanes: list[dict[str, Any]] = []
+        for lane in updated.get("capability_lanes", []):
+            lane_copy = dict(lane)
+            lane_capability = str(lane_copy.get("capability") or "").strip()
+            if owner_capability and lane_capability and lane_capability != owner_capability:
+                updated_lanes.append(lane_copy)
+                continue
+            lane_copy["inputs"] = dedupe_strings(list(lane_copy.get("inputs", [])) + existing_file_hints)
+            updated_lanes.append(lane_copy)
+        updated["capability_lanes"] = updated_lanes
+        return updated
     if not is_polish_release_repair_context(repair_context):
         return outline
     phase = str(outline.get("phase") or "polish").strip()
@@ -2170,6 +2847,12 @@ def sanitize_outline_for_release_repair(
         updated_lanes.append(lane_copy)
     updated["capability_lanes"] = updated_lanes
     return updated
+
+
+def normalize_outline_run_relative_paths_copy(payload: dict[str, Any], *, run_id: str) -> dict[str, Any]:
+    copied = json.loads(json.dumps(payload))
+    normalize_outline_run_relative_paths(copied, run_id=run_id)
+    return copied
 
 
 def default_lane_manager_role(project_root: Path, objective_id: str, capability: str) -> str:
@@ -2248,6 +2931,483 @@ def build_single_capability_fast_path_outline(
         "dependency_notes": dependency_notes,
         "collaboration_edges": [],
     }
+
+
+def previous_phases(phase: str) -> list[str]:
+    if phase not in PHASE_SEQUENCE:
+        return []
+    return PHASE_SEQUENCE[: PHASE_SEQUENCE.index(phase)]
+
+
+def collect_prior_phase_task_assignments(
+    run_dir: Path,
+    *,
+    objective_id: str,
+    before_phase: str,
+    capability: str | None = None,
+) -> list[dict[str, Any]]:
+    phases = set(previous_phases(before_phase))
+    tasks: list[dict[str, Any]] = []
+    for path in sorted((run_dir / "tasks").glob("*.json")):
+        payload = read_json(path)
+        if payload.get("objective_id") != objective_id or payload.get("phase") not in phases:
+            continue
+        task_capability = str(payload.get("capability") or "").strip() or None
+        if capability is not None and task_capability not in {capability, None}:
+            continue
+        tasks.append(payload)
+    return tasks
+
+
+def polish_capability_test_root(app_root: Path | None, capability: str) -> Path | None:
+    if app_root is None:
+        return None
+    if capability == "middleware":
+        candidate = app_root / "runtime" / "test"
+    else:
+        candidate = app_root / capability / "test"
+    return candidate if candidate.exists() else None
+
+
+def collect_polish_existing_write_paths(
+    project_root: Path,
+    run_dir: Path,
+    *,
+    objective_id: str,
+    capability: str,
+    phase: str,
+) -> list[str]:
+    write_paths: list[str] = []
+    for task in collect_prior_phase_task_assignments(
+        run_dir,
+        objective_id=objective_id,
+        before_phase=phase,
+        capability=capability,
+    ):
+        candidates = list(task.get("writes_existing_paths", [])) + concrete_expected_output_paths(task)
+        for value in candidates:
+            normalized = str(value).strip()
+            if (
+                not normalized
+                or normalized.startswith("runs/")
+                or "*" in normalized
+                or "?" in normalized
+                or "[" in normalized
+            ):
+                continue
+            candidate_path = project_root / normalized
+            if candidate_path.is_file():
+                write_paths.append(normalized)
+    return dedupe_strings(write_paths)
+
+
+def collect_polish_workspace_write_paths(
+    project_root: Path,
+    *,
+    objective_id: str,
+    capability: str,
+) -> list[str]:
+    app_root = find_objective_app_root(project_root, objective_id)
+    workspace_root = capability_workspace_root(app_root, capability, phase="polish") if app_root is not None else None
+    if workspace_root is None or not workspace_root.exists():
+        return []
+
+    allowed_suffixes = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".json", ".css", ".html", ".sh"}
+    skip_dirs = {"dist", "test", "tests", "coverage", "node_modules", ".git"}
+    write_paths: list[str] = []
+    resolved_project_root = project_root.resolve()
+    for path in sorted(workspace_root.rglob("*")):
+        if not path.is_file():
+            continue
+        relative_parts = path.relative_to(workspace_root).parts
+        if relative_parts and relative_parts[0] in skip_dirs:
+            continue
+        if ".test." in path.name or ".spec." in path.name:
+            continue
+        if path.suffix and path.suffix not in allowed_suffixes:
+            continue
+        try:
+            write_paths.append(str(path.resolve().relative_to(resolved_project_root)))
+        except ValueError:
+            continue
+    return dedupe_strings(write_paths)
+
+
+def sanitize_validation_id(value: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "-", str(value).lower()).strip("-")
+    return normalized or "validation"
+
+
+def relative_path_for_project(project_root: Path, path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(project_root.resolve()))
+    except ValueError:
+        try:
+            return str(path.relative_to(project_root))
+        except ValueError:
+            return str(path)
+
+
+def collect_polish_validation_steps(
+    project_root: Path,
+    run_dir: Path,
+    *,
+    run_id: str,
+    objective_id: str,
+    capability: str,
+    phase: str,
+) -> list[dict[str, str]]:
+    app_root = find_objective_app_root(project_root, objective_id)
+    steps: list[dict[str, str]] = []
+    seen_commands: set[str] = set()
+
+    def add_step(validation_id: str, command: str) -> None:
+        normalized_command = str(command).strip()
+        if not normalized_command or normalized_command in seen_commands:
+            return
+        if classify_polish_validation_command_scope(normalized_command, capability=capability) != "capability":
+            return
+        seen_commands.add(normalized_command)
+        steps.append({"id": sanitize_validation_id(validation_id), "command": normalized_command})
+
+    for task in collect_prior_phase_task_assignments(
+        run_dir,
+        objective_id=objective_id,
+        before_phase=phase,
+        capability=capability,
+    ):
+        for item in task.get("validation", []):
+            if not isinstance(item, dict):
+                continue
+            command = str(item.get("command") or "").strip()
+            if not command:
+                continue
+            validation_id = str(item.get("id") or f"{capability}-validation").strip()
+            add_step(validation_id, command)
+
+    test_root = polish_capability_test_root(app_root, capability)
+    if test_root is not None:
+        test_files = sorted(
+            relative_path_for_project(project_root, path)
+            for path in test_root.rglob("*.test.js")
+            if path.is_file()
+        )
+        if test_files:
+            add_step(
+                f"{capability}-workspace-tests",
+                "node --no-warnings --test " + " ".join(test_files),
+            )
+
+    return steps
+
+
+def classify_polish_validation_command_scope(command: str, *, capability: str) -> str:
+    normalized = " ".join(str(command or "").strip().split())
+    if not normalized:
+        return "unknown"
+    lowered = normalized.lower()
+    if " npm test" in f" {lowered}" or lowered.startswith("npm test") or " ci=1 npm test" in f" {lowered}":
+        return "phase_gate"
+    if "release-readiness" in lowered or "e2e-smoke" in lowered:
+        return "phase_gate"
+
+    touched_capabilities: set[str] = set()
+    if "apps/todo/frontend/" in lowered:
+        touched_capabilities.add("frontend")
+    if "apps/todo/backend/" in lowered:
+        touched_capabilities.add("backend")
+    if "apps/todo/runtime/" in lowered:
+        touched_capabilities.add("middleware")
+    if len(touched_capabilities) > 1:
+        return "phase_gate"
+    if touched_capabilities:
+        return "capability" if capability in touched_capabilities else "cross_capability"
+
+    script_name = extract_polish_npm_script_name(normalized)
+    if not script_name:
+        return "capability"
+    script_lower = script_name.lower()
+    if script_lower == "test" or "release-readiness" in script_lower or "e2e-smoke" in script_lower:
+        return "phase_gate"
+    if "frontend" in script_lower:
+        return "capability" if capability == "frontend" else "cross_capability"
+    if "backend" in script_lower:
+        return "capability" if capability == "backend" else "cross_capability"
+    if "runtime" in script_lower:
+        return "capability" if capability == "middleware" else "cross_capability"
+    if script_lower == "validate:todo-review-evidence":
+        return "capability" if capability == "middleware" else "cross_capability"
+    if script_lower == "build":
+        return "phase_gate"
+    return "capability"
+
+
+def extract_polish_npm_script_name(command: str) -> str | None:
+    normalized = " ".join(str(command or "").strip().split())
+    if not normalized:
+        return None
+    tokens = normalized.split()
+    if tokens and tokens[0] == "timeout" and len(tokens) >= 3:
+        tokens = tokens[2:]
+    while tokens and "=" in tokens[0] and not tokens[0].startswith(("npm", "/")):
+        tokens = tokens[1:]
+    if len(tokens) >= 3 and tokens[0] == "npm" and tokens[1] == "run":
+        return tokens[2]
+    if len(tokens) >= 2 and tokens[0] == "npm" and tokens[1] == "test":
+        return "test"
+    return None
+
+
+def build_deterministic_polish_outline(
+    project_root: Path,
+    *,
+    run_id: str,
+    objective: dict[str, Any],
+) -> dict[str, Any]:
+    objective_id = str(objective["objective_id"])
+    objective_root = find_objective_root(project_root, objective_id)
+    objective_root_rel = str(objective_root.relative_to(project_root))
+    capabilities = [
+        str(value).strip()
+        for value in objective.get("capabilities", [])
+        if isinstance(value, str) and str(value).strip()
+    ] or ["general"]
+    lanes: list[dict[str, Any]] = []
+    for capability in capabilities:
+        summary_output = {
+            "kind": "artifact",
+            "output_id": f"{capability}-polish-summary",
+            "path": f"{objective_root_rel}/polish/{capability}-validation-summary.md",
+            "asset_id": None,
+            "description": None,
+            "evidence": None,
+        }
+        lanes.append(
+            {
+                "capability": capability,
+                "assigned_manager_role": derive_manager_role_for_capability(project_root, objective_id, capability),
+                "objective": f"Polish the existing {capability} implementation, then validate the owned output against the declared polish checklist.",
+                "inputs": [
+                    "Planning Inputs.prior_phase_reports",
+                    "Planning Inputs.prior_phase_artifacts",
+                    "Planning Inputs.validation_environment_hints",
+                ],
+                "expected_outputs": [summary_output],
+                "done_when": [
+                    f"The {capability} polish summary artifact is produced and the owned validation checklist has been executed."
+                ],
+                "depends_on": [],
+                "planning_notes": [
+                    "Polish defaults to deterministic repair-and-validation work instead of fresh decomposition.",
+                    "Reuse established artifact paths and existing owned files; do not invent new product structure.",
+                ],
+                "collaboration_rules": [
+                    f"Stay inside the {capability} boundary for this objective.",
+                    "Treat polish as bounded hardening and verification, not discovery or redesign.",
+                ],
+            }
+        )
+    return {
+        "schema": "objective-outline.v1",
+        "run_id": run_id,
+        "phase": "polish",
+        "objective_id": objective_id,
+        "summary": f"Deterministic polish outline for {objective_summary_text(objective)}.",
+        "capability_lanes": lanes,
+        "dependency_notes": [
+            "Polish reuses accepted earlier-phase artifacts and validations instead of requesting a new capability decomposition turn."
+        ],
+        "collaboration_edges": [],
+    }
+
+
+def build_deterministic_polish_objective_plan(
+    project_root: Path,
+    run_id: str,
+    *,
+    objective: dict[str, Any],
+    outline: dict[str, Any],
+    sandbox_mode: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    run_dir = project_root / "runs" / run_id
+    objective_id = str(objective["objective_id"])
+    objective_root = find_objective_root(project_root, objective_id)
+    objective_root_rel = str(objective_root.relative_to(project_root))
+    app_root = find_objective_app_root(project_root, objective_id)
+    app_root_rel = None
+    if app_root is not None:
+        try:
+            app_root_rel = str(app_root.resolve().relative_to(project_root.resolve()))
+        except ValueError:
+            try:
+                app_root_rel = str(app_root.relative_to(project_root))
+            except ValueError:
+                app_root_rel = str(app_root)
+    capabilities = [
+        str(value).strip()
+        for value in objective.get("capabilities", [])
+        if isinstance(value, str) and str(value).strip()
+    ] or ["general"]
+    tasks: list[dict[str, Any]] = []
+    capability_summaries: list[dict[str, Any]] = []
+
+    for capability in capabilities:
+        working_directory = capability_workspace_root(app_root, capability, phase="polish") if app_root is not None else None
+        working_directory_rel = app_root_rel
+        if isinstance(working_directory, Path) and working_directory.exists():
+            try:
+                working_directory_rel = str(working_directory.resolve().relative_to(project_root.resolve()))
+            except ValueError:
+                try:
+                    working_directory_rel = str(working_directory.relative_to(project_root))
+                except ValueError:
+                    working_directory_rel = str(working_directory)
+        write_paths = collect_polish_existing_write_paths(
+            project_root,
+            run_dir,
+            objective_id=objective_id,
+            capability=capability,
+            phase="polish",
+        )
+        workspace_write_paths = collect_polish_workspace_write_paths(
+            project_root,
+            objective_id=objective_id,
+            capability=capability,
+        )
+        if workspace_write_paths:
+            write_paths = dedupe_strings(write_paths + workspace_write_paths)
+        validation_steps = collect_polish_validation_steps(
+            project_root,
+            run_dir,
+            run_id=run_id,
+            objective_id=objective_id,
+            capability=capability,
+            phase="polish",
+        )
+        implementation_task_id = f"{objective_id}-{capability}-polish-implementation"
+        validation_task_id = f"{objective_id}-{capability}-polish-validation"
+        implementation_output_path = f"{objective_root_rel}/polish/{capability}-implementation-summary.md"
+        validation_output_path = f"{objective_root_rel}/polish/{capability}-validation-summary.md"
+        implementation_owned_paths = dedupe_strings(write_paths + [implementation_output_path])
+        validation_owned_paths = [validation_output_path]
+        implementation_task = {
+            "task_id": implementation_task_id,
+            "capability": capability,
+            "execution_mode": "isolated_write",
+            "parallel_policy": "serialize",
+            "owned_paths": implementation_owned_paths,
+            "writes_existing_paths": write_paths,
+            "shared_asset_ids": capability_shared_asset_hints(objective_id, capability)[:4],
+            "objective": f"Polish the existing {capability} implementation using previously accepted artifacts and keep changes inside the established owned files.",
+            "inputs": [
+                "Planning Inputs.prior_phase_reports",
+                "Planning Inputs.prior_phase_artifacts",
+                "Planning Inputs.validation_environment_hints",
+            ],
+            "expected_outputs": [
+                {
+                    "kind": "artifact",
+                    "output_id": f"{capability}-polish-implementation-summary",
+                    "path": implementation_output_path,
+                    "asset_id": None,
+                    "description": None,
+                    "evidence": None,
+                }
+            ],
+            "done_when": [
+                "Owned implementation files are updated only as needed for polish.",
+                "A concise implementation summary artifact is written.",
+            ],
+            "depends_on": [],
+            "validation": [],
+            "collaboration_rules": [
+                "Reuse established artifact and source paths; do not relocate existing product assets.",
+                "Do not broaden scope beyond previously accepted owned files and declared polish outputs.",
+            ],
+            "working_directory": working_directory_rel,
+            "additional_directories": [],
+            "sandbox_mode": sandbox_mode,
+        }
+        validation_task = {
+            "task_id": validation_task_id,
+            "capability": capability,
+            "execution_mode": "isolated_write",
+            "parallel_policy": "serialize",
+            "owned_paths": validation_owned_paths,
+            "writes_existing_paths": [],
+            "shared_asset_ids": capability_shared_asset_hints(objective_id, capability)[:4],
+            "objective": f"Run the declared {capability} polish validation checklist and summarize the results without redesigning the implementation.",
+            "inputs": [
+                f"Output of {implementation_task_id}",
+                "Planning Inputs.validation_environment_hints",
+                "Planning Inputs.prior_phase_reports",
+            ],
+            "expected_outputs": [
+                {
+                    "kind": "artifact",
+                    "output_id": f"{capability}-polish-summary",
+                    "path": validation_output_path,
+                    "asset_id": None,
+                    "description": None,
+                    "evidence": None,
+                }
+            ],
+            "done_when": [
+                "The capability polish validation checklist is executed.",
+                "A validation summary artifact is written with the latest results.",
+            ],
+            "depends_on": [implementation_task_id],
+            "validation": validation_steps,
+            "collaboration_rules": [
+                "If a validation is blocked by the environment, report it as an environment blocker rather than requesting product replanning.",
+                "Stay within the existing capability boundary and do not invent new cross-capability contracts.",
+            ],
+            "working_directory": working_directory_rel,
+            "additional_directories": [],
+            "sandbox_mode": sandbox_mode,
+        }
+        tasks.extend([implementation_task, validation_task])
+        capability_summaries.append(
+            {
+                "run_id": run_id,
+                "phase": "polish",
+                "objective_id": objective_id,
+                "capability": capability,
+                "thread_id": None,
+                "usage": None,
+                "plan_path": f"runs/{run_id}/manager-plans/polish-{objective_id}-{capability}.json",
+                "task_ids": [implementation_task_id, validation_task_id],
+                "bundle_ids": [f"{objective_id}-{capability}-polish-bundle"],
+                "handoff_ids": [],
+                "stdout_path": None,
+                "stderr_path": None,
+                "last_message_path": None,
+                "identity_adjustments": {},
+                "attempt": 0,
+                "recovery_action": "deterministic_polish_plan",
+            }
+        )
+
+    plan = {
+        "schema": "objective-plan.v1",
+        "run_id": run_id,
+        "phase": "polish",
+        "objective_id": objective_id,
+        "summary": f"Deterministic polish plan for {objective_summary_text(objective)}.",
+        "tasks": tasks,
+        "bundle_plan": [
+            {
+                "bundle_id": f"{objective_id}-polish-bundle",
+                "task_ids": [task["task_id"] for task in tasks],
+                "summary": f"Polish bundle for {objective_summary_text(objective)}.",
+            }
+        ],
+        "dependency_notes": [
+            "Polish reuses earlier-phase owned files and validations; new decomposition is reserved for fallback repair only."
+        ],
+        "collaboration_handoffs": [],
+    }
+    return plan, capability_summaries
 
 
 def build_planning_prompt(prompt_text: str) -> str:
@@ -2394,10 +3554,10 @@ def planning_repair_payload_slice(
         return previous_payload
     schema_name = str(previous_payload.get("schema") or "").strip()
     if schema_name != "capability-plan.v1":
-        return previous_payload
+        return strip_planner_managed_fields(previous_payload)
     task_id = extract_task_id_from_planning_error(validation_error)
     if not task_id:
-        return previous_payload
+        return strip_planner_managed_fields(previous_payload)
     tasks = list(previous_payload.get("tasks") or [])
     task_by_id = {
         str(task.get("task_id") or "").strip(): task
@@ -2405,7 +3565,7 @@ def planning_repair_payload_slice(
         if isinstance(task, dict) and str(task.get("task_id") or "").strip()
     }
     if task_id not in task_by_id:
-        return previous_payload
+        return strip_planner_managed_fields(previous_payload)
     kept_task_ids: set[str] = {task_id}
     queue = [task_id]
     while queue:
@@ -2447,19 +3607,123 @@ def planning_repair_payload_slice(
             "focus_paths": list((repair_context or {}).get("focus_paths", [])),
             "source": str((repair_context or {}).get("source") or ""),
         }
-    return sliced
+    return strip_planner_managed_fields(sliced)
+
+
+def strip_planner_managed_fields(value: Any, *, top_level: bool = True) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: strip_planner_managed_fields(nested, top_level=False)
+            for key, nested in value.items()
+            if key not in {"assigned_role", "assigned_manager_role"}
+            and not (top_level and key in {"run_id", "phase", "objective_id", "capability"})
+        }
+    if isinstance(value, list):
+        return [strip_planner_managed_fields(item, top_level=False) for item in value]
+    return value
 
 
 def normalize_plan_identity(
-    payload: dict[str, Any], *, run_id: str, phase: str, objective_id: str
+    payload: dict[str, Any], *, run_id: str, phase: str, objective_id: str, capability: str | None = None
 ) -> dict[str, dict[str, str]]:
-    if payload["phase"] != phase or payload["objective_id"] != objective_id:
-        raise ExecutorError("Planning output identity does not match the requested objective/phase")
     adjustments: dict[str, dict[str, str]] = {}
-    if payload["run_id"] != run_id:
-        adjustments["run_id"] = {"from": str(payload["run_id"]), "to": run_id}
+    current_run_id = str(payload.get("run_id") or "").strip()
+    current_phase = str(payload.get("phase") or "").strip()
+    current_objective_id = str(payload.get("objective_id") or "").strip()
+    if current_phase and current_phase != phase:
+        raise ExecutorError("Planning output identity does not match the requested objective/phase")
+    if current_objective_id and current_objective_id != objective_id:
+        raise ExecutorError("Planning output identity does not match the requested objective/phase")
+    if current_run_id != run_id:
+        adjustments["run_id"] = {"from": current_run_id, "to": run_id}
         payload["run_id"] = run_id
+    if current_phase != phase:
+        adjustments["phase"] = {"from": current_phase, "to": phase}
+        payload["phase"] = phase
+    if current_objective_id != objective_id:
+        adjustments["objective_id"] = {"from": current_objective_id, "to": objective_id}
+        payload["objective_id"] = objective_id
+    if capability is not None:
+        current_capability = str(payload.get("capability") or "").strip()
+        if current_capability and current_capability != capability:
+            raise ExecutorError(f"Capability plan identity does not match requested capability {capability}")
+        if current_capability != capability:
+            adjustments["capability"] = {"from": current_capability, "to": capability}
+            payload["capability"] = capability
     return adjustments
+
+
+def rewrite_run_relative_path(value: str, run_id: str) -> str:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return normalized
+    match = re.match(r"^runs/[^/]+/(?P<rest>.+)$", normalized)
+    if not match:
+        return normalized
+    return f"runs/{run_id}/{match.group('rest')}"
+
+
+def rewrite_run_relative_text(value: str, run_id: str) -> str:
+    if not isinstance(value, str) or "runs/" not in value:
+        return value
+    return re.sub(r"runs/[^/\s'\"`]+/", f"runs/{run_id}/", value)
+
+
+def normalize_run_relative_output_descriptors(descriptors: list[dict[str, Any]], *, run_id: str) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for descriptor in descriptors:
+        updated = dict(descriptor)
+        path = descriptor_path(updated)
+        if path:
+            updated["path"] = rewrite_run_relative_path(path, run_id)
+        normalized.append(updated)
+    return normalized
+
+
+def normalize_outline_run_relative_paths(payload: dict[str, Any], *, run_id: str) -> None:
+    for lane in payload.get("capability_lanes", []):
+        lane["inputs"] = [
+            rewrite_run_relative_path(value, run_id) if isinstance(value, str) else value
+            for value in lane.get("inputs", [])
+        ]
+        lane["expected_outputs"] = normalize_run_relative_output_descriptors(
+            normalize_output_descriptors(sanitize_output_descriptors(list(lane.get("expected_outputs", [])))),
+            run_id=run_id,
+        )
+    for edge in payload.get("collaboration_edges", []):
+        edge["deliverables"] = normalize_run_relative_output_descriptors(
+            normalize_output_descriptors(sanitize_output_descriptors(list(edge.get("deliverables", [])))),
+            run_id=run_id,
+        )
+
+
+def normalize_task_run_relative_paths(task: dict[str, Any], *, run_id: str) -> None:
+    task["inputs"] = [
+        rewrite_run_relative_path(value, run_id) if isinstance(value, str) else value
+        for value in task.get("inputs", [])
+    ]
+    task["owned_paths"] = [
+        rewrite_run_relative_path(value, run_id) if isinstance(value, str) else value
+        for value in task.get("owned_paths", [])
+    ]
+    task["writes_existing_paths"] = [
+        rewrite_run_relative_path(value, run_id) if isinstance(value, str) else value
+        for value in task.get("writes_existing_paths", [])
+    ]
+    task["additional_directories"] = [
+        rewrite_run_relative_path(value, run_id) if isinstance(value, str) else value
+        for value in task.get("additional_directories", [])
+    ]
+    task["expected_outputs"] = normalize_run_relative_output_descriptors(
+        normalize_output_descriptors(sanitize_output_descriptors(list(task.get("expected_outputs", [])))),
+        run_id=run_id,
+    )
+    for validation in task.get("validation", []):
+        if not isinstance(validation, dict):
+            continue
+        command = validation.get("command")
+        if isinstance(command, str) and command.strip():
+            validation["command"] = rewrite_run_relative_text(command, run_id)
 
 
 def normalize_objective_outline(
@@ -2470,20 +3734,7 @@ def normalize_objective_outline(
     phase: str,
     objective: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, dict[str, str]]]:
-    try:
-        for lane in payload.get("capability_lanes", []):
-            lane["expected_outputs"] = normalize_output_descriptors(list(lane.get("expected_outputs", [])))
-        for edge in payload.get("collaboration_edges", []):
-            edge["deliverables"] = normalize_output_descriptors(list(edge.get("deliverables", [])))
-    except ValueError as exc:
-        raise ExecutorError(
-            "Objective outline declared an invalid output descriptor. Asset outputs must always be backed by "
-            "concrete file paths; use assertion outputs for logical claims instead."
-        ) from exc
-    try:
-        validate_document(payload, "objective-outline.v1", project_root)
-    except SchemaValidationError as exc:
-        raise ExecutorError(f"Objective manager returned invalid objective outline: {exc}") from exc
+    payload["schema"] = "objective-outline.v1"
     adjustments = normalize_plan_identity(
         payload,
         run_id=run_id,
@@ -2491,6 +3742,36 @@ def normalize_objective_outline(
         objective_id=objective["objective_id"],
     )
     expected_capabilities = list(objective.get("capabilities", [])) or ["general"]
+    for lane in payload.get("capability_lanes", []):
+        normalized_capability = canonical_outline_capability(
+            lane.get("capability", ""),
+            lane.get("assigned_manager_role", ""),
+            expected_capabilities,
+        )
+        lane["assigned_manager_role"] = derive_manager_role_for_capability(
+            project_root,
+            objective["objective_id"],
+            normalized_capability,
+        )
+    try:
+        for lane in payload.get("capability_lanes", []):
+            lane["expected_outputs"] = normalize_output_descriptors(
+                sanitize_output_descriptors(list(lane.get("expected_outputs", [])))
+            )
+        for edge in payload.get("collaboration_edges", []):
+            edge["deliverables"] = normalize_output_descriptors(
+                sanitize_output_descriptors(list(edge.get("deliverables", [])))
+            )
+    except ValueError as exc:
+        raise ExecutorError(
+            "Objective outline declared an invalid output descriptor. Asset outputs must always be backed by "
+            "concrete file paths; use assertion outputs for logical claims instead."
+        ) from exc
+    normalize_outline_run_relative_paths(payload, run_id=run_id)
+    try:
+        validate_document(payload, "objective-outline.v1", project_root)
+    except SchemaValidationError as exc:
+        raise ExecutorError(f"Objective manager returned invalid objective outline: {exc}") from exc
     payload["capability_lanes"], lane_aliases = normalize_outline_lanes(
         project_root,
         objective["objective_id"],
@@ -2532,7 +3813,9 @@ def normalize_objective_outline(
         edge["shared_asset_ids"] = dedupe_strings(
             [item for item in edge.get("shared_asset_ids", []) if isinstance(item, str) and item] or [edge_id]
         )
-        edge["deliverables"] = normalize_output_descriptors(list(edge.get("deliverables", [])))
+        edge["deliverables"] = normalize_output_descriptors(
+            sanitize_output_descriptors(list(edge.get("deliverables", [])))
+        )
         normalized_edges.append(edge)
     payload["collaboration_edges"] = normalized_edges
     strip_assertion_deliverables_from_review_edges(payload)
@@ -2543,6 +3826,13 @@ def normalize_objective_outline(
     validate_objective_outline_write_targets(
         project_root,
         payload,
+        phase=phase,
+        objective_id=objective["objective_id"],
+    )
+    validate_objective_outline_prior_artifact_continuity(
+        project_root,
+        payload,
+        run_id=run_id,
         phase=phase,
         objective_id=objective["objective_id"],
     )
@@ -2578,13 +3868,17 @@ def normalize_outline_lanes(
             normalized_lane["capability"] = normalized_capability
             normalized_lane["assigned_manager_role"] = expected_manager_role
             normalized_lane["depends_on"] = list(lane.get("depends_on", []))
-            normalized_lane["expected_outputs"] = normalize_output_descriptors(list(lane.get("expected_outputs", [])))
+            normalized_lane["expected_outputs"] = normalize_output_descriptors(
+                sanitize_output_descriptors(list(lane.get("expected_outputs", [])))
+            )
             merged[normalized_capability] = normalized_lane
             continue
         target = merged[normalized_capability]
         target["inputs"] = dedupe_strings(list(target.get("inputs", [])) + list(lane.get("inputs", [])))
         target["expected_outputs"] = normalize_output_descriptors(
-            list(target.get("expected_outputs", [])) + list(lane.get("expected_outputs", []))
+            sanitize_output_descriptors(
+                list(target.get("expected_outputs", [])) + list(lane.get("expected_outputs", []))
+            )
         )
         target["done_when"] = dedupe_strings(list(target.get("done_when", [])) + list(lane.get("done_when", [])))
         target["planning_notes"] = dedupe_strings(
@@ -2605,6 +3899,122 @@ def normalize_outline_lanes(
             ]
         )
     return list(merged.values()), lane_aliases
+
+
+ARTIFACT_CONTINUITY_TOKEN_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "app",
+    "artifact",
+    "artifacts",
+    "build",
+    "created",
+    "current",
+    "design",
+    "discovery",
+    "doc",
+    "docs",
+    "file",
+    "files",
+    "flow",
+    "flows",
+    "md",
+    "mvp",
+    "note",
+    "notes",
+    "phase",
+    "polish",
+    "report",
+    "runtime",
+    "script",
+    "spec",
+    "summary",
+    "task",
+    "tmp",
+    "txt",
+    "updated",
+}
+
+
+def artifact_identity_tokens(path_value: str) -> set[str]:
+    stem = Path(str(path_value)).stem.lower()
+    return {
+        token
+        for token in re.split(r"[^a-z0-9]+", stem)
+        if token and token not in ARTIFACT_CONTINUITY_TOKEN_STOPWORDS and not token.isdigit()
+    }
+
+
+def collect_same_objective_prior_artifacts(
+    project_root: Path,
+    run_id: str,
+    *,
+    objective_id: str,
+    capability: str,
+    phase: str,
+) -> list[dict[str, Any]]:
+    run_dir = project_root / "runs" / run_id
+    reports = collect_prior_phase_reports(run_dir, objective_id, phase)
+    artifacts = collect_prior_phase_artifacts(project_root, reports)
+    if capability == "general":
+        return artifacts
+    return [
+        artifact
+        for artifact in artifacts
+        if artifact.get("capability") in {capability, None}
+    ]
+
+
+def validate_prior_artifact_path_continuity(
+    project_root: Path,
+    run_id: str,
+    *,
+    objective_id: str,
+    capability: str,
+    phase: str,
+    descriptors: list[dict[str, Any]],
+    owner_label: str,
+) -> None:
+    if phase == "discovery":
+        return
+    objective_root = find_objective_root(project_root, objective_id)
+    objective_root_rel = str(objective_root.relative_to(project_root))
+    prior_artifacts = [
+        artifact
+        for artifact in collect_same_objective_prior_artifacts(
+            project_root,
+            run_id,
+            objective_id=objective_id,
+            capability=capability,
+            phase=phase,
+        )
+        if isinstance(artifact.get("path"), str)
+        and artifact["path"].startswith(f"{objective_root_rel}/")
+    ]
+    if not prior_artifacts:
+        return
+    for descriptor in normalize_output_descriptors(list(descriptors)):
+        current_path = descriptor_path(descriptor)
+        if not current_path or current_path.startswith(f"{objective_root_rel}/"):
+            continue
+        current_tokens = artifact_identity_tokens(current_path)
+        if len(current_tokens) < 2:
+            continue
+        for artifact in prior_artifacts:
+            prior_path = str(artifact.get("path") or "").strip()
+            if not prior_path or prior_path == current_path:
+                continue
+            overlap = current_tokens & artifact_identity_tokens(prior_path)
+            if len(overlap) < 2:
+                continue
+            source_task_id = str(artifact.get("source_task_id") or "").strip()
+            source_label = f" from earlier task {source_task_id}" if source_task_id else ""
+            raise ExecutorError(
+                f"{owner_label} silently moved the previously accepted artifact `{prior_path}` to new path "
+                f"`{current_path}`{source_label}. Reuse the accepted artifact path instead of inventing a new "
+                "location unless an approved migration explicitly changes it."
+            )
 
 
 def validate_objective_outline_write_targets(
@@ -2757,6 +4167,29 @@ def validate_objective_outline_backend_alignment(
         )
 
 
+def validate_objective_outline_prior_artifact_continuity(
+    project_root: Path,
+    outline: dict[str, Any],
+    *,
+    run_id: str,
+    phase: str,
+    objective_id: str,
+) -> None:
+    for lane in outline.get("capability_lanes", []):
+        capability = str(lane.get("capability", "") or "").strip()
+        if not capability:
+            continue
+        validate_prior_artifact_path_continuity(
+            project_root,
+            run_id,
+            objective_id=objective_id,
+            capability=capability,
+            phase=phase,
+            descriptors=list(lane.get("expected_outputs", [])),
+            owner_label=f"Objective outline lane {capability}",
+        )
+
+
 def validate_contract_authority_for_descriptors(
     descriptors: list[dict[str, Any]],
     *,
@@ -2899,6 +4332,16 @@ def normalize_capability_plan(
     objective_outline: dict[str, Any],
     default_sandbox_mode: str,
 ) -> tuple[dict[str, Any], dict[str, dict[str, str]]]:
+    payload["schema"] = "capability-plan.v1"
+    adjustments = normalize_plan_identity(
+        payload,
+        run_id=run_id,
+        phase=phase,
+        objective_id=objective_id,
+        capability=capability,
+    )
+    for task in payload.get("tasks", []):
+        normalize_task_run_relative_paths(task, run_id=run_id)
     backfill_terminal_lane_outputs(payload, objective_outline=objective_outline, capability=capability, phase=phase)
     normalize_task_execution_metadata(
         project_root,
@@ -2925,9 +4368,6 @@ def normalize_capability_plan(
         validate_document(payload, "capability-plan.v1", project_root)
     except SchemaValidationError as exc:
         raise ExecutorError(f"Capability manager returned invalid capability plan: {exc}") from exc
-    if payload["capability"] != capability:
-        raise ExecutorError(f"Capability plan identity does not match requested capability {capability}")
-    adjustments = normalize_plan_identity(payload, run_id=run_id, phase=phase, objective_id=objective_id)
     validate_capability_plan_contents(
         project_root,
         payload,
@@ -2987,6 +4427,11 @@ def aggregate_capability_plans(
         "dependency_notes": dedupe_strings(dependency_notes),
         "collaboration_handoffs": dedupe_dicts(collaboration_handoffs),
     }
+    canonicalize_planned_task_worker_roles(
+        plan,
+        objective_id=objective_id,
+        default_capability=None,
+    )
     try:
         validate_document(plan, "objective-plan.v1", project_root)
     except SchemaValidationError as exc:
@@ -3038,7 +4483,16 @@ def normalize_task_execution_metadata(
     run_id: str | None = None,
     default_sandbox_mode: str,
 ) -> None:
+    canonicalize_planned_task_worker_roles(
+        payload,
+        objective_id=objective_id,
+        default_capability=capability,
+    )
     phase = str(payload.get("phase", "discovery"))
+    for task in payload.get("tasks", []):
+        task["expected_outputs"] = normalize_output_descriptors(
+            sanitize_output_descriptors(list(task.get("expected_outputs", [])))
+        )
     planned_output_paths: set[str] = {
         path
         for task in payload.get("tasks", [])
@@ -3058,6 +4512,32 @@ def normalize_task_execution_metadata(
         planned_output_paths.update(concrete_expected_output_paths(task))
 
 
+def canonical_worker_role_for_task(
+    *,
+    objective_id: str,
+    task_capability: str | None,
+    default_capability: str | None,
+) -> str:
+    normalized_capability = str(task_capability or default_capability or "").strip()
+    if not normalized_capability or normalized_capability == "general":
+        return f"objectives.{objective_id}.general-worker"
+    return f"objectives.{objective_id}.{normalized_capability}-worker"
+
+
+def canonicalize_planned_task_worker_roles(
+    payload: dict[str, Any],
+    *,
+    objective_id: str,
+    default_capability: str | None,
+) -> None:
+    for task in payload.get("tasks", []):
+        task["assigned_role"] = canonical_worker_role_for_task(
+            objective_id=objective_id,
+            task_capability=str(task.get("capability", "") or "").strip() or None,
+            default_capability=default_capability,
+        )
+
+
 def normalize_task_execution_entry(
     project_root: Path,
     objective_id: str,
@@ -3069,7 +4549,11 @@ def normalize_task_execution_entry(
     default_sandbox_mode: str,
     available_existing_paths: set[str] | None = None,
 ) -> None:
+    task["capability"] = str(task.get("capability") or capability).strip() or capability
     normalize_task_artifact_descriptors(task)
+    task["expected_outputs"] = normalize_output_descriptors(
+        sanitize_output_descriptors(list(task.get("expected_outputs", [])))
+    )
     phase = str(phase_override or task.get("phase", "discovery"))
     owned_path_hints = capability_owned_path_hints(
         project_root,
@@ -3085,6 +4569,13 @@ def normalize_task_execution_entry(
         available_existing_paths=available_existing_paths,
         search_roots=existing_write_search_roots(project_root, run_id),
     )
+    inferred_existing_write_paths = infer_existing_write_paths_from_expected_outputs(
+        project_root,
+        task,
+        run_id=run_id,
+    )
+    if inferred_existing_write_paths:
+        existing_write_paths = dedupe_strings(existing_write_paths + inferred_existing_write_paths)
     task["writes_existing_paths"] = existing_write_paths
     explicit_parallel_policy = task.get("parallel_policy") is not None
     inferred = infer_execution_metadata(
@@ -3127,6 +4618,13 @@ def normalize_task_execution_entry(
         current_shared_assets.extend(shared_asset_hints)
     task["shared_asset_ids"] = dedupe_strings(current_shared_assets)
     canonicalize_validation_commands(task)
+    normalize_invalid_prefix_validation_commands(
+        project_root,
+        objective_id=objective_id,
+        capability=capability,
+        phase=phase,
+        task=task,
+    )
     prune_discovery_design_producing_task_contract(task, phase=phase)
     task["working_directory"] = None
     task["sandbox_mode"] = effective_sandbox_mode(task, default_sandbox_mode)
@@ -3223,6 +4721,7 @@ def normalize_existing_write_paths(
     search_roots: list[Path] | None = None,
 ) -> list[str]:
     normalized: list[str] = []
+    missing_paths: list[str] = []
     planned_paths = available_existing_paths or set()
     roots = search_roots or [project_root]
     for value in values or []:
@@ -3247,10 +4746,12 @@ def normalize_existing_write_paths(
             found_existing_file = True
             break
         if not found_existing_file and path_value not in planned_paths:
-            raise ExecutorError(
-                f"writes_existing_paths referenced a missing file: {path_value}"
-            )
+            missing_paths.append(path_value)
+            continue
         normalized.append(path_value)
+    if missing_paths:
+        joined = ", ".join(sorted(dedupe_strings(missing_paths)))
+        raise ExecutorError(f"writes_existing_paths referenced missing files: {joined}")
     return dedupe_strings(normalized)
 
 
@@ -3279,6 +4780,62 @@ def existing_required_output_paths(
     return dedupe_strings(existing_paths)
 
 
+def expand_existing_output_target_files(
+    project_root: Path,
+    path_value: str,
+    *,
+    run_id: str | None = None,
+) -> list[str]:
+    normalized = normalize_repo_relative_path(path_value)
+    if not normalized:
+        return []
+    matches: list[str] = []
+    for root in existing_write_search_roots(project_root, run_id):
+        if any(token in normalized for token in "*?["):
+            try:
+                candidates = list(root.glob(normalized))
+            except Exception:
+                candidates = []
+        else:
+            candidate = root / normalized
+            candidates = [candidate] if candidate.exists() else []
+        for candidate in candidates:
+            if not candidate.exists():
+                continue
+            if candidate.is_file():
+                try:
+                    matches.append(str(candidate.relative_to(root)).replace("\\", "/"))
+                except ValueError:
+                    continue
+                continue
+            if candidate.is_dir():
+                for file_path in candidate.rglob("*"):
+                    if not file_path.is_file():
+                        continue
+                    try:
+                        matches.append(str(file_path.relative_to(root)).replace("\\", "/"))
+                    except ValueError:
+                        continue
+    return dedupe_strings(matches)
+
+
+def infer_existing_write_paths_from_expected_outputs(
+    project_root: Path,
+    task: dict[str, Any],
+    *,
+    run_id: str | None = None,
+) -> list[str]:
+    inferred: list[str] = []
+    for descriptor in normalize_output_descriptors(list(task.get("expected_outputs", []))):
+        if descriptor_kind(descriptor) not in {"artifact", "asset"}:
+            continue
+        path_value = descriptor_path(descriptor)
+        if not path_value:
+            continue
+        inferred.extend(expand_existing_output_target_files(project_root, path_value, run_id=run_id))
+    return dedupe_strings(inferred)
+
+
 def existing_write_search_roots(project_root: Path, run_id: str | None) -> list[Path]:
     roots: list[Path] = [project_root]
     if run_id:
@@ -3294,6 +4851,167 @@ def existing_write_search_roots(project_root: Path, run_id: str | None) -> list[
         seen.add(resolved)
         unique_roots.append(resolved)
     return unique_roots
+
+
+def select_capability_validation_script(
+    project_root: Path,
+    *,
+    objective_id: str,
+    capability: str,
+    phase: str,
+) -> str | None:
+    app_root = find_objective_app_root(project_root, objective_id)
+    hints = build_validation_environment_hints(
+        project_root,
+        app_root,
+        capability=capability,
+        phase=phase,
+    )
+    for command in hints.get("recommended_repo_scripts", []):
+        if isinstance(command, str) and command.strip().startswith("npm run validate:"):
+            return command.strip()
+    for command in hints.get("recommended_repo_scripts", []):
+        if isinstance(command, str) and command.strip():
+            return command.strip()
+    return None
+
+
+def normalize_shell_command(command: str) -> str:
+    try:
+        return " ".join(shlex.split(str(command or "").strip(), posix=True))
+    except ValueError:
+        return " ".join(str(command or "").strip().split())
+
+
+def validation_environment_hints_for_capability(
+    project_root: Path,
+    *,
+    objective_id: str,
+    capability: str,
+    phase: str,
+) -> dict[str, Any]:
+    app_root = find_objective_app_root(project_root, objective_id)
+    return build_validation_environment_hints(
+        project_root,
+        app_root,
+        capability=capability,
+        phase=phase,
+    )
+
+
+def validation_command_candidate_repo_paths(command: str) -> list[str]:
+    prefix_path = validation_command_prefix_path(command)
+    candidate_paths: list[str] = []
+    for path in validation_command_repo_paths(command):
+        normalized = str(path).strip().lstrip("./")
+        if not normalized:
+            continue
+        candidate_paths.append(normalized)
+        if prefix_path and normalized and not normalized.startswith(f"{prefix_path.rstrip('/')}/"):
+            if normalized.startswith("apps/"):
+                continue
+            candidate_paths.append(f"{prefix_path.rstrip('/')}/{normalized}")
+    return dedupe_strings(candidate_paths)
+
+
+def validation_template_variants(template: str, *, test_path: str) -> set[str]:
+    resolved = template.replace("{test_path}", test_path)
+    variants = {normalize_shell_command(resolved)}
+    if resolved.startswith("CI=1 "):
+        variants.add(normalize_shell_command(resolved.removeprefix("CI=1 ")))
+    return variants
+
+
+def canonical_validation_command_from_catalog(
+    command: str,
+    *,
+    hints: dict[str, Any],
+    allow_rewrite: bool = True,
+) -> str | None:
+    normalized_command = normalize_shell_command(command)
+    if not normalized_command:
+        return None
+    for item in list(hints.get("allowed_validation_commands") or []):
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind") or "").strip()
+        if kind == "exact_command":
+            exact = str(item.get("command") or "").strip()
+            if exact and normalize_shell_command(exact) == normalized_command:
+                return exact
+            continue
+        if kind != "single_test_template":
+            continue
+        template = str(item.get("command_template") or "").strip()
+        prefixes = [
+            str(value).strip().rstrip("/")
+            for value in list(item.get("allowed_test_path_prefixes") or [])
+            if isinstance(value, str) and str(value).strip().rstrip("/")
+        ]
+        if not template or not prefixes:
+            continue
+        matching_paths = [
+            path
+            for path in validation_command_candidate_repo_paths(command)
+            if path.endswith((".test.js", ".spec.js"))
+            if any(owned_path_targets_prefix(path, prefix) for prefix in prefixes)
+        ]
+        if len(matching_paths) != 1:
+            continue
+        test_path = matching_paths[0]
+        if normalized_command in validation_template_variants(template, test_path=test_path):
+            return template.replace("{test_path}", test_path)
+        if not allow_rewrite:
+            continue
+        program = validation_command_program(command) or ""
+        if program in {"npm", "node"}:
+            return template.replace("{test_path}", test_path)
+    return None
+
+
+def validation_command_catalog_issue(command: str, *, hints: dict[str, Any]) -> str | None:
+    if canonical_validation_command_from_catalog(command, hints=hints, allow_rewrite=False) is not None:
+        return None
+    if hints.get("allowed_validation_commands"):
+        return "does not match any allowed validation command or single-test template for this capability"
+    return None
+
+
+def normalize_invalid_prefix_validation_commands(
+    project_root: Path,
+    *,
+    objective_id: str,
+    capability: str,
+    phase: str,
+    task: dict[str, Any],
+) -> None:
+    replacement_command = select_capability_validation_script(
+        project_root,
+        objective_id=objective_id,
+        capability=capability,
+        phase=phase,
+    )
+    hints = validation_environment_hints_for_capability(
+        project_root,
+        objective_id=objective_id,
+        capability=capability,
+        phase=phase,
+    )
+    if not replacement_command:
+        replacement_command = None
+    for validation in task.get("validation", []):
+        command = validation.get("command")
+        if not isinstance(command, str) or not command.strip():
+            continue
+        canonical_command = canonical_validation_command_from_catalog(command, hints=hints, allow_rewrite=True)
+        if canonical_command and canonical_command != command.strip():
+            validation["command"] = canonical_command
+            continue
+        if validation_command_prefix_issue(project_root, command) is None:
+            continue
+        stripped = command.strip()
+        if stripped.startswith("npm --prefix ") and stripped.endswith(" test") and replacement_command:
+            validation["command"] = replacement_command
 
 
 def enforce_explicit_write_targets(
@@ -3668,11 +5386,14 @@ def reject_noncanonical_future_path_inputs(
     local_output_paths = set(local_output_path_map(payload))
     inbound_paths = set(inbound_handoff_path_ref_map(objective_outline, capability=capability))
     for task in payload.get("tasks", []):
+        task_local_existing_inputs = task_local_existing_input_paths(project_root, run_id, task)
         for input_ref in task.get("inputs", []):
             if not isinstance(input_ref, str):
                 continue
             normalized = input_ref.strip()
             if not normalized or normalized.startswith(("Planning Inputs.", "Runtime Context.", "Output of ", "Outputs from ")):
+                continue
+            if normalized in task_local_existing_inputs:
                 continue
             if normalized in local_output_paths or normalized in inbound_paths:
                 raise ExecutorError(
@@ -3684,6 +5405,23 @@ def reject_noncanonical_future_path_inputs(
                     f"Capability plan task {task['task_id']} referenced nonexistent repo input path {normalized}. "
                     "Same-phase dependencies must use Output of ... or Planning Inputs.required_inbound_handoffs..."
                 )
+
+
+def task_local_existing_input_paths(project_root: Path, run_id: str, task: dict[str, Any]) -> set[str]:
+    paths: set[str] = set()
+    for raw_path in task.get("writes_existing_paths", []):
+        normalized = normalize_repo_relative_path(str(raw_path))
+        if normalized:
+            paths.add(normalized)
+    for raw_path in task.get("owned_paths", []):
+        normalized = normalize_repo_relative_path(str(raw_path))
+        if normalized and repo_input_exists_for_run(project_root, run_id, normalized):
+            paths.add(normalized)
+    for output in normalize_output_descriptors(task.get("expected_outputs", [])):
+        normalized = normalize_repo_relative_path(str(output.get("path") or ""))
+        if normalized and repo_input_exists_for_run(project_root, run_id, normalized):
+            paths.add(normalized)
+    return paths
 
 
 def repo_input_exists_for_run(project_root: Path, run_id: str, relative_path: str) -> bool:
@@ -3935,6 +5673,11 @@ def validate_capability_plan_contents(
     capability: str,
     objective_outline: dict[str, Any],
 ) -> None:
+    canonicalize_planned_task_worker_roles(
+        plan,
+        objective_id=objective_id,
+        default_capability=capability,
+    )
     valid_roles = {f"objectives.{objective_id}.general-worker"}
     if capability != "general":
         valid_roles.add(f"objectives.{objective_id}.{capability}-worker")
@@ -4018,9 +5761,34 @@ def validate_capability_plan_contents(
             )
     validate_capability_required_handoffs(plan, objective_outline=objective_outline, capability=capability)
     validate_phase_task_graph_shape(plan, objective_outline=objective_outline, capability=capability, phase=phase)
-    validate_validation_commands(plan["tasks"], phase=phase, plan_label="Capability plan")
+    validate_validation_commands(
+        plan["tasks"],
+        project_root=project_root,
+        phase=phase,
+        plan_label="Capability plan",
+        objective_id=objective_id,
+        capability=capability,
+    )
     validate_backend_mvp_build_input_authority(plan["tasks"], phase=phase, capability=capability)
+    for task in plan["tasks"]:
+        validate_prior_artifact_path_continuity(
+            project_root,
+            run_id,
+            objective_id=objective_id,
+            capability=capability,
+            phase=phase,
+            descriptors=list(task.get("expected_outputs", [])),
+            owner_label=f"Capability plan task {task['task_id']}",
+        )
     validate_backend_persistence_alignment(
+        project_root,
+        plan,
+        run_id=run_id,
+        phase=phase,
+        objective_id=objective_id,
+        capability=capability,
+    )
+    validate_capability_repo_shape_alignment(
         project_root,
         plan,
         run_id=run_id,
@@ -4169,7 +5937,54 @@ def validation_command_is_resolvable(command: str) -> bool:
     return shutil.which(program) is not None
 
 
-def validate_validation_commands(tasks: list[dict[str, Any]], *, phase: str, plan_label: str) -> None:
+def validation_command_prefix_path(command: str) -> str | None:
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    for index, token in enumerate(tokens[:-1]):
+        if token != "--prefix":
+            continue
+        candidate = tokens[index + 1].strip().lstrip("./")
+        if candidate:
+            return candidate
+    return None
+
+
+def validation_command_prefix_issue(project_root: Path, command: str) -> str | None:
+    prefix_path = validation_command_prefix_path(command)
+    if not prefix_path:
+        return None
+    candidate = project_root / prefix_path
+    if not candidate.exists():
+        return f"uses --prefix `{prefix_path}` but that directory does not exist"
+    package_manifest = candidate / "package.json"
+    if not package_manifest.exists():
+        return (
+            f"uses --prefix `{prefix_path}` but `{prefix_path}/package.json` does not exist"
+        )
+    return None
+
+
+def validate_validation_commands(
+    tasks: list[dict[str, Any]],
+    *,
+    project_root: Path,
+    phase: str,
+    plan_label: str,
+    objective_id: str | None = None,
+    capability: str | None = None,
+) -> None:
+    hints = (
+        validation_environment_hints_for_capability(
+            project_root,
+            objective_id=objective_id,
+            capability=capability,
+            phase=phase,
+        )
+        if objective_id and capability
+        else {}
+    )
     for task in tasks:
         for validation in task.get("validation", []):
             command = validation.get("command")
@@ -4182,6 +5997,18 @@ def validate_validation_commands(tasks: list[dict[str, Any]], *, phase: str, pla
                     f"{plan_label} task {task['task_id']} declared validation command `{command}` "
                     "that does not start with a real executable or shell builtin. "
                     "Use a real command instead of a placeholder validator."
+                )
+            prefix_issue = validation_command_prefix_issue(project_root, command)
+            if prefix_issue:
+                raise ExecutorError(
+                    f"{plan_label} task {task['task_id']} declared validation command `{command}` that "
+                    f"{prefix_issue}. Use the real package root or a direct repo-root validation command."
+                )
+            catalog_issue = validation_command_catalog_issue(command, hints=hints)
+            if catalog_issue:
+                raise ExecutorError(
+                    f"{plan_label} task {task['task_id']} declared validation command `{command}` that "
+                    f"{catalog_issue}. Use the Validation Command Catalog for this capability."
                 )
 
 
@@ -4337,7 +6164,121 @@ def validate_backend_persistence_alignment(
         )
 
 
+def detect_capability_workspace_language(
+    project_root: Path,
+    *,
+    run_id: str,
+    objective_id: str,
+    capability: str,
+    phase: str,
+) -> str | None:
+    app_root = find_objective_app_root(project_root, objective_id)
+    if app_root is None:
+        return None
+    workspace_root = capability_workspace_root(app_root, capability, phase=phase)
+    if workspace_root is None:
+        return None
+    try:
+        relative_workspace_root = workspace_root.resolve().relative_to(project_root.resolve())
+    except ValueError:
+        return None
+    roots = [project_root]
+    integration_root = integration_workspace_path(project_root, run_id)
+    if integration_root.exists():
+        roots.append(integration_root)
+    js_files = 0
+    ts_files = 0
+    seen: set[str] = set()
+    for root in roots:
+        candidate_root = root / relative_workspace_root
+        if not candidate_root.exists():
+            continue
+        for candidate in candidate_root.rglob("*"):
+            if not candidate.is_file():
+                continue
+            try:
+                relative_path = str(candidate.relative_to(root)).replace("\\", "/")
+            except ValueError:
+                continue
+            if relative_path in seen:
+                continue
+            seen.add(relative_path)
+            if candidate.suffix in {".js", ".jsx", ".cjs", ".mjs"}:
+                js_files += 1
+            elif candidate.suffix in {".ts", ".tsx", ".cts", ".mts"}:
+                ts_files += 1
+    if js_files and not ts_files:
+        return "javascript"
+    if ts_files and not js_files:
+        return "typescript"
+    return None
+
+
+def validate_capability_repo_shape_alignment(
+    project_root: Path,
+    plan: dict[str, Any],
+    *,
+    run_id: str,
+    phase: str,
+    objective_id: str,
+    capability: str,
+) -> None:
+    if phase != "mvp-build" or capability not in {"frontend", "backend"}:
+        return
+    established_language = detect_capability_workspace_language(
+        project_root,
+        run_id=run_id,
+        objective_id=objective_id,
+        capability=capability,
+        phase=phase,
+    )
+    if established_language is None:
+        return
+    app_root = find_objective_app_root(project_root, objective_id)
+    if app_root is None:
+        return
+    workspace_root = capability_workspace_root(app_root, capability, phase=phase)
+    if workspace_root is None:
+        return
+    try:
+        workspace_prefix = str(workspace_root.resolve().relative_to(project_root.resolve())).replace("\\", "/")
+    except ValueError:
+        return
+    invalid_suffixes = {".ts", ".tsx", ".cts", ".mts"} if established_language == "javascript" else {".js", ".jsx", ".cjs", ".mjs"}
+    candidate_paths: list[str] = []
+    for task in plan.get("tasks", []):
+        candidate_paths.extend(str(value).strip() for value in task.get("owned_paths", []) if str(value).strip())
+        candidate_paths.extend(str(value).strip() for value in task.get("writes_existing_paths", []) if str(value).strip())
+        candidate_paths.extend(
+            path_value
+            for descriptor in normalize_output_descriptors(list(task.get("expected_outputs", [])))
+            if (path_value := descriptor_path(descriptor))
+        )
+        for validation in task.get("validation", []):
+            command = validation.get("command")
+            if isinstance(command, str) and command.strip():
+                candidate_paths.extend(validation_command_repo_paths(command))
+    conflicts = [
+        normalized_path
+        for path_value in dedupe_strings(candidate_paths)
+        if (normalized_path := normalize_repo_relative_path(path_value))
+        and owned_path_targets_prefix(normalized_path, workspace_prefix)
+        and Path(normalized_path).suffix in invalid_suffixes
+    ]
+    if conflicts:
+        raise ExecutorError(
+            f"Capability plan contradicted the observed {capability} workspace language: existing {capability} code is "
+            f"{established_language}, but the plan introduced incompatible implementation paths or validation targets: "
+            + ", ".join(sorted(conflicts))
+        )
+
+
 def validate_objective_plan_contents(project_root: Path, plan: dict[str, Any], objective: dict[str, Any]) -> None:
+    canonicalize_planned_task_worker_roles(
+        plan,
+        objective_id=str(objective["objective_id"]),
+        default_capability=None,
+    )
     valid_roles = {f"objectives.{objective['objective_id']}.general-worker"}
     for capability in objective["capabilities"]:
         if capability != "general":
@@ -4384,6 +6325,11 @@ def validate_planned_task_inputs(
     objective_id: str,
     tasks: list[dict[str, Any]],
 ) -> None:
+    canonicalize_planned_task_worker_roles(
+        {"tasks": tasks},
+        objective_id=objective_id,
+        default_capability=None,
+    )
     planned_task_ids = {task["task_id"] for task in tasks}
     for planned_task in tasks:
         preview_task = {
@@ -4423,6 +6369,26 @@ def validate_planned_task_inputs(
             raise ExecutorError(
                 f"Objective plan produced unresolved input refs for task {planned_task['task_id']}: "
                 + ", ".join(unresolved)
+            )
+        compiled_context = compile_task_context_packet(
+            project_root,
+            run_id,
+            preview_task,
+            files_loaded=[],
+            prompt_path="",
+            role_kind="worker",
+        )
+        missing_inputs = list(compiled_context.get("missing_inputs", []))
+        if missing_inputs:
+            details = []
+            for item in missing_inputs:
+                input_ref = str(item.get("input_ref") or "").strip()
+                reason = str(item.get("reason") or "").strip()
+                detail = str(item.get("detail") or "").strip()
+                details.append(f"{input_ref} ({reason}: {detail})" if detail else f"{input_ref} ({reason})")
+            raise ExecutorError(
+                f"Objective plan produced non-materializable task inputs for task {planned_task['task_id']}: "
+                + ", ".join(details)
             )
 
 
@@ -4483,6 +6449,11 @@ def materialize_objective_plan(project_root: Path, run_id: str, plan: dict[str, 
     run_dir = project_root / "runs" / run_id
     phase = plan["phase"]
     objective_id = plan["objective_id"]
+    canonicalize_planned_task_worker_roles(
+        plan,
+        objective_id=objective_id,
+        default_capability=None,
+    )
     existing_paths = []
     for path in sorted((run_dir / "tasks").glob("*.json")):
         payload = read_json(path)
@@ -4564,6 +6535,14 @@ def materialize_objective_plan(project_root: Path, run_id: str, plan: dict[str, 
         write_json(run_dir / "tasks" / f"{task_id}.json", payload)
     for handoff_id, payload in desired_handoffs.items():
         write_json(collaboration_dir / f"{handoff_id}.json", payload)
+    write_objective_task_graph_manifest(
+        run_dir,
+        phase=phase,
+        objective_id=objective_id,
+        task_ids=sorted(desired_payloads),
+        bundle_ids=sorted(str(bundle.get("bundle_id") or "").strip() for bundle in plan.get("bundle_plan", []) if str(bundle.get("bundle_id") or "").strip()),
+        handoff_ids=sorted(desired_handoffs),
+    )
 
 
 def build_planned_handoff_payload(

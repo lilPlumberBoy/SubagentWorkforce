@@ -51,6 +51,22 @@
       }
     },
     "open_issues": {"type": "array", "items": {"type": "string"}},
+    "blockers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind", "summary", "details", "related_paths", "related_validation_ids", "suggested_owner_capability"],
+        "additionalProperties": false,
+        "properties": {
+          "kind": {"type": "string"},
+          "summary": {"type": "string"},
+          "details": {"type": "string"},
+          "related_paths": {"type": "array", "items": {"type": "string"}},
+          "related_validation_ids": {"type": "array", "items": {"type": "string"}},
+          "suggested_owner_capability": {"type": ["string", "null"]}
+        }
+      }
+    },
     "change_requests": {
       "type": "array",
       "items": {

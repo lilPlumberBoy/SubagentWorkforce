@@ -17,7 +17,7 @@ from rich.text import Text
 from .autonomy import autonomy_history_path, read_autonomy_state
 from .filesystem import load_optional_json, read_text
 from .handoffs import list_handoffs
-from .live import list_activities, read_activity, read_activity_history, read_events, read_run_state
+from .live import list_activities, read_activity, read_activity_history, read_events, read_run_state, refresh_run_state
 from .management import run_guidance
 from .observability import read_run_observability
 
@@ -72,6 +72,47 @@ def inspect_activity(
         return
 
 
+def debug_prompt(
+    project_root: Path,
+    run_id: str,
+    activity_id: str,
+    *,
+    follow: bool = False,
+    events: int = 20,
+    show_body: bool = True,
+) -> None:
+    console = Console()
+    try:
+        initial_render = build_prompt_debug_detail(
+            project_root,
+            run_id,
+            activity_id,
+            events=events,
+            show_body=show_body,
+        )
+    except FileNotFoundError as exc:
+        raise SystemExit(f"Activity {activity_id} was not found in run {run_id}.") from exc
+    if not follow:
+        console.print(initial_render)
+        return
+    try:
+        with Live(initial_render, console=console, refresh_per_second=4) as live:
+            while True:
+                time.sleep(1.0)
+                live.update(
+                    build_prompt_debug_detail(
+                        project_root,
+                        run_id,
+                        activity_id,
+                        events=events,
+                        show_body=show_body,
+                    ),
+                    refresh=True,
+                )
+    except KeyboardInterrupt:
+        return
+
+
 def run_with_watch(
     project_root: Path,
     run_id: str,
@@ -115,6 +156,7 @@ def run_with_watch(
 
 
 def build_run_dashboard(project_root: Path, run_id: str):
+    refresh_run_state(project_root, run_id)
     run_state = read_run_state(project_root, run_id)
     current_phase = run_state["current_phase"]
     activities = list_activities(project_root, run_id, phase=current_phase)
@@ -174,6 +216,25 @@ def build_activity_detail(project_root: Path, run_id: str, activity_id: str, *, 
     )
 
 
+def build_prompt_debug_detail(
+    project_root: Path,
+    run_id: str,
+    activity_id: str,
+    *,
+    events: int = 20,
+    show_body: bool = True,
+):
+    activity = read_activity(project_root, run_id, activity_id)
+    event_rows = read_events(project_root, run_id, activity_id=activity_id)[-events:]
+    renderables = [
+        build_prompt_debug_panel(activity),
+        build_event_table(event_rows, title=f"Latest Events ({len(event_rows)})"),
+    ]
+    if show_body:
+        renderables.insert(1, Panel(load_prompt_text(project_root, activity.get("prompt_path")), title="Prompt Body", border_style="cyan"))
+    return Group(*renderables)
+
+
 def build_run_header(run_id: str, run_state: dict[str, Any]) -> Panel:
     text = Text()
     text.append(f"Run: {run_id}\n", style="bold")
@@ -188,7 +249,8 @@ def build_autonomy_panel(project_root: Path, run_id: str) -> Panel:
     guidance = run_guidance(project_root, run_id, phase=run_state["current_phase"])
     border_style = {
         "inactive": "blue",
-        "active": "green",
+        "running": "green",
+        "waiting_for_approval": "yellow",
         "stopped": "yellow",
         "completed": "cyan",
     }.get(state["status"], "blue")
@@ -208,9 +270,13 @@ def build_autonomy_panel(project_root: Path, run_id: str) -> Panel:
         f"Last action status: {state.get('last_action_status') or 'none'}",
         f"Stop reason: {state.get('stop_reason') or 'none'}",
     ]
-    if state["status"] != "active" and guidance["run_status"] == "working":
+    if state.get("approval_scope") == "none":
+        lines.append("Review gates: disabled for autonomous advancement.")
+    if state["status"] == "waiting_for_approval":
+        lines.append("Execution note: the controller is paused at a human review gate.")
+    elif state["status"] != "running" and guidance["run_status"] == "working":
         lines.append("Execution note: run work is active outside the autonomous controller.")
-    elif state["status"] != "active" and guidance["run_status"] == "recoverable":
+    elif state["status"] != "running" and guidance["run_status"] == "recoverable":
         lines.append("Execution note: the run can continue, but the autonomous controller is not currently attached.")
     tuning = state.get("last_tuning_decision")
     if tuning:
@@ -269,13 +335,14 @@ def build_activity_table(title: str, activities: list[dict[str, Any]], objective
     table.add_column("Activity")
     table.add_column("Objective")
     table.add_column("Status")
+    table.add_column("LLM")
     table.add_column("Warnings")
     table.add_column("Progress")
     table.add_column("Elapsed")
     table.add_column("Last Event")
     table.add_column("Current")
     if not activities:
-        table.add_row("none", "-", "-", "-", progress_renderable(0.0), "-", "-", "-")
+        table.add_row("none", "-", "-", "-", "-", progress_renderable(0.0), "-", "-", "-")
         return table
     for activity in sorted(activities, key=activity_sort_key):
         warnings_text = "; ".join(item["message"] for item in activity.get("warnings", [])) or "-"
@@ -283,6 +350,7 @@ def build_activity_table(title: str, activities: list[dict[str, Any]], objective
             activity_label(activity),
             objective_label(activity["objective_id"], objective_lookup),
             status_label(activity),
+            activity_observability_summary(activity),
             warnings_text,
             progress_renderable(activity["progress_fraction"]),
             elapsed_text(activity),
@@ -318,9 +386,24 @@ def build_activity_summary_panel(activity: dict[str, Any]) -> Panel:
         f"Workspace: {activity.get('workspace_path') or '-'}",
         f"Branch: {activity.get('branch_name') or '-'}",
         f"Prompt size: {observability.get('prompt_char_count', 0)} chars / {observability.get('prompt_line_count', 0)} lines",
+        f"Prompt bytes: {observability.get('prompt_bytes', 0)}",
+        f"Submitted: {observability.get('submitted_at') or '-'}",
+        f"Launch started: {observability.get('launched_at') or '-'}",
+        f"Thread started: {observability.get('thread_started_at') or '-'}",
+        f"Turn started: {observability.get('turn_started_at') or '-'}",
+        f"First stream: {observability.get('first_stream_at') or '-'}",
+        f"Turn completed: {observability.get('turn_completed_at') or '-'}",
         f"LLM calls: {observability.get('llm_call_count', 0)}",
         f"Tokens: in={observability.get('input_tokens', 0)} cached={observability.get('cached_input_tokens', 0)} out={observability.get('output_tokens', 0)}",
-        f"Latency: last={humanize_ms(int(observability.get('last_call_latency_ms', 0)))} runtime={humanize_ms(int(observability.get('runtime_ms', 0)))} queue={humanize_ms(int(observability.get('queue_wait_ms', 0)))}",
+        (
+            "Latency: "
+            f"last={humanize_ms(int(observability.get('last_call_latency_ms', 0)))} "
+            f"queue={humanize_ms(int(observability.get('queue_wait_ms', 0)))} "
+            f"first_stream={humanize_ms(int(observability.get('time_to_first_stream_ms', 0)))} "
+            f"processing={humanize_ms(int(observability.get('processing_ms', 0)))} "
+            f"runtime={humanize_ms(int(observability.get('runtime_ms', 0)))} "
+            f"wall={humanize_ms(int(observability.get('wall_clock_ms', 0)))}"
+        ),
         f"Timeouts / retries: {observability.get('timeout_count', 0)} / {observability.get('timeout_retry_count', 0)}",
         f"LLM stream bytes: stdout={observability.get('stdout_bytes', 0)} stderr={observability.get('stderr_bytes', 0)}",
         f"In-flight signal: last={relative_timestamp(observability.get('last_signal_at'))} stdout={relative_timestamp(observability.get('last_stdout_at'))} stderr={relative_timestamp(observability.get('last_stderr_at'))}",
@@ -334,6 +417,37 @@ def build_activity_summary_panel(activity: dict[str, Any]) -> Panel:
         for item in warnings:
             lines.append(f"- {item['code']}: {item['message']}")
     return Panel("\n".join(lines), title="Activity", border_style="yellow")
+
+
+def build_prompt_debug_panel(activity: dict[str, Any]) -> Panel:
+    observability = activity.get("observability", {})
+    lines = [
+        f"Activity: {activity['activity_id']}",
+        f"Kind: {activity['kind']}",
+        f"Status: {activity['status']}",
+        f"Attempt: {activity.get('attempt', 1)}",
+        f"Prompt path: {activity.get('prompt_path') or '-'}",
+        f"Prompt size: {observability.get('prompt_char_count', 0)} chars / {observability.get('prompt_line_count', 0)} lines / {observability.get('prompt_bytes', 0)} bytes",
+        f"Submitted: {observability.get('submitted_at') or '-'}",
+        f"Launch started: {observability.get('launched_at') or '-'}",
+        f"Thread started: {observability.get('thread_started_at') or '-'}",
+        f"Turn started: {observability.get('turn_started_at') or '-'}",
+        f"First stream: {observability.get('first_stream_at') or '-'}",
+        f"Turn completed: {observability.get('turn_completed_at') or '-'}",
+        f"Queue wait: {humanize_ms(int(observability.get('queue_wait_ms', 0)))}",
+        f"Time to first stream: {humanize_ms(int(observability.get('time_to_first_stream_ms', 0)))}",
+        f"Processing: {humanize_ms(int(observability.get('processing_ms', 0)))}",
+        f"Runtime: {humanize_ms(int(observability.get('runtime_ms', 0)))}",
+        f"Wall clock: {humanize_ms(int(observability.get('wall_clock_ms', 0)))}",
+        f"Tokens: in={observability.get('input_tokens', 0)} cached={observability.get('cached_input_tokens', 0)} out={observability.get('output_tokens', 0)}",
+        f"Stdout/Stderr bytes: {observability.get('stdout_bytes', 0)} / {observability.get('stderr_bytes', 0)}",
+        f"Workspace: {activity.get('workspace_path') or '-'}",
+        f"Branch: {activity.get('branch_name') or '-'}",
+        f"Stdout path: {activity.get('stdout_path') or '-'}",
+        f"Stderr path: {activity.get('stderr_path') or '-'}",
+        f"Output path: {activity.get('output_path') or '-'}",
+    ]
+    return Panel("\n".join(lines), title="Prompt Debug", border_style="magenta")
 
 
 def build_observability_panel(project_root: Path, run_id: str) -> Panel:
@@ -400,6 +514,16 @@ def build_artifact_paths_panel(activity: dict[str, Any]) -> Panel:
         f"Branch: {activity.get('branch_name') or '-'}",
     ]
     return Panel("\n".join(lines), title="Artifacts", border_style="blue")
+
+
+def activity_observability_summary(activity: dict[str, Any]) -> str:
+    observability = activity.get("observability", {}) or {}
+    return (
+        f"wait {humanize_ms(int(observability.get('queue_wait_ms', 0)))} · "
+        f"run {humanize_ms(int(observability.get('runtime_ms', 0)))} · "
+        f"in {int(observability.get('input_tokens', 0))} · "
+        f"out {int(observability.get('output_tokens', 0))}"
+    )
 
 
 def build_warning_rollup_panel(activities: list[dict[str, Any]], objective_lookup: dict[str, dict[str, str]]) -> Panel:
@@ -478,7 +602,7 @@ def build_activity_history_panel(history: list[dict[str, Any]], objective_lookup
 
 def load_prompt_text(project_root: Path, prompt_path: str | None) -> str:
     if not prompt_path:
-        return "No prompt path recorded."
+        return "Prompt is not available for this activity yet."
     path = project_root / prompt_path
     if not path.exists():
         return f"Prompt file not found: {prompt_path}"

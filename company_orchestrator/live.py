@@ -48,10 +48,18 @@ TERMINAL_ACTIVITY_STATUSES = {
 HISTORY_ACTIVITY_STATUSES = TERMINAL_ACTIVITY_STATUSES | {"ready_for_bundle_review"}
 
 ATTEMPT_RESET_FIELDS = {
+    "submitted_at": None,
     "queued_at": None,
     "launched_at": None,
+    "thread_started_at": None,
+    "turn_started_at": None,
+    "first_stream_at": None,
+    "turn_completed_at": None,
     "completed_at": None,
     "queue_wait_ms": 0,
+    "time_to_first_stream_ms": 0,
+    "processing_ms": 0,
+    "wall_clock_ms": 0,
     "runtime_ms": 0,
     "last_call_latency_ms": 0,
     "llm_call_count": 0,
@@ -260,10 +268,10 @@ def ensure_activity(
                 else (existing.get("handoff_blocker_fingerprint") if existing else None)
             ),
             "current_activity": current_activity,
-            "prompt_path": prompt_path,
-            "stdout_path": stdout_path,
-            "stderr_path": stderr_path,
-            "output_path": output_path,
+            "prompt_path": prompt_path if prompt_path is not None else (existing.get("prompt_path") if existing else None),
+            "stdout_path": stdout_path if stdout_path is not None else (existing.get("stdout_path") if existing else None),
+            "stderr_path": stderr_path if stderr_path is not None else (existing.get("stderr_path") if existing else None),
+            "output_path": output_path if output_path is not None else (existing.get("output_path") if existing else None),
             "dependency_blockers": dependency_blockers or [],
             "observability": observability_payload,
             "started_at": started_at,
@@ -584,10 +592,18 @@ def normalize_observability_payload(
         "prompt_char_count": 0,
         "prompt_line_count": 0,
         "prompt_bytes": 0,
+        "submitted_at": None,
         "queued_at": None,
         "launched_at": None,
+        "thread_started_at": None,
+        "turn_started_at": None,
+        "first_stream_at": None,
+        "turn_completed_at": None,
         "completed_at": None,
         "queue_wait_ms": 0,
+        "time_to_first_stream_ms": 0,
+        "processing_ms": 0,
+        "wall_clock_ms": 0,
         "runtime_ms": 0,
         "last_call_latency_ms": 0,
         "llm_call_count": 0,
@@ -625,14 +641,16 @@ def apply_observability_transitions(
 ) -> dict[str, Any]:
     status = payload["status"]
     updated_at = payload["updated_at"]
+    if observability.get("submitted_at") is None:
+        observability["submitted_at"] = payload.get("started_at") or updated_at
     if status == "queued" and observability.get("queued_at") is None:
         observability["queued_at"] = updated_at
     if status in {"launching", "running", "recovering"}:
         if observability.get("launched_at") is None:
             observability["launched_at"] = updated_at
-        queued_at = observability.get("queued_at")
-        if queued_at and not observability.get("queue_wait_ms"):
-            observability["queue_wait_ms"] = timestamp_diff_ms(queued_at, updated_at)
+        queue_start = observability.get("queued_at") or observability.get("submitted_at")
+        if queue_start and not observability.get("queue_wait_ms"):
+            observability["queue_wait_ms"] = timestamp_diff_ms(queue_start, updated_at)
     if status in TERMINAL_ACTIVITY_STATUSES and observability.get("completed_at") is None:
         observability["completed_at"] = updated_at
     launched_at = observability.get("launched_at")
@@ -640,6 +658,26 @@ def apply_observability_transitions(
     if launched_at:
         end_timestamp = completed_at or updated_at
         observability["runtime_ms"] = timestamp_diff_ms(launched_at, end_timestamp)
+    if observability.get("thread_started_at") and observability.get("first_stream_at") is None:
+        observability["first_stream_at"] = observability.get("thread_started_at")
+    if observability.get("turn_completed_at") and observability.get("completed_at") is None:
+        observability["completed_at"] = observability.get("turn_completed_at")
+    first_stream_anchor = observability.get("turn_started_at") or observability.get("launched_at")
+    if first_stream_anchor and observability.get("first_stream_at"):
+        observability["time_to_first_stream_ms"] = timestamp_diff_ms(
+            first_stream_anchor,
+            observability.get("first_stream_at"),
+        )
+    if observability.get("turn_started_at"):
+        processing_end = observability.get("turn_completed_at") or completed_at or updated_at
+        observability["processing_ms"] = timestamp_diff_ms(
+            observability.get("turn_started_at"),
+            processing_end,
+        )
+    submitted_at = observability.get("submitted_at")
+    if submitted_at:
+        wall_clock_end = completed_at or updated_at
+        observability["wall_clock_ms"] = timestamp_diff_ms(submitted_at, wall_clock_end)
     return observability
 
 
@@ -665,8 +703,45 @@ def note_activity_stream(
             observability["last_stderr_at"] = observed_at
         if stdout_bytes or stderr_bytes:
             observability["last_signal_at"] = observed_at
+            if observability.get("first_stream_at") is None:
+                observability["first_stream_at"] = observed_at
         payload["observability"] = apply_observability_transitions(payload, observability, previous=payload)
         payload["updated_at"] = observed_at
+        validate_document(payload, "activity-live-state.v1", project_root)
+        write_json_atomic(activity_path(run_dir, activity_id), payload)
+        refresh_run_state(project_root, run_id)
+        from .observability import refresh_run_observability
+
+        refresh_run_observability(project_root, run_id)
+        return payload
+
+
+def update_activity_observability_timestamps(
+    project_root: Path,
+    run_id: str,
+    activity_id: str,
+    *,
+    submitted_at: str | None = None,
+    thread_started_at: str | None = None,
+    turn_started_at: str | None = None,
+    turn_completed_at: str | None = None,
+    first_stream_at: str | None = None,
+) -> dict[str, Any]:
+    run_dir = project_root / "runs" / run_id
+    with run_lock(run_id):
+        payload = normalize_activity_payload(read_json(activity_path(run_dir, activity_id)))
+        observability = dict(payload.get("observability", {}))
+        if submitted_at is not None and observability.get("submitted_at") is None:
+            observability["submitted_at"] = submitted_at
+        if thread_started_at is not None and observability.get("thread_started_at") is None:
+            observability["thread_started_at"] = thread_started_at
+        if turn_started_at is not None and observability.get("turn_started_at") is None:
+            observability["turn_started_at"] = turn_started_at
+        if turn_completed_at is not None:
+            observability["turn_completed_at"] = turn_completed_at
+        if first_stream_at is not None and observability.get("first_stream_at") is None:
+            observability["first_stream_at"] = first_stream_at
+        payload["observability"] = apply_observability_transitions(payload, observability, previous=payload)
         validate_document(payload, "activity-live-state.v1", project_root)
         write_json_atomic(activity_path(run_dir, activity_id), payload)
         refresh_run_state(project_root, run_id)

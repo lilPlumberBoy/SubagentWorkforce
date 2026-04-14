@@ -2,451 +2,604 @@
 
 ## Purpose
 
-Build a basic local React application that replaces the current terminal-only dashboard for monitoring orchestrator runs.
+Build a local browser monitor for orchestrator runs that complements and eventually surpasses the current terminal dashboard.
 
-The goal of the first version is not feature completeness. The goal is to prove the full data path works:
+The document that previously lived here was written when the monitoring surface was smaller. The current system now exposes:
 
-1. Run data exists on disk.
-2. A local API can read and normalize that data.
-3. A React app can request the data.
-4. The UI can render it on localhost.
-5. The UI can refresh and show live changes over time.
+- live run state under `runs/<run-id>/live/`
+- run guidance and next-action recommendations
+- autonomy controller state and audit history
+- recovery-aware activity state
+- handoff tracking
+- activity history
+- richer LLM observability
+- prompt and artifact inspection views in the terminal tooling
 
-This document only covers the minimal first version needed to prove that flow.
+This rewrite updates the frontend design to match the system as it exists now.
 
-## First-Version Scope
+## Current System Reality
 
-The first version should be read-only and intentionally small.
+Relevant runtime and monitor code:
 
-It should show:
+- live monitor and detail rendering: [company_orchestrator/monitoring.py](/Users/mike/projects/personal/SubagentWorkforce/company_orchestrator/monitoring.py)
+- live run readers: [company_orchestrator/live.py](/Users/mike/projects/personal/SubagentWorkforce/company_orchestrator/live.py)
+- observability rollups: [company_orchestrator/observability.py](/Users/mike/projects/personal/SubagentWorkforce/company_orchestrator/observability.py)
+- run guidance and next action logic: [company_orchestrator/management.py](/Users/mike/projects/personal/SubagentWorkforce/company_orchestrator/management.py)
+- CLI surfaces for watch, inspect, debug, retry, reconcile, resume: [company_orchestrator/cli.py](/Users/mike/projects/personal/SubagentWorkforce/company_orchestrator/cli.py)
 
-- run list
-- selected run summary
-- live run state
-- activities
-- recent events
-- observability summary
+Relevant contracts:
 
-It should not include:
+- run state schema: [orchestrator/schemas/run-live-state.v1.json](/Users/mike/projects/personal/SubagentWorkforce/orchestrator/schemas/run-live-state.v1.json)
+- activity state schema: [orchestrator/schemas/activity-live-state.v1.json](/Users/mike/projects/personal/SubagentWorkforce/orchestrator/schemas/activity-live-state.v1.json)
+- live event schema: [orchestrator/schemas/live-event.v1.json](/Users/mike/projects/personal/SubagentWorkforce/orchestrator/schemas/live-event.v1.json)
+- run observability schema: [orchestrator/schemas/run-observability.v1.json](/Users/mike/projects/personal/SubagentWorkforce/orchestrator/schemas/run-observability.v1.json)
 
-- command buttons like retry, resume, approve, or reconcile
-- auth
-- charts
-- prompt inspection
-- multi-page navigation beyond a single dashboard page
-- websockets
-- advanced styling or design-system work
+Current operator-facing monitor behavior:
 
-## Existing Repo Reality
+- `watch-run` renders run header, autonomy controller, activity counts, observability, objective progress, activity groups, handoffs, warnings, recovery summary, activity history, and next action
+- `inspect-activity` renders activity metadata, prompt text, recent events, and artifact paths
+- `debug-prompt` renders prompt-focused observability and artifact metadata
+- normal commands also emit compact run guidance in their result summaries
 
-Current relevant structure:
+See [README.md](/Users/mike/projects/personal/SubagentWorkforce/README.md) and the monitor implementation for the source of truth.
 
-- root Node package: [package.json](/Users/mike/projects/personal/SubagentWorkforce/package.json)
-- orchestrator runtime logic: [company_orchestrator](/Users/mike/projects/personal/SubagentWorkforce/company_orchestrator)
-- current terminal dashboard logic: [monitoring.py](/Users/mike/projects/personal/SubagentWorkforce/company_orchestrator/monitoring.py)
-- live run readers: [live.py](/Users/mike/projects/personal/SubagentWorkforce/company_orchestrator/live.py)
-- observability data logic: [observability.py](/Users/mike/projects/personal/SubagentWorkforce/company_orchestrator/observability.py)
-- existing app folder pattern: [apps](/Users/mike/projects/personal/SubagentWorkforce/apps)
+## Constraints
 
-Important repo constraints:
+- The browser must not read `runs/*` files directly.
+- The Python orchestrator already owns run interpretation; frontend code should not recreate scheduling or recovery logic.
+- The Python package currently depends only on `rich`, not Flask or FastAPI: [pyproject.toml](/Users/mike/projects/personal/SubagentWorkforce/pyproject.toml)
+- The repo does not currently use Vite, Next, or a frontend workspace toolchain.
+- The existing frontend pattern is a repo-local React bundle served by a small Node host: [apps/todo/runtime/src/browser-bundle.js](/Users/mike/projects/personal/SubagentWorkforce/apps/todo/runtime/src/browser-bundle.js), [apps/todo/runtime/src/frontend-server.js](/Users/mike/projects/personal/SubagentWorkforce/apps/todo/runtime/src/frontend-server.js)
 
-- There is no existing frontend workspace tooling at the repo level beyond the root package.
-- The browser should not read `runs/*` files directly.
-- The Python orchestrator already knows how to read and interpret run state, so the local API should stay in Python.
+These constraints imply:
+
+- the read API should stay in Python
+- the browser UI should stay thin
+- the frontend should reuse the existing no-build runtime pattern unless there is a strong reason to introduce a new toolchain
+
+## Design Goal
+
+The first browser version should make it possible to answer the same practical questions the terminal dashboard answers:
+
+- What phase is the run in?
+- Is the run actively working, recoverable, ready for review, ready to advance, or blocked?
+- What is the next operator action?
+- What is autonomy doing?
+- Which activities are active, queued, blocked, interrupted, or recovered?
+- Are handoffs blocking progress?
+- Are there parallelism warnings or recovery actions?
+- What does observability say about current and recent LLM behavior?
+
+The browser should not start by implementing command execution or operator mutations.
+
+## Recommended Architecture
+
+Use a three-part split:
+
+1. Python monitor API
+2. React monitor frontend
+3. Small Node frontend host, using the same pattern as the todo runtime
+
+### Why this split
+
+- Python already has the authoritative readers for run state, events, observability, and guidance.
+- Node + React is already present in the repo and already has a tested localhost-serving pattern.
+- This avoids teaching the browser about filesystem layout, schema normalization, or recovery semantics.
 
 ## Recommended Repo Layout
 
-Add a new React app here:
-
-- [apps/monitor](/Users/mike/projects/personal/SubagentWorkforce/apps/monitor)
-
-Add a minimal local monitor API here:
+### Python API
 
 - [company_orchestrator/monitor_api.py](/Users/mike/projects/personal/SubagentWorkforce/company_orchestrator/monitor_api.py)
 
-Use the root package only for helper scripts:
+Optional supporting module if response shaping grows:
 
-- [package.json](/Users/mike/projects/personal/SubagentWorkforce/package.json)
+- [company_orchestrator/monitor_view_model.py](/Users/mike/projects/personal/SubagentWorkforce/company_orchestrator/monitor_view_model.py)
 
-## Architecture
+### Frontend app
 
-The first version should use a very simple split:
+- [apps/monitor/frontend/src](/Users/mike/projects/personal/SubagentWorkforce/apps/monitor/frontend/src)
+- [apps/monitor/runtime/src/browser-bundle.js](/Users/mike/projects/personal/SubagentWorkforce/apps/monitor/runtime/src/browser-bundle.js)
+- [apps/monitor/runtime/src/frontend-server.js](/Users/mike/projects/personal/SubagentWorkforce/apps/monitor/runtime/src/frontend-server.js)
+- [apps/monitor/runtime/scripts/start.js](/Users/mike/projects/personal/SubagentWorkforce/apps/monitor/runtime/scripts/start.js)
+- [apps/monitor/runtime/test](/Users/mike/projects/personal/SubagentWorkforce/apps/monitor/runtime/test)
 
-- React app renders the UI
-- Python API reads run data from disk and returns normalized JSON
+### Root scripts
 
-Recommended localhost setup:
+- [package.json](/Users/mike/projects/personal/SubagentWorkforce/package.json) for helper scripts only
 
-- monitor API: `http://127.0.0.1:8765`
-- React app: `http://127.0.0.1:5173`
+## Backend Recommendation
 
-Recommended first-version update model:
+Do not introduce a Python web framework for the first version.
 
-- polling every 2 to 5 seconds
-- no streaming yet
+Preferred first implementation:
+
+- use the Python standard library `http.server` or a similarly small built-in HTTP surface
+- expose read-only JSON endpoints only
+- keep all response shaping in Python functions that can be unit-tested without starting the server
 
 Reason:
 
-- polling is easier to build and debug
-- the data is already file-based
-- this is enough to prove live updates work
+- current Python dependencies are intentionally minimal
+- the API surface is small
+- this keeps monitor work aligned with the rest of the local-first repo style
 
-## Minimal API Surface
+If the API later needs auth, streaming, or more routing complexity, revisit the framework decision then.
 
-Define these endpoints first and keep them small:
+## Frontend Recommendation
+
+Do not start by adding Vite or another new frontend stack.
+
+Preferred first implementation:
+
+- mirror the todo runtime structure
+- bundle browser modules with a simple local bundler
+- serve the monitor page from a small Express host
+- keep React in plain JavaScript
+
+Reason:
+
+- this matches the repo’s existing runtime pattern
+- it avoids introducing a second frontend workflow
+- it keeps test and startup behavior consistent with the todo app
+
+## Product Scope
+
+The prior version of this document described a narrower dashboard than the terminal monitor now provides. The browser monitor should reflect the current monitoring model in phases.
+
+### Phase 1: Dashboard Parity For Core Operator Decisions
+
+The first browser release should be read-only and should include:
+
+- run list
+- selected run header
+- next action panel
+- autonomy panel
+- activity counts
+- observability panel
+- objective progress
+- grouped activity tables
+- handoff table
+- parallelism warnings
+- recovery actions
+- recent activity history
+
+Grouped activity tables should mirror the terminal monitor:
+
+- active planning activities
+- active task activities
+- queued tasks
+- blocked tasks
+- interrupted or recovered activities
+
+### Phase 2: Detail Views
+
+After the main dashboard works, add browser equivalents of the current terminal detail tools:
+
+- activity detail view
+- prompt debug view
+- event timeline for a selected activity
+- artifact path summary
+
+These are already operator workflows in the terminal monitor, so they are not speculative features.
+
+### Explicit Non-Goals For The First Browser Release
+
+- retry, resume, approve, reconcile, or other write actions
+- auth
+- websockets or streaming
+- charts
+- role prompt editing
+- direct raw file browsing
+- deep prompt body rendering on the landing dashboard
+- replacing every terminal-only workflow on day one
+
+## Data Sources The API Must Understand
+
+The browser monitor should be derived from these existing run artifacts:
+
+- `runs/<run-id>/live/run-state.json`
+- `runs/<run-id>/live/activities/*.json`
+- `runs/<run-id>/live/events.jsonl`
+- `runs/<run-id>/live/activity-history.jsonl`
+- `runs/<run-id>/live/observability.json`
+- `runs/<run-id>/live/autonomy-history.jsonl`
+- `runs/<run-id>/autonomy.json`
+- `runs/<run-id>/manager-runs/phase-<phase>.json`
+- phase reports and review docs when guidance references them
+- handoff state from existing handoff readers
+
+Do not interpret these independently in the browser. Reuse the current Python readers and helpers:
+
+- [read_run_state](/Users/mike/projects/personal/SubagentWorkforce/company_orchestrator/live.py:512)
+- [list_activities](/Users/mike/projects/personal/SubagentWorkforce/company_orchestrator/live.py:502)
+- [read_events](/Users/mike/projects/personal/SubagentWorkforce/company_orchestrator/live.py:523)
+- [read_run_observability](/Users/mike/projects/personal/SubagentWorkforce/company_orchestrator/observability.py:168)
+- [run_guidance](/Users/mike/projects/personal/SubagentWorkforce/company_orchestrator/management.py:1675)
+
+## API Shape
+
+The old endpoint list was too thin for the current monitor surface. The updated browser API should distinguish between:
+
+- lightweight run-list endpoints
+- a composite dashboard endpoint for one selected run
+- detail endpoints for activity and prompt inspection
+
+### Minimal Endpoint Set
 
 - `GET /api/runs`
-- `GET /api/runs/:runId/summary`
-- `GET /api/runs/:runId/state`
-- `GET /api/runs/:runId/activities`
+- `GET /api/runs/:runId/dashboard`
 - `GET /api/runs/:runId/events?limit=50`
+- `GET /api/runs/:runId/activities/:activityId`
+- `GET /api/runs/:runId/activities/:activityId/prompt-debug`
+
+Optional later split if payload sizes become awkward:
+
+- `GET /api/runs/:runId/guidance`
+- `GET /api/runs/:runId/autonomy`
 - `GET /api/runs/:runId/observability`
+- `GET /api/runs/:runId/handoffs`
+- `GET /api/runs/:runId/history`
 
-First-version response guidance:
+### `GET /api/runs`
 
-- `runs`
-  - `run_id`
-  - `current_phase`
-  - `updated_at`
-  - `status`
+Return a compact list suitable for the sidebar.
 
-- `summary`
-  - phase
-  - controller status
-  - run status
-  - key counts
+Each item should include:
 
-- `state`
-  - current phase
-  - active activity ids
-  - queued activity ids
-  - counts by status
-  - counts by kind
+- `run_id`
+- `current_phase`
+- `updated_at`
+- `run_status`
+- `run_status_reason`
+- `controller_status`
+- `active_activity_count`
+- `queued_activity_count`
 
-- `activities`
-  - activity id
-  - display name
-  - kind
-  - status
-  - current activity
-  - updated at
+The list view must be cheap to poll and must not include raw activity payloads.
 
-- `events`
-  - timestamp
-  - activity id
-  - event type
-  - message
+### `GET /api/runs/:runId/dashboard`
 
-- `observability`
-  - total calls
-  - completed calls
-  - failed calls
-  - timed out calls
-  - token totals
-  - latency totals
-  - active processes
+Return a composite view model for the selected run.
 
-Do not return giant raw file payloads in the first version.
+Recommended top-level shape:
 
-## Minimal UI Shape
+```json
+{
+  "run": {},
+  "guidance": {},
+  "autonomy": {},
+  "counts": {},
+  "observability": {},
+  "objective_progress": [],
+  "activities": {
+    "active_planning": [],
+    "active_tasks": [],
+    "queued_tasks": [],
+    "blocked_tasks": [],
+    "interrupted_or_recovered": []
+  },
+  "handoffs": [],
+  "warnings": [],
+  "recovery": [],
+  "history": [],
+  "events": []
+}
+```
 
-The first version should be a single page.
+This endpoint should be the browser equivalent of the current `watch-run` assembly path.
 
-Recommended layout:
+### Guidance Payload
+
+The browser should treat run guidance as a first-class data block, not a derived string.
+
+Include:
+
+- `run_status`
+- `run_status_reason`
+- `next_action_command`
+- `next_action_reason`
+- `review_doc_path`
+- `phase_recommendation`
+
+These values already drive terminal summaries and the `Next Action` panel.
+
+### Autonomy Payload
+
+Include the fields currently surfaced in the terminal monitor:
+
+- controller status
+- approval scope
+- stop-before phases
+- stop-on-recovery
+- adaptive tuning enabled flag
+- sandbox mode
+- max concurrency
+- timeout
+- active phase
+- last action
+- last action status
+- stop reason
+- last tuning decision
+- autonomy audit log path
+
+### Activity Rows
+
+Activity rows in the main dashboard should remain compact but should reflect current live-state richness.
+
+Each row should include:
+
+- `activity_id`
+- `display_name`
+- `objective_id`
+- `kind`
+- `status`
+- `attempt`
+- `progress_fraction`
+- `current_activity`
+- `latest_event`
+- `warnings`
+- compact observability summary
+- elapsed and updated timestamps
+
+The detail endpoint can return the full normalized activity payload.
+
+### Handoff Rows
+
+Include:
+
+- `handoff_id`
+- `objective_id`
+- `status`
+- `status_reason`
+- `from_task_id`
+- `to_task_ids`
+- `blocking`
+
+### History Rows
+
+Include only recent terminal activity history for the selected run.
+
+Each entry should include:
+
+- `activity_id`
+- `objective_id`
+- `status`
+- `timestamp`
+- `attempt`
+
+### Event Rows
+
+Include recent run-level events for the selected run.
+
+Each entry should include:
+
+- `timestamp`
+- `activity_id`
+- `event_type`
+- `message`
+
+### Detail Endpoints
+
+`GET /api/runs/:runId/activities/:activityId` should return:
+
+- normalized activity payload
+- recent events
+- artifact paths
+
+`GET /api/runs/:runId/activities/:activityId/prompt-debug` should return:
+
+- prompt-focused observability
+- prompt path
+- optional prompt body
+- artifact paths
+
+The browser does not need prompt bodies on the main dashboard, but it should support them in detail mode because the terminal already does.
+
+## UI Shape
+
+### Main Dashboard Layout
 
 - top bar
-  - title
+  - page title
   - selected run id
+  - current phase
+  - run status badge
 
 - left sidebar
   - run list
+  - compact status and phase per run
 
-- main top row
-  - summary panel
-  - state panel
-  - observability panel
+- top information row
+  - next action card
+  - autonomy card
+  - observability card
 
-- main middle
-  - activities table
+- second row
+  - activity counts
+  - objective progress
 
-- main bottom
-  - recent events log
+- main body
+  - active planning table
+  - active tasks table
+  - queued tasks table
+  - blocked tasks table
+  - handoffs table
+  - interrupted and recovered table
 
-UI should stay plain and utilitarian.
+- lower diagnostics
+  - parallelism warnings
+  - recovery actions
+  - recent activity history
+  - recent run events
 
-The first success criterion is functional visibility, not polish.
+### Detail Views
 
-## Ordered Development Plan
+Recommended detail affordances:
 
-### Phase 1: Define the Contract
+- click an activity row to open activity detail
+- from activity detail, open prompt debug
+- keep detail UI on the same page in a drawer or panel before adding routing complexity
 
-Task 1. Write down the exact first-version scope.
+## Refresh Model
 
-- Confirm the UI is read-only.
-- Confirm the only required views are run list, summary, state, activities, events, and observability.
-- Confirm that advanced features are intentionally deferred.
+Do not start with websockets.
 
-Test checkpoint:
+Recommended polling:
 
-- You can describe the first version in one paragraph without adding any extra features.
+- run list: every 10 to 15 seconds
+- selected dashboard: every 2 to 3 seconds while visible
+- detail panels: every 2 to 3 seconds only when open
 
-Task 2. Define the API contract before building anything.
+Design the API so the main dashboard can refresh from one composite call for the selected run. This reduces flicker, mismatch between panels, and client-side merge logic.
 
-- Decide the exact endpoint list.
-- Decide the exact top-level JSON shape for each endpoint.
-- Keep the responses compact and stable.
+## Testing Strategy
 
-Test checkpoint:
+The previous design doc did not reflect the repo’s testing style. The implementation should follow existing patterns:
 
-- You can explain what every endpoint returns without opening the code.
+- Python unit tests for API response shaping and missing-file behavior
+- Node built-in tests for the frontend runtime host and page boot
+- no assumption of Jest, Vite, or browser-only test frameworks
 
-### Phase 2: Build the Local API First
+### API tests
 
-Task 3. Create the API entry module.
+Cover:
 
-- Add a new API module in [company_orchestrator/monitor_api.py](/Users/mike/projects/personal/SubagentWorkforce/company_orchestrator/monitor_api.py).
-- Keep it read-only.
-- Reuse existing run readers from the orchestrator instead of re-parsing files from scratch.
+- completed run
+- active run
+- interrupted or recovered run
+- run with missing optional files
+- run with blocked handoffs
+- run with approved feedback or approved changes affecting guidance
 
-Test checkpoint:
+### Frontend tests
 
-- The API module can start locally and return one hardcoded JSON response.
+Cover:
+
+- frontend runtime starts locally
+- browser shell renders
+- run list loads
+- selecting a run updates the dashboard
+- polling updates the dashboard without a full reload
+- detail panel renders activity metadata and prompt debug data
+
+## Development Plan
+
+### Phase 1: Contract And View Model
+
+Task 1. Define the browser monitor around current monitor parity.
+
+- Treat `watch-run` as the reference for the landing dashboard.
+- Treat `inspect-activity` and `debug-prompt` as phase-2 detail parity targets.
+
+Task 2. Define the API view models in Python before building UI.
+
+- Create serializer functions for run list items.
+- Create one serializer for the selected-run dashboard payload.
+- Create detail serializers for activity detail and prompt debug.
+
+Checkpoint:
+
+- every UI panel maps to one explicit field in the API response
+
+### Phase 2: Python API
+
+Task 3. Add [company_orchestrator/monitor_api.py](/Users/mike/projects/personal/SubagentWorkforce/company_orchestrator/monitor_api.py).
+
+- use a minimal stdlib HTTP server
+- keep endpoints read-only
+- reuse current readers and guidance helpers
 
 Task 4. Implement `GET /api/runs`.
 
-- Read the available runs from the repo.
-- Return a compact run list.
-- Do not include deep details yet.
+- scan available runs
+- return compact list items only
 
-Test checkpoint:
+Task 5. Implement `GET /api/runs/:runId/dashboard`.
 
-- Opening the endpoint in a browser or with `curl` shows valid JSON.
+- build one coherent payload from run state, guidance, autonomy, activities, handoffs, history, and observability
 
-Task 5. Implement `GET /api/runs/:runId/summary`.
+Task 6. Implement detail endpoints.
 
-- Return basic summary data for one run.
-- Use the orchestrator’s current run-reading logic rather than inventing new interpretation rules.
+- activity detail
+- prompt debug
+- recent events with limit support
 
-Test checkpoint:
+Checkpoint:
 
-- A known run id returns a compact summary object.
-- A missing run id returns a clear error response.
+- API responses match current monitor behavior for at least two real runs
 
-Task 6. Implement `GET /api/runs/:runId/state`.
+### Phase 3: Frontend Runtime
 
-- Return current phase, activity ids, and count summaries.
+Task 7. Create the monitor runtime tree under [apps/monitor](/Users/mike/projects/personal/SubagentWorkforce/apps/monitor).
 
-Test checkpoint:
+- mirror the todo app structure
+- keep React in plain JavaScript
+- keep the runtime host simple
 
-- You can compare the API response to the existing terminal dashboard output and they roughly match.
+Task 8. Add a small API client module.
 
-Task 7. Implement `GET /api/runs/:runId/activities`.
+- centralize fetch logic
+- support polling
+- keep browser code unaware of filesystem details
 
-- Return activities as a flat list of displayable objects.
+Checkpoint:
 
-Test checkpoint:
+- frontend shell boots locally and prints live run data from the API
 
-- A run with interrupted or recovered activities returns readable activity rows.
+### Phase 4: Main Dashboard
 
-Task 8. Implement `GET /api/runs/:runId/events`.
+Task 9. Render run list and selection.
 
-- Return only the most recent events.
-- Add a limit parameter.
+Task 10. Render next action, autonomy, observability, and counts.
 
-Test checkpoint:
+Task 11. Render objective progress and grouped activity tables.
 
-- The endpoint does not dump huge output by default.
+Task 12. Render handoffs, warnings, recovery actions, history, and recent events.
 
-Task 9. Implement `GET /api/runs/:runId/observability`.
+Checkpoint:
 
-- Return totals only.
-- Keep it compact.
+- a user can diagnose most run state from the browser without opening the terminal dashboard
 
-Test checkpoint:
+### Phase 5: Detail Panels
 
-- The response is readable without scrolling through raw logs.
+Task 13. Add activity detail panel.
 
-### Phase 3: Verify the API Against Real Run Data
+Task 14. Add prompt debug panel.
 
-Task 10. Test the API against at least two real runs.
+Checkpoint:
 
-- Use one mostly completed run.
-- Use one interrupted or partially recovered run.
-
-Test checkpoint:
-
-- Both run types load successfully.
-- Missing optional files do not crash the API.
-
-Task 11. Confirm the API is the only thing touching raw run files.
-
-- The future React app should depend only on HTTP responses.
-
-Test checkpoint:
-
-- No frontend planning depends on direct filesystem reads.
-
-### Phase 4: Bootstrap the React App
-
-Task 12. Create the React app in [apps/monitor](/Users/mike/projects/personal/SubagentWorkforce/apps/monitor).
-
-- Keep the app simple.
-- Use plain React.
-- Prefer plain JavaScript over TypeScript for the first version if simplicity is the priority.
-
-Test checkpoint:
-
-- `localhost:5173` shows the empty app shell.
-
-Task 13. Add a small API client module in the React app.
-
-- Centralize all fetch calls in one place.
-- Do not spread raw fetch logic across many components.
-
-Test checkpoint:
-
-- The app can request `/api/runs` and print the result to the page.
-
-### Phase 5: Build the UI in the Easiest Order
-
-Task 14. Render the run list only.
-
-- Show run id and current phase.
-- Add click selection.
-
-Test checkpoint:
-
-- Clicking a run updates selected state in the UI.
-
-Task 15. Render the selected run summary.
-
-- Add the summary panel first.
-- Keep it text-only and compact.
-
-Test checkpoint:
-
-- Changing selected run updates the summary panel.
-
-Task 16. Render the state panel.
-
-- Show phase, active activities, queued activities, and status counts.
-
-Test checkpoint:
-
-- The state panel matches the API response cleanly.
-
-Task 17. Render the observability panel.
-
-- Show call totals, tokens, latency, and active processes.
-
-Test checkpoint:
-
-- Observability values load without breaking layout.
-
-Task 18. Render the activities table.
-
-- Show display name, kind, status, current activity, and updated time.
-
-Test checkpoint:
-
-- Long activity text wraps and remains readable.
-
-Task 19. Render the recent events panel.
-
-- Show recent events in a scrollable area.
-- Keep it plain text.
-
-Test checkpoint:
-
-- Events can be read as a timeline.
-
-### Phase 6: Add Live Refresh
-
-Task 20. Add polling after the static dashboard works.
-
-- Poll summary, state, activities, events, and observability.
-- Do not poll the run list as often.
-
-Test checkpoint:
-
-- Updating run files causes the UI to refresh without a browser reload.
-
-Task 21. Keep the polling behavior stable.
-
-- Avoid flicker.
-- Avoid duplicate rows.
-- Avoid resetting scroll unexpectedly.
-
-Test checkpoint:
-
-- The page stays usable during repeated refreshes.
-
-### Phase 7: Smooth Out Local Development
-
-Task 22. Add frontend proxy configuration.
-
-- Route `/api/*` from the React dev server to the local Python API.
-
-Test checkpoint:
-
-- The frontend calls `/api/...` without hardcoding the full backend URL.
-
-Task 23. Add root helper scripts in [package.json](/Users/mike/projects/personal/SubagentWorkforce/package.json).
-
-- Add a script for the API.
-- Add a script for the frontend.
-- Optionally add a combined dev script later, but that is not required for the first successful version.
-
-Test checkpoint:
-
-- A new developer can start both services from the repo without guessing commands.
-
-## Recommended Testing Order
-
-Use this exact order to reduce confusion:
-
-1. API returns hardcoded JSON.
-2. API returns real run list.
-3. API returns one real run summary.
-4. React app loads.
-5. React app fetches run list.
-6. React app selects one run.
-7. React app renders summary.
-8. React app renders state.
-9. React app renders activities.
-10. React app renders events.
-11. React app renders observability.
-12. Polling is added last.
-
-This order matters because it proves the backend first, then selection, then rendering, then live behavior.
+- browser detail views expose the same practical inspection surface as `inspect-activity` and `debug-prompt`
 
 ## Common Mistakes To Avoid
 
-- Do not start with advanced features.
-- Do not build the whole UI before the API is proven.
-- Do not parse raw run files in React.
-- Do not start with streaming.
-- Do not combine write actions into the first version.
-- Do not spend time on styling before data is flowing end-to-end.
+- Do not build the browser by re-parsing raw run files in JavaScript.
+- Do not hardcode a status model that differs from `run_guidance`.
+- Do not split the selected-run dashboard across too many independently polled endpoints in the first version.
+- Do not add write actions before the read-only monitor is reliable.
+- Do not introduce a frontend toolchain just because browser UI exists; the repo already has a workable runtime pattern.
+- Do not reduce observability to only totals; the current monitor also cares about active process state, stream volume, latency, retries, and call counts by kind.
+- Do not ignore handoffs, recovery, or approved external-input states; they now materially affect what an operator should do next.
 
-## Definition of Done for Version 1
+## Definition Of Done For Browser Monitor V1
 
-The first version is done when:
+Version 1 is done when:
 
-- the API starts locally
-- the React app starts locally
-- the browser shows a real run list
-- selecting a run shows summary, state, activities, events, and observability
-- the page refreshes that data on a polling interval
-- no terminal dashboard is required to understand the selected run at a basic level
+- the Python monitor API starts locally
+- the browser monitor starts locally
+- the run list shows real runs
+- selecting a run shows current run status and next action
+- the browser shows autonomy, observability, grouped activities, handoffs, warnings, recovery, and history
+- the selected run refreshes on polling without page reload
+- a user can determine whether to wait, review, resume, rerun, or advance by using the browser monitor alone
 
-## Next Step After This Document
+## Future Work After V1
 
-Once the minimal monitor is planned and the implementation begins, the next document should expand this baseline into:
+After the read-only browser monitor is stable, consider:
 
-- full feature list
-- component breakdown
-- richer API surface
-- interaction design
-- live streaming model if needed
-- action endpoints if needed
+- activity detail drawers with prompt body and artifact links
+- operator action endpoints for retry, resume, approve, and reconcile
+- event filtering and search
+- comparison across runs
+- stream transport if polling becomes too coarse
+- richer visual summaries once parity and correctness are proven

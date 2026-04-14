@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
+from .bundles import active_bundle_ids_for_phase
 from .filesystem import ensure_dir, load_optional_json, read_json, write_json
 from .live import (
     list_activities,
@@ -64,7 +66,63 @@ def reconcile_run(project_root: Path, run_id: str, *, apply: bool = False) -> di
             summary["blocked"].append(incident)
     if apply:
         refresh_run_state(project_root, run_id)
+        _reconcile_autonomy_state(project_root, run_id)
     return summary
+
+
+def _reconcile_autonomy_state(project_root: Path, run_id: str) -> None:
+    from .autonomy import autonomy_lease_is_fresh
+
+    run_dir = project_root / "runs" / run_id
+    autonomy_path = run_dir / "autonomy.json"
+    if not autonomy_path.exists():
+        return
+    autonomy_state = load_optional_json(autonomy_path)
+    if not isinstance(autonomy_state, dict):
+        return
+    if autonomy_state.get("status") not in {"active", "running"}:
+        return
+    phase_plan = read_json(run_dir / "phase-plan.json")
+    if all(item.get("status") == "complete" for item in phase_plan.get("phases", [])):
+        autonomy_state["status"] = "completed"
+        autonomy_state["completed_at"] = autonomy_state.get("completed_at") or now_timestamp()
+        autonomy_state["stop_phase"] = None
+        autonomy_state["stop_reason"] = None
+        autonomy_state["lease_owner"] = None
+        autonomy_state["lease_started_at"] = None
+        autonomy_state["lease_heartbeat_at"] = None
+        autonomy_state["lease_timeout_seconds"] = None
+        autonomy_state["lease_action_kind"] = None
+        autonomy_state["updated_at"] = now_timestamp()
+        write_json(autonomy_path, autonomy_state)
+        return
+    run_state = read_run_state(project_root, run_id)
+    if run_state.get("active_activity_ids") or run_state.get("queued_activity_ids"):
+        return
+    if autonomy_lease_is_fresh(autonomy_state):
+        return
+    phase = run_state.get("current_phase")
+    if not phase:
+        return
+    activities = list_activities(project_root, run_id, phase=phase)
+    phase_report = load_optional_json(run_dir / "phase-reports" / f"{phase}.json")
+    if isinstance(phase_report, dict):
+        recommendation = str(phase_report.get("recommendation") or "").strip()
+        if recommendation == "hold":
+            stop_reason = "Phase is on hold and no live work remains."
+        elif recommendation == "advance":
+            stop_reason = "Phase is ready to advance, but no live work remains."
+        else:
+            stop_reason = "Phase work is no longer running, but the autonomous controller remained active."
+    elif any(activity.get("status") in {"interrupted", "recovered", "failed", "blocked", "needs_revision"} for activity in activities):
+        stop_reason = "Phase work was interrupted or reconciled, and no live work remains."
+    else:
+        return
+    autonomy_state["status"] = "stopped"
+    autonomy_state["stop_phase"] = phase
+    autonomy_state["stop_reason"] = stop_reason
+    autonomy_state["updated_at"] = now_timestamp()
+    write_json(autonomy_path, autonomy_state)
 
 
 def reconcile_for_command(
@@ -111,18 +169,7 @@ def summarize_recovery_for_phase(project_root: Path, run_id: str, phase: str) ->
                 "reason": activity.get("status_reason") or activity.get("current_activity") or "reconciled activity",
             }
         )
-    for event in events:
-        if event.get("event_type") != "bundle.recovery_blocked":
-            continue
-        payload = event.get("payload", {})
-        incidents.append(
-            {
-                "activity_id": f"bundle:{payload.get('bundle_id', 'unknown')}",
-                "status": "blocked",
-                "reason": event.get("message") or "Bundle landing recovery blocked.",
-                "artifact_path": payload.get("recovery_path"),
-            }
-        )
+    incidents.extend(load_active_bundle_recovery_incidents(project_root, run_id, phase))
     return {
         "interrupted_activities": len(interrupted),
         "recovered_activities": len(recovered),
@@ -356,6 +403,96 @@ def display_path(project_root: Path, path: Path) -> str:
         return str(path)
 
 
+def bundle_recovery_summary_path(run_dir: Path, bundle_id: str) -> Path:
+    return run_dir / "recovery" / f"{bundle_id}.json"
+
+
+def bundle_recovery_archive_path(run_dir: Path, phase: str, bundle_id: str) -> Path:
+    archive_dir = ensure_dir(run_dir / "archive" / "bundle-recovery" / phase)
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "-", now_timestamp())
+    candidate = archive_dir / f"{bundle_id}-{stem}.json"
+    counter = 1
+    while candidate.exists():
+        counter += 1
+        candidate = archive_dir / f"{bundle_id}-{stem}-{counter}.json"
+    return candidate
+
+
+def archive_bundle_recovery_incident(
+    project_root: Path,
+    run_id: str,
+    *,
+    phase: str,
+    bundle_id: str,
+    reason: str,
+    apply: bool,
+) -> dict[str, Any] | None:
+    run_dir = project_root / "runs" / run_id
+    summary_path = bundle_recovery_summary_path(run_dir, bundle_id)
+    if not summary_path.exists():
+        return None
+    archive_path = bundle_recovery_archive_path(run_dir, phase, bundle_id)
+    payload = load_optional_json(summary_path)
+    archive_payload = payload if isinstance(payload, dict) else {"bundle_id": bundle_id, "phase": phase}
+    archive_payload["status"] = "archived"
+    archive_payload["archived_at"] = now_timestamp()
+    archive_payload["archive_reason"] = reason
+    archive_payload["archived_from"] = display_path(project_root, summary_path)
+    archive_payload["bundle_id"] = bundle_id
+    archive_payload["phase"] = phase
+    incident = {
+        "bundle_id": bundle_id,
+        "status": "archived",
+        "reason": reason,
+        "artifact_path": display_path(project_root, archive_path),
+    }
+    if not apply:
+        return incident
+    write_json(archive_path, archive_payload)
+    summary_path.unlink()
+    record_event(
+        project_root,
+        run_id,
+        phase=phase,
+        activity_id=None,
+        event_type="bundle.recovery_archived",
+        message=f"Archived obsolete bundle recovery incident for {bundle_id}.",
+        payload={
+            "bundle_id": bundle_id,
+            "reason": reason,
+            "archive_path": display_path(project_root, archive_path),
+        },
+    )
+    return incident
+
+
+def load_active_bundle_recovery_incidents(project_root: Path, run_id: str, phase: str) -> list[dict[str, Any]]:
+    run_dir = project_root / "runs" / run_id
+    incidents: list[dict[str, Any]] = []
+    recovery_dir = run_dir / "recovery"
+    if not recovery_dir.exists():
+        return incidents
+    for path in sorted(recovery_dir.glob("*.json")):
+        payload = load_optional_json(path)
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("phase") != phase:
+            continue
+        if payload.get("status") == "archived":
+            continue
+        bundle_id = str(payload.get("bundle_id") or path.stem).strip()
+        reason = str(payload.get("reason") or "Bundle landing recovery blocked.").strip()
+        incidents.append(
+            {
+                "activity_id": f"bundle:{bundle_id}",
+                "status": "blocked",
+                "reason": reason,
+                "artifact_path": display_path(project_root, path),
+            }
+        )
+    return incidents
+
+
 def reconcile_bundle_landings(project_root: Path, run_id: str, *, phase: str, apply: bool) -> list[dict[str, Any]]:
     run_dir = project_root / "runs" / run_id
     incidents: list[dict[str, Any]] = []
@@ -365,14 +502,91 @@ def reconcile_bundle_landings(project_root: Path, run_id: str, *, phase: str, ap
         return incidents
     integration_branch = integration_branch_name(run_id)
     integration_workspace = integration_workspace_path(project_root, run_id)
+    active_bundle_ids = active_bundle_ids_for_phase(run_dir, phase)
+    bundles_by_id: dict[str, dict[str, Any]] = {}
+    for path in sorted((run_dir / "bundles").glob("*.json")):
+        bundle = read_json(path)
+        bundle_id = str(bundle.get("bundle_id") or "").strip()
+        if bundle_id:
+            bundles_by_id[bundle_id] = bundle
+
+    recovery_dir = run_dir / "recovery"
+    recovery_paths = sorted(recovery_dir.glob("*.json")) if recovery_dir.exists() else []
+    for path in recovery_paths:
+        payload = load_optional_json(path)
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("phase") != phase:
+            continue
+        bundle_id = str(payload.get("bundle_id") or path.stem).strip()
+        if not bundle_id:
+            continue
+        bundle = bundles_by_id.get(bundle_id)
+        if bundle_id not in active_bundle_ids:
+            archive_bundle_recovery_incident(
+                project_root,
+                run_id,
+                phase=phase,
+                bundle_id=bundle_id,
+                reason="Bundle is no longer part of the active manager-approved bundle plan.",
+                apply=apply,
+            )
+            continue
+        if bundle is None:
+            archive_bundle_recovery_incident(
+                project_root,
+                run_id,
+                phase=phase,
+                bundle_id=bundle_id,
+                reason="Bundle recovery incident no longer has a corresponding bundle file.",
+                apply=apply,
+            )
+            continue
+        if bundle.get("status") == "rejected":
+            archive_bundle_recovery_incident(
+                project_root,
+                run_id,
+                phase=phase,
+                bundle_id=bundle_id,
+                reason="Bundle is rejected and no longer an active landing candidate.",
+                apply=apply,
+            )
+
     for path in sorted((run_dir / "bundles").glob("*.json")):
         bundle = read_json(path)
         if bundle.get("phase") != phase:
             continue
-        if bundle.get("status") != "accepted":
+        bundle_id = str(bundle.get("bundle_id") or "").strip()
+        if not bundle_id or bundle_id not in active_bundle_ids:
+            archive_bundle_recovery_incident(
+                project_root,
+                run_id,
+                phase=phase,
+                bundle_id=bundle_id,
+                reason="Bundle is not part of the active manager-approved bundle plan.",
+                apply=apply,
+            )
+            continue
+        if bundle.get("status") not in {"accepted", "blocked"}:
+            archive_bundle_recovery_incident(
+                project_root,
+                run_id,
+                phase=phase,
+                bundle_id=bundle_id,
+                reason=f"Bundle status {bundle.get('status')} is not an active accepted landing state.",
+                apply=apply,
+            )
             continue
         landing_results = bundle.get("landing_results", [])
         if landing_results:
+            archive_bundle_recovery_incident(
+                project_root,
+                run_id,
+                phase=phase,
+                bundle_id=bundle_id,
+                reason="Bundle already has landing results and no longer needs landing recovery.",
+                apply=apply,
+            )
             continue
         isolated_task_ids = []
         for task_id in bundle.get("included_tasks", []):
@@ -383,6 +597,14 @@ def reconcile_bundle_landings(project_root: Path, run_id: str, *, phase: str, ap
             if task.get("execution_mode") == "isolated_write":
                 isolated_task_ids.append(task_id)
         if not isolated_task_ids:
+            archive_bundle_recovery_incident(
+                project_root,
+                run_id,
+                phase=phase,
+                bundle_id=bundle_id,
+                reason="Bundle does not contain isolated-write tasks and has no landing recovery surface.",
+                apply=apply,
+            )
             continue
         merged = True
         for task_id in isolated_task_ids:
@@ -395,18 +617,26 @@ def reconcile_bundle_landings(project_root: Path, run_id: str, *, phase: str, ap
                 merged = False
                 break
         if merged:
+            archive_bundle_recovery_incident(
+                project_root,
+                run_id,
+                phase=phase,
+                bundle_id=bundle_id,
+                reason="Accepted landing is already present on the integration branch.",
+                apply=apply,
+            )
             incidents.append(
                 {
-                    "bundle_id": bundle["bundle_id"],
+                    "bundle_id": bundle_id,
                     "status": "completed",
                     "reason": "Accepted landing already present on run integration branch.",
                 }
             )
             continue
-        summary_path = ensure_dir(run_dir / "recovery") / f"{bundle['bundle_id']}.json"
+        summary_path = bundle_recovery_summary_path(run_dir, bundle_id)
         summary_payload = {
             "run_id": run_id,
-            "bundle_id": bundle["bundle_id"],
+            "bundle_id": bundle_id,
             "phase": bundle["phase"],
             "objective_id": bundle["objective_id"],
             "status": "interrupted",
@@ -417,7 +647,7 @@ def reconcile_bundle_landings(project_root: Path, run_id: str, *, phase: str, ap
         }
         incidents.append(
             {
-                "bundle_id": bundle["bundle_id"],
+                "bundle_id": bundle_id,
                 "status": "blocked",
                 "reason": summary_payload["reason"],
                 "artifact_path": display_path(project_root, summary_path),
@@ -435,8 +665,8 @@ def reconcile_bundle_landings(project_root: Path, run_id: str, *, phase: str, ap
             phase=bundle["phase"],
             activity_id=None,
             event_type="bundle.recovery_blocked",
-            message=f"Bundle {bundle['bundle_id']} requires recovery before landing can continue.",
-            payload={"bundle_id": bundle["bundle_id"], "recovery_path": display_path(project_root, summary_path)},
+            message=f"Bundle {bundle_id} requires recovery before landing can continue.",
+            payload={"bundle_id": bundle_id, "recovery_path": display_path(project_root, summary_path)},
         )
     return incidents
 

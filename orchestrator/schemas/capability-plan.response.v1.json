@@ -1,0 +1,138 @@
+{
+  "type": "object",
+  "required": [
+    "schema",
+    "summary",
+    "tasks",
+    "bundle_plan",
+    "dependency_notes",
+    "collaboration_handoffs"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"type": "string", "enum": ["capability-plan.v1"]},
+    "summary": {"type": "string"},
+    "tasks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "task_id",
+          "execution_mode",
+          "parallel_policy",
+          "owned_paths",
+          "writes_existing_paths",
+          "shared_asset_ids",
+          "objective",
+          "inputs",
+          "expected_outputs",
+          "done_when",
+          "depends_on",
+          "validation",
+          "collaboration_rules",
+          "working_directory",
+          "additional_directories",
+          "sandbox_mode"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "task_id": {"type": "string"},
+          "execution_mode": {"type": "string", "enum": ["read_only", "isolated_write"]},
+          "parallel_policy": {"type": "string", "enum": ["allow", "serialize"]},
+          "owned_paths": {"type": "array", "items": {"type": "string"}},
+          "writes_existing_paths": {"type": "array", "items": {"type": "string"}},
+          "shared_asset_ids": {"type": "array", "items": {"type": "string"}},
+          "objective": {"type": "string"},
+          "inputs": {"type": "array", "items": {"type": "string"}},
+          "expected_outputs": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["kind", "output_id", "path", "asset_id", "description", "evidence"],
+              "additionalProperties": false,
+              "properties": {
+                "kind": {"type": "string", "enum": ["artifact", "asset", "assertion"]},
+                "output_id": {"type": "string"},
+                "path": {"type": ["string", "null"]},
+                "asset_id": {"type": ["string", "null"]},
+                "description": {"type": ["string", "null"]},
+                "evidence": {
+                  "type": ["object", "null"],
+                  "required": ["validation_ids", "artifact_paths"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "validation_ids": {"type": "array", "items": {"type": "string"}},
+                    "artifact_paths": {"type": "array", "items": {"type": "string"}}
+                  }
+                }
+              }
+            }
+          },
+          "done_when": {"type": "array", "items": {"type": "string"}},
+          "depends_on": {"type": "array", "items": {"type": "string"}},
+          "validation": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["id", "command"],
+              "additionalProperties": false,
+              "properties": {
+                "id": {"type": "string"},
+                "command": {"type": "string"}
+              }
+            }
+          },
+          "collaboration_rules": {"type": "array", "items": {"type": "string"}},
+          "working_directory": {"type": ["string", "null"]},
+          "additional_directories": {"type": "array", "items": {"type": "string"}},
+          "sandbox_mode": {"type": "string", "enum": ["read-only", "workspace-write", "danger-full-access"]}
+        }
+      }
+    },
+    "bundle_plan": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["bundle_id", "task_ids", "summary"],
+        "additionalProperties": false,
+        "properties": {
+          "bundle_id": {"type": "string"},
+          "task_ids": {"type": "array", "items": {"type": "string"}},
+          "summary": {"type": "string"}
+        }
+      }
+    },
+    "dependency_notes": {"type": "array", "items": {"type": "string"}},
+    "collaboration_handoffs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "handoff_id",
+          "from_capability",
+          "to_capability",
+          "from_task_id",
+          "to_role",
+          "handoff_type",
+          "reason",
+          "deliverable_output_ids",
+          "blocking",
+          "shared_asset_ids"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "handoff_id": {"type": "string"},
+          "from_capability": {"type": "string"},
+          "to_capability": {"type": "string"},
+          "from_task_id": {"type": "string"},
+          "to_role": {"type": "string"},
+          "handoff_type": {"type": "string"},
+          "reason": {"type": "string"},
+          "deliverable_output_ids": {"type": "array", "items": {"type": "string"}},
+          "blocking": {"type": "boolean"},
+          "shared_asset_ids": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    }
+  }
+}

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+import subprocess
 from typing import Any, Callable
 
 from .autonomy import run_autonomous
@@ -10,9 +12,17 @@ from .bundles import assemble_review_bundle, review_bundle
 from .change_replan import apply_approved_changes_and_resume
 from .collaboration import create_collaboration_request, resolve_collaboration_request
 from .executor import execute_task
-from .filesystem import read_json
-from .management import run_guidance, run_objective, run_phase
-from .monitoring import inspect_activity, run_with_watch, watch_run
+from .feedback import apply_feedback_and_resume, list_feedback, submit_feedback, triage_feedback
+from .filesystem import ensure_dir, load_optional_json, read_json, write_json
+from .management import (
+    build_bundle_run_state_repair_context,
+    build_bundle_task_repair_context,
+    classify_report_repair_class,
+    run_guidance,
+    run_objective,
+    run_phase,
+)
+from .monitoring import debug_prompt, inspect_activity, run_with_watch, watch_run
 from .objective_planner import plan_objective, plan_phase
 from .planner import bootstrap_run, decompose_goal, generate_role_files, initialize_run, promote_roles, suggest_team_proposals
 from .prompts import render_prompt
@@ -47,6 +57,7 @@ def main() -> None:
     bootstrap_parser.add_argument("--no-approve-roles", action="store_true")
     bootstrap_parser.add_argument("--max-iterations", type=int, default=40)
     bootstrap_parser.add_argument("--approval-scope", choices=["all", "planning-only", "none"], default="all")
+    bootstrap_parser.add_argument("--no-review-gates", action="store_true")
     bootstrap_parser.add_argument("--stop-before-phase", action="append", default=[])
     bootstrap_parser.add_argument("--stop-on-recovery", action="store_true")
     bootstrap_parser.add_argument("--no-adaptive-tuning", action="store_true")
@@ -125,6 +136,30 @@ def main() -> None:
     apply_changes_parser.add_argument("--max-concurrency", type=int, default=3)
     add_watch_options(apply_changes_parser)
 
+    submit_feedback_parser = subparsers.add_parser("submit-feedback")
+    submit_feedback_parser.add_argument("run_id")
+    submit_feedback_parser.add_argument("summary")
+    submit_feedback_parser.add_argument("--expected-behavior", default="")
+    submit_feedback_parser.add_argument("--observed-behavior", default="")
+    submit_feedback_parser.add_argument("--repro-step", action="append", default=[])
+    submit_feedback_parser.add_argument("--severity", choices=["low", "medium", "high", "critical"], default="medium")
+
+    list_feedback_parser = subparsers.add_parser("list-feedback")
+    list_feedback_parser.add_argument("run_id")
+
+    triage_feedback_parser = subparsers.add_parser("triage-feedback")
+    triage_feedback_parser.add_argument("run_id")
+    triage_feedback_parser.add_argument("feedback_id")
+
+    apply_feedback_parser = subparsers.add_parser("apply-feedback")
+    apply_feedback_parser.add_argument("run_id")
+    apply_feedback_parser.add_argument("--feedback-id", action="append", default=[])
+    apply_feedback_parser.add_argument("--sandbox", default="read-only")
+    apply_feedback_parser.add_argument("--codex-path", default="codex")
+    apply_feedback_parser.add_argument("--timeout-seconds", type=int, default=None)
+    apply_feedback_parser.add_argument("--max-concurrency", type=int, default=3)
+    add_watch_options(apply_feedback_parser)
+
     auto_parser = subparsers.add_parser("run-autonomous")
     auto_parser.add_argument("run_id")
     auto_parser.add_argument("--sandbox", default="read-only")
@@ -133,6 +168,7 @@ def main() -> None:
     auto_parser.add_argument("--max-concurrency", type=int, default=3)
     auto_parser.add_argument("--max-iterations", type=int, default=40)
     auto_parser.add_argument("--approval-scope", choices=["all", "planning-only", "none"], default="all")
+    auto_parser.add_argument("--no-review-gates", action="store_true")
     auto_parser.add_argument("--stop-before-phase", action="append", default=[])
     auto_parser.add_argument("--stop-on-recovery", action="store_true")
     auto_parser.add_argument("--no-adaptive-tuning", action="store_true")
@@ -142,11 +178,27 @@ def main() -> None:
     watch_parser.add_argument("run_id")
     watch_parser.add_argument("--refresh-seconds", type=float, default=1.0)
 
+    watch_web_parser = subparsers.add_parser("watch-run-web")
+    watch_web_parser.add_argument("run_id", nargs="?", default=None)
+    watch_web_parser.add_argument("--node-path", default="node")
+    watch_web_parser.add_argument("--api-host", default=None)
+    watch_web_parser.add_argument("--api-port", type=int, default=None)
+    watch_web_parser.add_argument("--frontend-host", default=None)
+    watch_web_parser.add_argument("--frontend-port", type=int, default=None)
+    watch_web_parser.add_argument("--python-command", default=None)
+
     inspect_parser = subparsers.add_parser("inspect-activity")
     inspect_parser.add_argument("run_id")
     inspect_parser.add_argument("activity_id")
     inspect_parser.add_argument("--follow", action="store_true")
     inspect_parser.add_argument("--events", type=int, default=20)
+
+    debug_prompt_parser = subparsers.add_parser("debug-prompt")
+    debug_prompt_parser.add_argument("run_id")
+    debug_prompt_parser.add_argument("activity_id")
+    debug_prompt_parser.add_argument("--follow", action="store_true")
+    debug_prompt_parser.add_argument("--events", type=int, default=20)
+    debug_prompt_parser.add_argument("--no-body", action="store_true")
 
     reconcile_parser = subparsers.add_parser("reconcile-run")
     reconcile_parser.add_argument("run_id")
@@ -193,6 +245,9 @@ def main() -> None:
     resolve_collaboration_parser = subparsers.add_parser("resolve-collaboration")
     resolve_collaboration_parser.add_argument("run_id")
     resolve_collaboration_parser.add_argument("request_id")
+
+    def effective_approval_scope(args: argparse.Namespace) -> str:
+        return "none" if getattr(args, "no_review_gates", False) else args.approval_scope
 
     report_parser = subparsers.add_parser("phase-report")
     report_parser.add_argument("run_id")
@@ -241,7 +296,7 @@ def main() -> None:
                 timeout_seconds=args.timeout_seconds,
                 max_concurrency=args.max_concurrency,
                 max_iterations=args.max_iterations,
-                approval_scope=args.approval_scope,
+                approval_scope=effective_approval_scope(args),
                 stop_before_phases=args.stop_before_phase,
                 stop_on_recovery=args.stop_on_recovery,
                 adaptive_tuning=not args.no_adaptive_tuning,
@@ -439,7 +494,7 @@ def main() -> None:
                 timeout_seconds=args.timeout_seconds,
                 max_concurrency=args.max_concurrency,
                 max_iterations=args.max_iterations,
-                approval_scope=args.approval_scope,
+                approval_scope=effective_approval_scope(args),
                 stop_before_phases=args.stop_before_phase,
                 stop_on_recovery=args.stop_on_recovery,
                 adaptive_tuning=not args.no_adaptive_tuning,
@@ -467,8 +522,31 @@ def main() -> None:
             refresh_seconds=args.refresh_seconds,
         )
         return
+    if args.command == "watch-run-web":
+        raise SystemExit(
+            watch_run_web(
+                project_root,
+                args.run_id,
+                node_path=args.node_path,
+                api_host=args.api_host,
+                api_port=args.api_port,
+                frontend_host=args.frontend_host,
+                frontend_port=args.frontend_port,
+                python_command=args.python_command,
+            )
+        )
     if args.command == "inspect-activity":
         inspect_activity(project_root, args.run_id, args.activity_id, follow=args.follow, events=args.events)
+        return
+    if args.command == "debug-prompt":
+        debug_prompt(
+            project_root,
+            args.run_id,
+            args.activity_id,
+            follow=args.follow,
+            events=args.events,
+            show_body=not args.no_body,
+        )
         return
     if args.command == "reconcile-run":
         print_json(reconcile_run(project_root, args.run_id, apply=args.apply))
@@ -504,6 +582,59 @@ def main() -> None:
                 project_root,
                 args.run_id,
                 change_ids=args.change_id,
+                sandbox_mode=args.sandbox,
+                codex_path=args.codex_path,
+                timeout_seconds=args.timeout_seconds,
+                max_concurrency=args.max_concurrency,
+            )
+        result = run_maybe_watched(
+            project_root,
+            args.run_id,
+            args.watch,
+            args.watch_refresh_seconds,
+            operation,
+        )
+        if should_print_result(args.json_output, watched=args.watch):
+            print_result(
+                project_root,
+                result,
+                run_id=args.run_id,
+                leading_blank_line=args.watch,
+                json_output=args.json_output,
+            )
+        return
+    if args.command == "submit-feedback":
+        print_result(
+            project_root,
+            submit_feedback(
+                project_root,
+                args.run_id,
+                summary=args.summary,
+                expected_behavior=args.expected_behavior,
+                observed_behavior=args.observed_behavior,
+                repro_steps=args.repro_step,
+                severity=args.severity,
+            ),
+            run_id=args.run_id,
+            json_output=args.json_output,
+        )
+        return
+    if args.command == "list-feedback":
+        print_result(project_root, list_feedback(project_root, args.run_id), run_id=args.run_id, json_output=args.json_output)
+        return
+    if args.command == "triage-feedback":
+        print_result(
+            project_root,
+            triage_feedback(project_root, args.run_id, args.feedback_id),
+            run_id=args.run_id,
+            json_output=args.json_output,
+        )
+        return
+    if args.command == "apply-feedback":
+        operation = lambda: apply_feedback_and_resume(
+                project_root,
+                args.run_id,
+                feedback_ids=args.feedback_id,
                 sandbox_mode=args.sandbox,
                 codex_path=args.codex_path,
                 timeout_seconds=args.timeout_seconds,
@@ -694,6 +825,50 @@ def run_maybe_watched(
     )
 
 
+def watch_run_web(
+    project_root: Path,
+    run_id: str | None,
+    *,
+    node_path: str = "node",
+    api_host: str | None = None,
+    api_port: int | None = None,
+    frontend_host: str | None = None,
+    frontend_port: int | None = None,
+    python_command: str | None = None,
+) -> int:
+    env = os.environ.copy()
+    env["MONITOR_PROJECT_ROOT"] = str(project_root)
+    env["MONITOR_API_PORT"] = str(api_port if api_port is not None else 0)
+    env["MONITOR_FRONTEND_PORT"] = str(frontend_port if frontend_port is not None else 0)
+    if isinstance(run_id, str) and run_id.strip():
+        env["MONITOR_RUN_ID"] = run_id.strip()
+    if api_host:
+        env["MONITOR_API_HOST"] = api_host
+    if frontend_host:
+        env["MONITOR_FRONTEND_HOST"] = frontend_host
+    if python_command:
+        env["MONITOR_API_PYTHON"] = python_command
+
+    repo_root = Path(__file__).resolve().parent.parent
+    command = [
+        node_path,
+        "--no-warnings",
+        "apps/monitor/runtime/scripts/start.js",
+    ]
+    if isinstance(run_id, str) and run_id.strip():
+        command.append(run_id.strip())
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(repo_root),
+            env=env,
+            check=False,
+        )
+    except KeyboardInterrupt:
+        return 130
+    return int(completed.returncode)
+
+
 def retry_activity(
     project_root: Path,
     run_id: str,
@@ -705,15 +880,42 @@ def retry_activity(
 ) -> dict[str, Any]:
     activity = read_json(project_root / "runs" / run_id / "live" / "activities" / f"{activity_id.replace(':', '__')}.json")
     if activity["kind"] == "task_execution":
-        return execute_task(
-            project_root,
-            run_id,
-            activity["activity_id"],
-            sandbox_mode=sandbox_mode,
-            codex_path=codex_path,
-            timeout_seconds=timeout_seconds,
-            allow_recovery_blocked=True,
-        )
+        repair_context_path: Path | None = None
+        reports_dir = project_root / "runs" / run_id / "reports"
+        report = load_optional_json(reports_dir / f"{activity['activity_id']}.json")
+        if isinstance(report, dict):
+            repair_class = classify_report_repair_class(report)
+            repair_context_dir = ensure_dir(project_root / "runs" / run_id / "repair-contexts")
+            repair_context_path = repair_context_dir / f"{activity['activity_id']}.json"
+            if repair_class == "run_state_repair":
+                write_json(
+                    repair_context_path,
+                    build_bundle_run_state_repair_context(
+                        bundle={"bundle_id": str(activity.get("objective_id") or "").strip(), "included_tasks": [activity["activity_id"]]},
+                        report=report,
+                    ),
+                )
+            elif repair_class == "task_repair":
+                write_json(
+                    repair_context_path,
+                    build_bundle_task_repair_context(
+                        bundle={"bundle_id": str(activity.get("objective_id") or "").strip(), "included_tasks": [activity["activity_id"]]},
+                        report=report,
+                    ),
+                )
+        try:
+            return execute_task(
+                project_root,
+                run_id,
+                activity["activity_id"],
+                sandbox_mode=sandbox_mode,
+                codex_path=codex_path,
+                timeout_seconds=timeout_seconds,
+                allow_recovery_blocked=True,
+            )
+        finally:
+            if repair_context_path is not None and repair_context_path.exists():
+                repair_context_path.unlink()
     return plan_objective(
         project_root,
         run_id,

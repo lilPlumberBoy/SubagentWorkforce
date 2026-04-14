@@ -1,0 +1,87 @@
+{
+  "type": "object",
+  "required": [
+    "schema",
+    "run_id",
+    "feedback_id",
+    "summary",
+    "expected_behavior",
+    "observed_behavior",
+    "repro_steps",
+    "severity",
+    "status",
+    "triage",
+    "resolution",
+    "submitted_at",
+    "replacement_plan_revision"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"type": "string", "enum": ["user-feedback.v1"]},
+    "run_id": {"type": "string"},
+    "feedback_id": {"type": "string"},
+    "summary": {"type": "string"},
+    "expected_behavior": {"type": "string"},
+    "observed_behavior": {"type": "string"},
+    "repro_steps": {"type": "array", "items": {"type": "string"}},
+    "severity": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
+    "status": {
+      "type": "string",
+      "enum": ["submitted", "approved", "pending_human_review", "in_progress", "resolved"]
+    },
+    "triage": {
+      "type": ["object", "null"],
+      "required": [
+        "feedback_kind",
+        "goal_alignment",
+        "route",
+        "owner_objective_id",
+        "owner_capability",
+        "required_reentry_phase",
+        "actionable",
+        "rationale",
+        "matched_objective_ids",
+        "focus_paths"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "feedback_kind": {
+          "type": "string",
+          "enum": ["local_bug", "cross_boundary_change", "feature_request"]
+        },
+        "goal_alignment": {
+          "type": "string",
+          "enum": ["in_goal", "adjacent", "out_of_goal"]
+        },
+        "route": {
+          "type": "string",
+          "enum": ["local_repair", "cross_boundary_change", "cross_boundary_review", "manual_review"]
+        },
+        "owner_objective_id": {"type": ["string", "null"]},
+        "owner_capability": {"type": ["string", "null"]},
+        "required_reentry_phase": {
+          "type": ["string", "null"],
+          "enum": ["discovery", "design", "mvp-build", "polish", null]
+        },
+        "actionable": {"type": "boolean"},
+        "rationale": {"type": "string"},
+        "matched_objective_ids": {"type": "array", "items": {"type": "string"}},
+        "focus_paths": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "resolution": {
+      "type": ["object", "null"],
+      "required": ["status", "resolved_at", "phase_report_path", "validation_report_path", "notes"],
+      "additionalProperties": false,
+      "properties": {
+        "status": {"type": "string", "enum": ["resolved"]},
+        "resolved_at": {"type": "string"},
+        "phase_report_path": {"type": ["string", "null"]},
+        "validation_report_path": {"type": ["string", "null"]},
+        "notes": {"type": "string"}
+      }
+    },
+    "submitted_at": {"type": "string"},
+    "replacement_plan_revision": {"type": ["string", "null"]}
+  }
+}

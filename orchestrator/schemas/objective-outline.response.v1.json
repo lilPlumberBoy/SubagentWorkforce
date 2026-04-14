@@ -1,0 +1,118 @@
+{
+  "type": "object",
+  "required": [
+    "schema",
+    "summary",
+    "capability_lanes",
+    "dependency_notes",
+    "collaboration_edges"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"type": "string", "enum": ["objective-outline.v1"]},
+    "summary": {"type": "string"},
+    "capability_lanes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "capability",
+          "objective",
+          "inputs",
+          "expected_outputs",
+          "done_when",
+          "depends_on",
+          "planning_notes",
+          "collaboration_rules"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "capability": {"type": "string"},
+          "objective": {"type": "string"},
+          "inputs": {"type": "array", "items": {"type": "string"}},
+          "expected_outputs": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["kind", "output_id", "path", "asset_id", "description", "evidence"],
+              "additionalProperties": false,
+              "properties": {
+                "kind": {"type": "string", "enum": ["artifact", "asset", "assertion"]},
+                "output_id": {"type": "string"},
+                "path": {"type": ["string", "null"]},
+                "asset_id": {"type": ["string", "null"]},
+                "description": {"type": ["string", "null"]},
+                "evidence": {
+                  "type": ["object", "null"],
+                  "required": ["validation_ids", "artifact_paths"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "validation_ids": {"type": "array", "items": {"type": "string"}},
+                    "artifact_paths": {"type": "array", "items": {"type": "string"}}
+                  }
+                }
+              }
+            }
+          },
+          "done_when": {"type": "array", "items": {"type": "string"}},
+          "depends_on": {"type": "array", "items": {"type": "string"}},
+          "planning_notes": {"type": "array", "items": {"type": "string"}},
+          "collaboration_rules": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "dependency_notes": {"type": "array", "items": {"type": "string"}},
+    "collaboration_edges": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "edge_id",
+          "from_capability",
+          "to_capability",
+          "to_role",
+          "handoff_type",
+          "reason",
+          "deliverables",
+          "blocking",
+          "shared_asset_ids"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "edge_id": {"type": "string"},
+          "from_capability": {"type": "string"},
+          "to_capability": {"type": "string"},
+          "to_role": {"type": "string"},
+          "handoff_type": {"type": "string"},
+          "reason": {"type": "string"},
+          "deliverables": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["kind", "output_id", "path", "asset_id", "description", "evidence"],
+              "additionalProperties": false,
+              "properties": {
+                "kind": {"type": "string", "enum": ["artifact", "asset", "assertion"]},
+                "output_id": {"type": "string"},
+                "path": {"type": ["string", "null"]},
+                "asset_id": {"type": ["string", "null"]},
+                "description": {"type": ["string", "null"]},
+                "evidence": {
+                  "type": ["object", "null"],
+                  "required": ["validation_ids", "artifact_paths"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "validation_ids": {"type": "array", "items": {"type": "string"}},
+                    "artifact_paths": {"type": "array", "items": {"type": "string"}}
+                  }
+                }
+              }
+            }
+          },
+          "blocking": {"type": "boolean"},
+          "shared_asset_ids": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    }
+  }
+}

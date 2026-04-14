@@ -10,6 +10,8 @@ const DEFAULT_FRONTEND_PORT = 4173;
 async function startTodoRuntime(options = {}) {
   const backendHost = options.backendHost || DEFAULT_BACKEND_HOST;
   const frontendHost = options.frontendHost || DEFAULT_FRONTEND_HOST;
+  const backendPublicHost = normalizePublicHost(backendHost);
+  const frontendPublicHost = normalizePublicHost(frontendHost);
   const backendPort = await resolveListenPort(
     backendHost,
     options.backendPort ?? DEFAULT_BACKEND_PORT,
@@ -20,14 +22,18 @@ async function startTodoRuntime(options = {}) {
     options.frontendPort ?? DEFAULT_FRONTEND_PORT,
     'TODO_FRONTEND_PORT'
   );
-  const frontendOrigin = `http://${frontendHost}:${frontendPort}`;
+  const frontendOrigin = `http://${frontendPublicHost}:${frontendPort}`;
 
-  const backend = await startTodoHttpServer({
+  const backendServer = await startTodoHttpServer({
     allowedOrigin: frontendOrigin,
     databasePath: options.databasePath,
     host: backendHost,
     port: backendPort,
   });
+  const backend = {
+    ...backendServer,
+    url: createPublicBaseUrl(backendServer.server, backendPublicHost),
+  };
 
   let frontend;
 
@@ -36,6 +42,7 @@ async function startTodoRuntime(options = {}) {
       apiBaseUrl: backend.url,
       host: frontendHost,
       port: frontendPort,
+      publicHost: frontendPublicHost,
     });
   } catch (error) {
     await backend.close();
@@ -103,6 +110,35 @@ async function resolveListenPort(host, port, envName) {
       });
     });
   });
+}
+
+function normalizePublicHost(host) {
+  if (typeof host !== 'string' || host.trim().length === 0) {
+    return DEFAULT_FRONTEND_HOST;
+  }
+
+  const normalizedHost = host.trim();
+
+  if (
+    normalizedHost === '0.0.0.0' ||
+    normalizedHost === '::' ||
+    normalizedHost === '::0' ||
+    normalizedHost === '::ffff:0.0.0.0'
+  ) {
+    return '127.0.0.1';
+  }
+
+  return normalizedHost;
+}
+
+function createPublicBaseUrl(server, host) {
+  const address = server.address();
+
+  if (!address || typeof address === 'string') {
+    throw new Error('Runtime server address is unavailable.');
+  }
+
+  return `http://${host}:${address.port}`;
 }
 
 module.exports = {

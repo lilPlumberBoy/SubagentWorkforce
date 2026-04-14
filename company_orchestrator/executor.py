@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import threading
@@ -24,6 +25,7 @@ from .live import (
     now_timestamp,
     read_activity,
     record_event,
+    update_activity_observability_timestamps,
     update_activity,
 )
 from .observability import compact_observability_for_report, prompt_metrics, record_llm_call
@@ -39,15 +41,25 @@ from .parallelism import (
     normalize_task_artifact_descriptors,
     task_requires_write_access,
 )
-from .prompts import preview_resolved_inputs, render_prompt, resolve_report_artifact_path, resolve_workspace_input_path
+from .prompts import (
+    compile_task_context_packet,
+    load_input_artifact_for_run,
+    load_task_repair_context,
+    preview_resolved_inputs,
+    render_prompt,
+    resolve_report_artifact_path,
+    resolve_workspace_input_path,
+)
 from .recovery import prepare_activity_retry, reconcile_for_command
 from .schemas import SchemaValidationError, validate_document
+from .task_graph import infer_task_runtime_requirements, load_task_runtime_contract
 from .timeout_policy import resolve_task_timeout_policy, timeout_final_message, timeout_retry_message
 from .worktree_manager import (
     WorkspaceInfo,
     WorktreeError,
     commit_task_workspace,
     ensure_task_workspace_with_refresh,
+    integration_workspace_path,
 )
 
 
@@ -88,12 +100,225 @@ class TaskExecutionRuntime:
     workspace_reused: bool = False
 
 
+def apply_repair_context_to_task(task: dict[str, Any], repair_context: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(repair_context, dict):
+        return task
+    if str(repair_context.get("source") or "").strip() not in {"run_state_repair", "bundle_broad_retry"} and not bool(
+        repair_context.get("allow_broadening_scope")
+    ):
+        return task
+    focus_paths = [
+        str(value).strip()
+        for value in list(repair_context.get("focus_paths") or [])
+        if isinstance(value, str) and str(value).strip() and not Path(str(value).strip()).is_absolute()
+    ]
+    if not focus_paths:
+        return task
+    adjusted = dict(task)
+    writes_existing_paths = [
+        str(value).strip()
+        for value in list(adjusted.get("writes_existing_paths") or [])
+        if isinstance(value, str) and str(value).strip()
+    ]
+    owned_paths = [
+        str(value).strip()
+        for value in list(adjusted.get("owned_paths") or [])
+        if isinstance(value, str) and str(value).strip()
+    ]
+    adjusted["writes_existing_paths"] = sorted({*writes_existing_paths, *focus_paths})
+    adjusted["owned_paths"] = sorted({*owned_paths, *focus_paths})
+    return adjusted
+
+
+def _copy_authoritative_file(source_path: Path, destination_path: Path) -> bool:
+    if not source_path.exists() or not source_path.is_file():
+        return False
+    ensure_dir(destination_path.parent)
+    if destination_path.exists() and source_path.read_bytes() == destination_path.read_bytes():
+        return False
+    shutil.copy2(source_path, destination_path)
+    return True
+
+
+def apply_run_state_repair_preflight(
+    project_root: Path,
+    run_id: str,
+    task: dict[str, Any],
+    runtime: TaskExecutionRuntime,
+    repair_context: dict[str, Any] | None,
+) -> list[str]:
+    if not isinstance(repair_context, dict):
+        return []
+    if str(repair_context.get("source") or "").strip() != "run_state_repair":
+        return []
+    workspace_root = Path(str(runtime.workspace_path)).resolve() if runtime.workspace_path else None
+    integration_root = integration_workspace_path(project_root, run_id)
+    focus_paths = [
+        str(value).strip()
+        for value in list(repair_context.get("focus_paths") or [])
+        if isinstance(value, str) and str(value).strip() and not str(value).strip().startswith("runs/")
+    ]
+    repaired: set[str] = set()
+    for relative_path in focus_paths:
+        source_candidates: list[Path] = []
+        repo_path = (project_root / relative_path).resolve()
+        source_candidates.append(repo_path)
+        if workspace_root is not None:
+            source_candidates.append((workspace_root / relative_path).resolve())
+        source_candidates.append((integration_root / relative_path).resolve())
+        source_path = next((candidate for candidate in source_candidates if candidate.exists() and candidate.is_file()), None)
+        if source_path is None:
+            continue
+        if _copy_authoritative_file(source_path, (integration_root / relative_path).resolve()):
+            repaired.add(relative_path)
+        if workspace_root is not None and _copy_authoritative_file(source_path, (workspace_root / relative_path).resolve()):
+            repaired.add(relative_path)
+    if repaired:
+        runtime.recovery_action = runtime.recovery_action or "run_state_repair"
+    return sorted(repaired)
+
+
+def task_declared_file_paths(task: dict[str, Any]) -> list[str]:
+    paths: set[str] = set()
+    for key in ("owned_paths", "writes_existing_paths"):
+        for value in task.get(key, []):
+            normalized = str(value).strip()
+            if normalized and not Path(normalized).is_absolute() and not normalized.startswith("runs/"):
+                paths.add(normalized)
+    for output in task.get("expected_outputs", []):
+        if not isinstance(output, dict):
+            continue
+        normalized = str(output.get("path") or "").strip()
+        if normalized and not Path(normalized).is_absolute() and not normalized.startswith("runs/"):
+            paths.add(normalized)
+    return sorted(paths)
+
+
+def command_tokens(command: str) -> list[str]:
+    try:
+        outer = shlex.split(command)
+    except ValueError:
+        return [command]
+    if len(outer) >= 3 and outer[1] == "-lc":
+        try:
+            return shlex.split(outer[2])
+        except ValueError:
+            return [outer[2]]
+    return outer
+
+
+def extract_repo_relative_paths_from_command(command: str) -> list[str]:
+    paths: list[str] = []
+    for token in command_tokens(command):
+        normalized = str(token).strip().strip("\"'")
+        if (
+            "/" not in normalized
+            or normalized.startswith(("/", "-", "runs/"))
+            or "$" in normalized
+            or normalized.startswith(".orchestrator-")
+        ):
+            continue
+        if normalized.endswith((";", ",", ")")):
+            normalized = normalized.rstrip(";,)")
+        if normalized:
+            paths.append(normalized)
+    return sorted({path for path in paths if path})
+
+
+def looks_like_validation_command(command: str) -> bool:
+    lowered = command.lower()
+    if "validate:" in lowered:
+        return True
+    tokens = command_tokens(command)
+    joined = " ".join(tokens).lower()
+    if not joined:
+        return False
+    validation_markers = (
+        "npm test",
+        "pnpm test",
+        "yarn test",
+        "node --test",
+        "pytest",
+        "cargo test",
+        "go test",
+    )
+    return any(marker in joined for marker in validation_markers)
+
+
+def infer_attempt_run_state_repair_context(
+    task: dict[str, Any],
+    attempt_events: list[dict[str, Any]],
+    *,
+    existing_repair_context: dict[str, Any] | None,
+    trigger_reason: str,
+) -> dict[str, Any] | None:
+    if isinstance(existing_repair_context, dict) and str(existing_repair_context.get("source") or "").strip() == "run_state_repair":
+        return existing_repair_context
+    declared_validation_commands = [
+        str(item.get("command") or "").strip()
+        for item in task.get("validation", [])
+        if isinstance(item, dict) and str(item.get("command") or "").strip()
+    ]
+    validation_started = False
+    run_report_accessed = False
+    observed_paths: set[str] = set()
+    for event in attempt_events:
+        if event.get("type") != "item.started":
+            continue
+        item = event.get("item", {})
+        if not isinstance(item, dict) or item.get("type") != "command_execution":
+            continue
+        command = str(item.get("command") or "").strip()
+        if not command:
+            continue
+        if any(validation_command in command for validation_command in declared_validation_commands) or looks_like_validation_command(command):
+            validation_started = True
+        if "runs/" in command and ("/reports/" in command or ".json" in command):
+            run_report_accessed = True
+        observed_paths.update(extract_repo_relative_paths_from_command(command))
+    declared_paths = set(task_declared_file_paths(task))
+    extra_paths = sorted(path for path in observed_paths if path not in declared_paths)
+    if not validation_started and not (
+        str(trigger_reason or "").startswith("stall_") and run_report_accessed and extra_paths
+    ):
+        return None
+    if not extra_paths:
+        return None
+    focus_paths = sorted({*declared_paths, *extra_paths})
+    return {
+        "source": "run_state_repair",
+        "summary": "Repair stale run-local state before retrying validation-heavy task execution.",
+        "task_id": str(task.get("task_id") or "").strip(),
+        "objective_id": str(task.get("objective_id") or "").strip(),
+        "trigger_reason": trigger_reason,
+        "focus_paths": focus_paths,
+    }
+
+
+MAX_TASK_EXECUTION_MISSING_FINAL_MESSAGE_RETRIES = 1
+TASK_STALL_TIMEOUT_MIN_SECONDS = 60
+TASK_STALL_TIMEOUT_MAX_SECONDS = 180
+
+
 def coerce_process_text(stream: str | bytes | None) -> str:
     if stream is None:
         return ""
     if isinstance(stream, bytes):
         return stream.decode("utf-8", errors="replace")
     return stream
+
+
+def task_stall_timeout_seconds(timeout_seconds: int) -> int:
+    return max(
+        1,
+        min(
+            timeout_seconds,
+            max(
+                TASK_STALL_TIMEOUT_MIN_SECONDS,
+                min(TASK_STALL_TIMEOUT_MAX_SECONDS, max(1, timeout_seconds // 4)),
+            ),
+        ),
+    )
 
 
 def run_codex_command(
@@ -199,6 +424,53 @@ def run_codex_command(
     )
 
 
+def build_task_execution_materials(
+    project_root: Path,
+    run_id: str,
+    task_path: Path,
+    task: dict[str, Any],
+    *,
+    sandbox_mode: str,
+    runtime: TaskExecutionRuntime,
+) -> tuple[Path, str, dict[str, Any], str]:
+    task_working_directory = runtime.workspace_path or task.get("working_directory")
+    if task_working_directory:
+        working_directory = Path(task_working_directory)
+        if not working_directory.is_absolute():
+            working_directory = (project_root / working_directory).resolve()
+        else:
+            working_directory = working_directory.resolve()
+    else:
+        working_directory = project_root
+    task_sandbox_mode = effective_sandbox_mode(task, sandbox_mode)
+    role_kind = "worker"
+    task_context = compile_task_context_packet(
+        project_root,
+        run_id,
+        task,
+        files_loaded=[],
+        prompt_path=str((project_root / "runs" / run_id / "prompt-logs" / f"{task['task_id']}.prompt.md").relative_to(project_root)),
+        role_kind=role_kind,
+        working_directory=working_directory,
+        sandbox_mode=task_sandbox_mode,
+    )
+    validate_compiled_task_context(task_context)
+    materialized_read_paths = materialize_task_context_files(project_root, run_id, task, working_directory)
+    task_context["materialized_read_paths"] = materialized_read_paths
+    prompt_metadata = render_prompt(
+        project_root,
+        run_id,
+        task_path,
+        working_directory=working_directory,
+        sandbox_mode=task_sandbox_mode,
+        task_payload=task,
+        compiled_task_context=task_context,
+    )
+    prompt_text = read_text(project_root / prompt_metadata["prompt_path"])
+    execution_prompt = build_execution_prompt(prompt_text)
+    return working_directory, task_sandbox_mode, prompt_metadata, execution_prompt
+
+
 def execute_task(
     project_root: Path,
     run_id: str,
@@ -216,11 +488,12 @@ def execute_task(
     if not task_path.exists():
         raise ExecutorError(f"Task {task_id} does not exist for run {run_id}")
 
-    task = read_json(task_path)
+    repair_context = load_task_repair_context(project_root, run_id, task_id)
+    task = apply_repair_context_to_task(read_json(task_path), repair_context)
     normalize_task_artifact_descriptors(task)
-    if task_requires_write_access(task) and task.get("execution_mode") == "read_only":
-        task["execution_mode"] = "isolated_write"
     canonicalize_validation_commands(task)
+    runtime_requirements = infer_task_runtime_requirements(task)
+    task["execution_mode"] = resolve_task_execution_mode(task, runtime_requirements)
     write_json(task_path, task)
     runtime = runtime or TaskExecutionRuntime()
     timeout_policy = resolve_task_timeout_policy(task["phase"], task.get("execution_mode", "read_only"), timeout_seconds)
@@ -233,29 +506,29 @@ def execute_task(
     if previous_activity is not None:
         runtime.attempt = int(previous_activity.get("attempt", 1)) + 1
     runtime = prepare_task_runtime(project_root, run_id, task, runtime=runtime)
-    task_working_directory = runtime.workspace_path or task.get("working_directory")
-    if task_working_directory:
-        working_directory = Path(task_working_directory)
-        if not working_directory.is_absolute():
-            working_directory = (project_root / working_directory).resolve()
-        else:
-            working_directory = working_directory.resolve()
-    else:
-        working_directory = project_root
-    materialize_task_context_files(project_root, run_id, task, working_directory)
-    task_sandbox_mode = effective_sandbox_mode(task, sandbox_mode)
-    prompt_metadata = render_prompt(
+    repaired_paths = set(apply_run_state_repair_preflight(project_root, run_id, task, runtime, repair_context))
+    working_directory, task_sandbox_mode, prompt_metadata, execution_prompt = build_task_execution_materials(
         project_root,
         run_id,
         task_path,
-        working_directory=working_directory,
-        sandbox_mode=task_sandbox_mode,
-        task_payload=task,
+        task,
+        sandbox_mode=sandbox_mode,
+        runtime=runtime,
     )
-    prompt_text = read_text(project_root / prompt_metadata["prompt_path"])
-    execution_prompt = build_execution_prompt(prompt_text)
     prompt_observability = prompt_metrics(execution_prompt)
     execution_dir = ensure_dir(run_dir / "executions")
+    task_runtime_contract = load_task_runtime_contract(
+        run_dir,
+        phase=str(task.get("phase") or ""),
+        objective_id=str(task.get("objective_id") or ""),
+        capability=str(task.get("capability") or ""),
+        task_id=task_id,
+    )
+    runtime_requirements = (
+        dict(task_runtime_contract.get("runtime_requirements", {}))
+        if isinstance(task_runtime_contract, dict) and isinstance(task_runtime_contract.get("runtime_requirements"), dict)
+        else infer_task_runtime_requirements(task)
+    )
     output_schema_path = project_root / "orchestrator" / "schemas" / "executor-response.v1.json"
     last_message_path = execution_dir / f"{task_id}.last-message.json"
     stdout_path = execution_dir / f"{task_id}.stdout.jsonl"
@@ -264,6 +537,7 @@ def execute_task(
     report_path = run_dir / "reports" / f"{task_id}.json"
     clear_text(stdout_path)
     clear_text(stderr_path)
+    clear_text(last_message_path)
     command = build_codex_command(
         codex_path=codex_path,
         working_directory=working_directory,
@@ -271,6 +545,12 @@ def execute_task(
         last_message_path=last_message_path,
         sandbox_mode=task_sandbox_mode,
         additional_directories=task.get("additional_directories", []),
+    )
+    temp_root = task_temp_root(
+        run_dir,
+        task_id=task_id,
+        attempt=runtime.attempt,
+        runtime_requirements=runtime_requirements,
     )
     activity_state = ensure_activity(
         project_root,
@@ -301,6 +581,16 @@ def execute_task(
         recovery_action=runtime.recovery_action,
         begin_attempt=previous_activity is not None,
     )
+    if repaired_paths:
+        record_event(
+            project_root,
+            run_id,
+            phase=task["phase"],
+            activity_id=task_id,
+            event_type="task.run_state_repair_applied",
+            message=f"Patched stale run-local files before retrying task {task_id}.",
+            payload={"paths": sorted(repaired_paths)},
+        )
     for warning in runtime.runtime_warnings:
         append_activity_warning(
             project_root,
@@ -348,7 +638,36 @@ def execute_task(
         },
     )
 
+    stdout_attempts: list[str] = []
+    stderr_attempts: list[str] = []
+    missing_final_message_retry_used = False
+    stall_retry_used = False
+    total_attempts = timeout_policy.max_timeout_retries + 1
+    missing_final_message_attempt = 0
+    stall_timeout_seconds = task_stall_timeout_seconds(timeout_policy.timeout_seconds)
+    task_progress = {
+        "last_stream_activity_at_monotonic": None,
+        "thread_started_at_monotonic": None,
+        "turn_started_at_monotonic": None,
+        "process_started_at_monotonic": None,
+    }
+    final_response: str | None = None
+
     def on_stdout_line(raw_line: str) -> None:
+        task_progress["last_stream_activity_at_monotonic"] = time.monotonic()
+        stripped_line = raw_line.strip()
+        if stripped_line:
+            try:
+                event_payload = json.loads(stripped_line)
+            except json.JSONDecodeError:
+                event_payload = None
+            if isinstance(event_payload, dict):
+                activity_at = task_progress["last_stream_activity_at_monotonic"]
+                event_type = event_payload.get("type")
+                if event_type == "thread.started":
+                    task_progress["thread_started_at_monotonic"] = activity_at
+                elif event_type == "turn.started":
+                    task_progress["turn_started_at_monotonic"] = activity_at
         append_text(stdout_path, raw_line + "\n")
         note_activity_stream(
             project_root,
@@ -359,6 +678,7 @@ def execute_task(
         handle_codex_event_line(project_root, run_id, task["phase"], task_id, raw_line)
 
     def on_stderr_line(raw_line: str) -> None:
+        task_progress["last_stream_activity_at_monotonic"] = time.monotonic()
         append_text(stderr_path, raw_line)
         note_activity_stream(
             project_root,
@@ -368,6 +688,7 @@ def execute_task(
         )
 
     def on_process_started(process: subprocess.Popen[str]) -> None:
+        task_progress["process_started_at_monotonic"] = time.monotonic()
         update_activity(
             project_root,
             run_id,
@@ -380,102 +701,209 @@ def execute_task(
             },
         )
 
-    stdout_attempts: list[str] = []
-    stderr_attempts: list[str] = []
-    total_attempts = timeout_policy.max_timeout_retries + 1
-    completed: CodexProcessResult | None = None
-    call_started_at = now_timestamp()
-    call_completed_at = now_timestamp()
-    call_latency_ms = 0
-    for timeout_attempt in range(1, total_attempts + 1):
+    def stall_reason() -> str | None:
+        last_activity_at = task_progress["last_stream_activity_at_monotonic"]
+        now_monotonic = time.monotonic()
+        turn_started_at = task_progress["turn_started_at_monotonic"]
+        thread_started_at = task_progress["thread_started_at_monotonic"]
+        process_started_at = task_progress["process_started_at_monotonic"]
+        if turn_started_at is not None and last_activity_at is not None and now_monotonic - last_activity_at >= stall_timeout_seconds:
+            return "stall_after_turn_started"
+        if thread_started_at is not None and last_activity_at is not None and now_monotonic - last_activity_at >= stall_timeout_seconds:
+            return "stall_after_thread_started"
+        if process_started_at is not None and last_activity_at is None and now_monotonic - process_started_at >= stall_timeout_seconds:
+            return "stall_before_first_output"
+        return None
+
+    while final_response is None:
+        completed: CodexProcessResult | None = None
         call_started_at = now_timestamp()
-        call_started_monotonic = time.monotonic()
-        try:
-            completed = run_codex_command(
-                command,
-                prompt=execution_prompt,
-                cwd=project_root,
-                env=build_exec_environment(),
-                timeout_seconds=timeout_policy.timeout_seconds,
-                on_stdout_line=on_stdout_line,
-                on_stderr_line=on_stderr_line,
-                on_process_started=on_process_started,
-            )
-            call_completed_at = now_timestamp()
-            call_latency_ms = int((time.monotonic() - call_started_monotonic) * 1000)
-            break
-        except subprocess.TimeoutExpired as exc:
-            timeout_stdout = coerce_process_text(exc.stdout)
-            timeout_stderr = coerce_process_text(exc.stderr)
-            if timeout_stdout:
-                append_text(stdout_path, timeout_stdout)
-                if not timeout_stdout.endswith("\n"):
-                    append_text(stdout_path, "\n")
-            if timeout_stderr:
-                append_text(stderr_path, timeout_stderr)
-            stdout_attempts.append(coerce_process_text(exc.stdout))
-            stderr_attempts.append(coerce_process_text(exc.stderr))
-            call_completed_at = now_timestamp()
-            call_latency_ms = int((time.monotonic() - call_started_monotonic) * 1000)
-            current_activity = read_activity(project_root, run_id, task_id)
-            queue_wait_ms = int((current_activity.get("observability", {}) or {}).get("queue_wait_ms", 0))
-            stdout_bytes = len(timeout_stdout.encode("utf-8"))
-            stderr_bytes = len(timeout_stderr.encode("utf-8"))
-            record_llm_call(
-                project_root,
-                run_id,
-                phase=task["phase"],
-                activity_id=task_id,
-                kind="task_execution",
-                attempt=runtime.attempt,
-                started_at=call_started_at,
-                completed_at=call_completed_at,
-                latency_ms=call_latency_ms,
-                queue_wait_ms=queue_wait_ms,
-                prompt_char_count=prompt_observability["prompt_char_count"],
-                prompt_line_count=prompt_observability["prompt_line_count"],
-                prompt_bytes=prompt_observability["prompt_bytes"],
-                timed_out=True,
-                retry_scheduled=timeout_attempt <= timeout_policy.max_timeout_retries,
-                success=False,
-                input_tokens=0,
-                cached_input_tokens=0,
-                output_tokens=0,
-                stdout_bytes=stdout_bytes,
-                stderr_bytes=stderr_bytes,
-                timeout_seconds=timeout_policy.timeout_seconds,
-                error="timeout",
-                label=task_id,
-            )
-            update_activity(
-                project_root,
-                run_id,
-                task_id,
-                observability=accumulate_observability(
-                    current_activity["observability"],
+        call_completed_at = now_timestamp()
+        call_latency_ms = 0
+        for timeout_attempt in range(1, total_attempts + 1):
+            clear_text(last_message_path)
+            call_started_at = now_timestamp()
+            call_started_monotonic = time.monotonic()
+            try:
+                completed = run_codex_command(
+                    command,
+                    prompt=execution_prompt,
+                    cwd=project_root,
+                    env=build_exec_environment(temp_root),
+                    timeout_seconds=timeout_policy.timeout_seconds,
+                    on_stdout_line=on_stdout_line,
+                    on_stderr_line=on_stderr_line,
+                    on_process_started=on_process_started,
+                    stall_timeout_seconds=stall_timeout_seconds,
+                    stall_reason=stall_reason,
+                )
+                call_completed_at = now_timestamp()
+                call_latency_ms = int((time.monotonic() - call_started_monotonic) * 1000)
+                break
+            except CodexProcessStall as exc:
+                stall_stdout = coerce_process_text(exc.output)
+                stall_stderr = coerce_process_text(exc.stderr)
+                if stall_stdout:
+                    append_text(stdout_path, stall_stdout)
+                    if not stall_stdout.endswith("\n"):
+                        append_text(stdout_path, "\n")
+                if stall_stderr:
+                    append_text(stderr_path, stall_stderr)
+                stdout_attempts.append(stall_stdout)
+                stderr_attempts.append(stall_stderr)
+                call_completed_at = now_timestamp()
+                call_latency_ms = int((time.monotonic() - call_started_monotonic) * 1000)
+                current_activity = read_activity(project_root, run_id, task_id)
+                queue_wait_ms = int((current_activity.get("observability", {}) or {}).get("queue_wait_ms", 0))
+                stdout_bytes = len(stall_stdout.encode("utf-8"))
+                stderr_bytes = len(stall_stderr.encode("utf-8"))
+                record_llm_call(
+                    project_root,
+                    run_id,
+                    phase=task["phase"],
+                    activity_id=task_id,
+                    kind="task_execution",
+                    attempt=runtime.attempt,
+                    started_at=call_started_at,
+                    completed_at=call_completed_at,
                     latency_ms=call_latency_ms,
+                    queue_wait_ms=queue_wait_ms,
+                    prompt_char_count=prompt_observability["prompt_char_count"],
+                    prompt_line_count=prompt_observability["prompt_line_count"],
+                    prompt_bytes=prompt_observability["prompt_bytes"],
+                    timed_out=False,
+                    retry_scheduled=timeout_attempt <= timeout_policy.max_timeout_retries,
+                    success=False,
+                    input_tokens=0,
+                    cached_input_tokens=0,
+                    output_tokens=0,
                     stdout_bytes=stdout_bytes,
                     stderr_bytes=stderr_bytes,
-                    timed_out=True,
-                    timeout_retry_scheduled=timeout_attempt <= timeout_policy.max_timeout_retries,
-                ),
-            )
-            if timeout_attempt <= timeout_policy.max_timeout_retries:
-                message = timeout_retry_message(
-                    "task",
-                    task_id,
                     timeout_seconds=timeout_policy.timeout_seconds,
-                    attempt=timeout_attempt,
-                    max_attempts=total_attempts,
+                    error=exc.reason,
+                    label=task_id,
                 )
                 update_activity(
                     project_root,
                     run_id,
                     task_id,
-                    status="recovering",
-                    progress_stage="recovering",
+                    observability=accumulate_observability(
+                        current_activity["observability"],
+                        latency_ms=call_latency_ms,
+                        stdout_bytes=stdout_bytes,
+                        stderr_bytes=stderr_bytes,
+                        timed_out=False,
+                        timeout_retry_scheduled=False,
+                    ),
+                )
+                record_event(
+                    project_root,
+                    run_id,
+                    phase=task["phase"],
+                    activity_id=task_id,
+                    event_type="task.stall_detected",
+                    message=f"Task {task_id} stalled during execution.",
+                    payload={
+                        "reason": exc.reason,
+                        "stall_timeout_seconds": exc.stall_seconds,
+                    },
+                )
+                inferred_repair_context = infer_attempt_run_state_repair_context(
+                    task,
+                    parse_jsonl_events(stall_stdout),
+                    existing_repair_context=repair_context,
+                    trigger_reason=exc.reason,
+                )
+                if inferred_repair_context is not None:
+                    repair_context = inferred_repair_context
+                    task = apply_repair_context_to_task(task, repair_context)
+                    runtime_requirements = infer_task_runtime_requirements(task)
+                    task["execution_mode"] = resolve_task_execution_mode(task, runtime_requirements)
+                    write_json(task_path, task)
+                    repaired_paths.update(
+                        apply_run_state_repair_preflight(project_root, run_id, task, runtime, repair_context)
+                    )
+                    working_directory, task_sandbox_mode, prompt_metadata, execution_prompt = build_task_execution_materials(
+                        project_root,
+                        run_id,
+                        task_path,
+                        task,
+                        sandbox_mode=sandbox_mode,
+                        runtime=runtime,
+                    )
+                    prompt_observability = prompt_metrics(execution_prompt)
+                    command = build_codex_command(
+                        codex_path=codex_path,
+                        working_directory=working_directory,
+                        output_schema_path=output_schema_path,
+                        last_message_path=last_message_path,
+                        sandbox_mode=task_sandbox_mode,
+                        additional_directories=task.get("additional_directories", []),
+                    )
+                    temp_root = task_temp_root(
+                        run_dir,
+                        task_id=task_id,
+                        attempt=runtime.attempt,
+                        runtime_requirements=runtime_requirements,
+                    )
+                    record_event(
+                        project_root,
+                        run_id,
+                        phase=task["phase"],
+                        activity_id=task_id,
+                        event_type="task.run_state_repair_applied",
+                        message=f"Expanded task {task_id} into run-state repair before retrying after stall.",
+                        payload={"paths": sorted(repaired_paths), "trigger_reason": exc.reason},
+                    )
+                if timeout_attempt <= timeout_policy.max_timeout_retries:
+                    stall_retry_used = True
+                    message = (
+                        f"Task {task_id} stalled after {exc.stall_seconds} seconds "
+                        f"({exc.reason}); retrying ({timeout_attempt}/{total_attempts})."
+                    )
+                    update_activity(
+                        project_root,
+                        run_id,
+                        task_id,
+                        status="recovering",
+                        progress_stage="recovering",
+                        current_activity=message,
+                        status_reason="stall_retry_scheduled",
+                        warnings=list(runtime.runtime_warnings),
+                        parallel_execution_requested=runtime.parallel_execution_requested,
+                        parallel_execution_granted=runtime.parallel_execution_granted,
+                        parallel_fallback_reason=runtime.parallel_fallback_reason,
+                        workspace_path=runtime.workspace_path,
+                        branch_name=runtime.branch_name,
+                        process_metadata=None,
+                    )
+                    record_event(
+                        project_root,
+                        run_id,
+                        phase=task["phase"],
+                        activity_id=task_id,
+                        event_type="task.retry_scheduled",
+                        message=message,
+                        payload={
+                            "reason": exc.reason,
+                            "stall_timeout_seconds": exc.stall_seconds,
+                            "attempt": timeout_attempt,
+                            "max_attempts": total_attempts,
+                        },
+                    )
+                    continue
+                message = (
+                    f"codex exec stalled after {exc.stall_seconds} seconds for task {task_id} "
+                    f"({exc.reason}); retry-activity is recommended."
+                )
+                update_activity(
+                    project_root,
+                    run_id,
+                    task_id,
+                    status="failed",
+                    progress_stage="failed",
                     current_activity=message,
-                    status_reason="timeout_retry_scheduled",
+                    status_reason=exc.reason,
                     warnings=list(runtime.runtime_warnings),
                     parallel_execution_requested=runtime.parallel_execution_requested,
                     parallel_execution_granted=runtime.parallel_execution_granted,
@@ -489,31 +917,256 @@ def execute_task(
                     run_id,
                     phase=task["phase"],
                     activity_id=task_id,
-                    event_type="task.timeout_retry_scheduled",
+                    event_type="task.failed",
                     message=message,
                     payload={
-                        "timeout_seconds": timeout_policy.timeout_seconds,
-                        "attempt": timeout_attempt,
-                        "max_attempts": total_attempts,
+                        "reason": exc.reason,
+                        "stall_timeout_seconds": exc.stall_seconds,
                     },
                 )
-                continue
-            failure_message = timeout_final_message(
-                "task",
-                task_id,
-                timeout_seconds=timeout_policy.timeout_seconds,
-                attempts=total_attempts,
-                resume_recommended=task.get("execution_mode", "read_only") == "isolated_write",
-                explicit_override=timeout_policy.source == "explicit",
-            )
+                raise ExecutorError(message) from exc
+            except subprocess.TimeoutExpired as exc:
+                timeout_stdout = coerce_process_text(exc.stdout)
+                timeout_stderr = coerce_process_text(exc.stderr)
+                if timeout_stdout:
+                    append_text(stdout_path, timeout_stdout)
+                    if not timeout_stdout.endswith("\n"):
+                        append_text(stdout_path, "\n")
+                if timeout_stderr:
+                    append_text(stderr_path, timeout_stderr)
+                stdout_attempts.append(coerce_process_text(exc.stdout))
+                stderr_attempts.append(coerce_process_text(exc.stderr))
+                call_completed_at = now_timestamp()
+                call_latency_ms = int((time.monotonic() - call_started_monotonic) * 1000)
+                current_activity = read_activity(project_root, run_id, task_id)
+                queue_wait_ms = int((current_activity.get("observability", {}) or {}).get("queue_wait_ms", 0))
+                stdout_bytes = len(timeout_stdout.encode("utf-8"))
+                stderr_bytes = len(timeout_stderr.encode("utf-8"))
+                record_llm_call(
+                    project_root,
+                    run_id,
+                    phase=task["phase"],
+                    activity_id=task_id,
+                    kind="task_execution",
+                    attempt=runtime.attempt,
+                    started_at=call_started_at,
+                    completed_at=call_completed_at,
+                    latency_ms=call_latency_ms,
+                    queue_wait_ms=queue_wait_ms,
+                    prompt_char_count=prompt_observability["prompt_char_count"],
+                    prompt_line_count=prompt_observability["prompt_line_count"],
+                    prompt_bytes=prompt_observability["prompt_bytes"],
+                    timed_out=True,
+                    retry_scheduled=timeout_attempt <= timeout_policy.max_timeout_retries,
+                    success=False,
+                    input_tokens=0,
+                    cached_input_tokens=0,
+                    output_tokens=0,
+                    stdout_bytes=stdout_bytes,
+                    stderr_bytes=stderr_bytes,
+                    timeout_seconds=timeout_policy.timeout_seconds,
+                    error="timeout",
+                    label=task_id,
+                )
+                update_activity(
+                    project_root,
+                    run_id,
+                    task_id,
+                    observability=accumulate_observability(
+                        current_activity["observability"],
+                        latency_ms=call_latency_ms,
+                        stdout_bytes=stdout_bytes,
+                        stderr_bytes=stderr_bytes,
+                        timed_out=True,
+                        timeout_retry_scheduled=timeout_attempt <= timeout_policy.max_timeout_retries,
+                    ),
+                )
+                if timeout_attempt <= timeout_policy.max_timeout_retries:
+                    message = timeout_retry_message(
+                        "task",
+                        task_id,
+                        timeout_seconds=timeout_policy.timeout_seconds,
+                        attempt=timeout_attempt,
+                        max_attempts=total_attempts,
+                    )
+                    update_activity(
+                        project_root,
+                        run_id,
+                        task_id,
+                        status="recovering",
+                        progress_stage="recovering",
+                        current_activity=message,
+                        status_reason="timeout_retry_scheduled",
+                        warnings=list(runtime.runtime_warnings),
+                        parallel_execution_requested=runtime.parallel_execution_requested,
+                        parallel_execution_granted=runtime.parallel_execution_granted,
+                        parallel_fallback_reason=runtime.parallel_fallback_reason,
+                        workspace_path=runtime.workspace_path,
+                        branch_name=runtime.branch_name,
+                        process_metadata=None,
+                    )
+                    record_event(
+                        project_root,
+                        run_id,
+                        phase=task["phase"],
+                        activity_id=task_id,
+                        event_type="task.timeout_retry_scheduled",
+                        message=message,
+                        payload={
+                            "timeout_seconds": timeout_policy.timeout_seconds,
+                            "attempt": timeout_attempt,
+                            "max_attempts": total_attempts,
+                        },
+                    )
+                    inferred_repair_context = infer_attempt_run_state_repair_context(
+                        task,
+                        parse_jsonl_events(timeout_stdout),
+                        existing_repair_context=repair_context,
+                        trigger_reason="timeout_exhausted",
+                    )
+                    if inferred_repair_context is not None:
+                        repair_context = inferred_repair_context
+                        task = apply_repair_context_to_task(task, repair_context)
+                        runtime_requirements = infer_task_runtime_requirements(task)
+                        task["execution_mode"] = resolve_task_execution_mode(task, runtime_requirements)
+                        write_json(task_path, task)
+                        repaired_paths.update(
+                            apply_run_state_repair_preflight(project_root, run_id, task, runtime, repair_context)
+                        )
+                        working_directory, task_sandbox_mode, prompt_metadata, execution_prompt = build_task_execution_materials(
+                            project_root,
+                            run_id,
+                            task_path,
+                            task,
+                            sandbox_mode=sandbox_mode,
+                            runtime=runtime,
+                        )
+                        prompt_observability = prompt_metrics(execution_prompt)
+                        command = build_codex_command(
+                            codex_path=codex_path,
+                            working_directory=working_directory,
+                            output_schema_path=output_schema_path,
+                            last_message_path=last_message_path,
+                            sandbox_mode=task_sandbox_mode,
+                            additional_directories=task.get("additional_directories", []),
+                        )
+                        temp_root = task_temp_root(
+                            run_dir,
+                            task_id=task_id,
+                            attempt=runtime.attempt,
+                            runtime_requirements=runtime_requirements,
+                        )
+                        record_event(
+                            project_root,
+                            run_id,
+                            phase=task["phase"],
+                            activity_id=task_id,
+                            event_type="task.run_state_repair_applied",
+                            message=f"Expanded task {task_id} into run-state repair before retrying after timeout.",
+                            payload={"paths": sorted(repaired_paths), "trigger_reason": "timeout_exhausted"},
+                        )
+                    continue
+                failure_message = timeout_final_message(
+                    "task",
+                    task_id,
+                    timeout_seconds=timeout_policy.timeout_seconds,
+                    attempts=total_attempts,
+                    resume_recommended=task.get("execution_mode", "read_only") == "isolated_write",
+                    explicit_override=timeout_policy.source == "explicit",
+                )
+                update_activity(
+                    project_root,
+                    run_id,
+                    task_id,
+                    status="failed",
+                    progress_stage="failed",
+                    current_activity=failure_message,
+                    status_reason="timeout_exhausted",
+                    warnings=list(runtime.runtime_warnings),
+                    parallel_execution_requested=runtime.parallel_execution_requested,
+                    parallel_execution_granted=runtime.parallel_execution_granted,
+                    parallel_fallback_reason=runtime.parallel_fallback_reason,
+                    workspace_path=runtime.workspace_path,
+                    branch_name=runtime.branch_name,
+                    process_metadata=None,
+                )
+                record_event(
+                    project_root,
+                    run_id,
+                    phase=task["phase"],
+                    activity_id=task_id,
+                    event_type="task.failed",
+                    message=failure_message,
+                    payload={"timeout_seconds": timeout_policy.timeout_seconds, "attempts": total_attempts},
+                )
+                raise ExecutorError(failure_message) from exc
+        assert completed is not None
+        stdout_attempts.append(completed.stdout)
+        stderr_attempts.append(completed.stderr)
+
+        events = parse_jsonl_events(completed.stdout)
+        usage = extract_usage(events) or {}
+        final_response_candidate = extract_final_response_with_fallback(
+            events,
+            last_message_path=last_message_path,
+        )
+        current_activity = read_activity(project_root, run_id, task_id)
+        queue_wait_ms = int((current_activity.get("observability", {}) or {}).get("queue_wait_ms", 0))
+        stdout_bytes = len(completed.stdout.encode("utf-8"))
+        stderr_bytes = len(completed.stderr.encode("utf-8"))
+        failure = extract_turn_failure(events)
+        llm_error = failure or ("missing_final_agent_message" if final_response_candidate is None else None)
+        record_llm_call(
+            project_root,
+            run_id,
+            phase=task["phase"],
+            activity_id=task_id,
+            kind="task_execution",
+            attempt=runtime.attempt,
+            started_at=call_started_at,
+            completed_at=call_completed_at,
+            latency_ms=call_latency_ms,
+            queue_wait_ms=queue_wait_ms,
+            prompt_char_count=prompt_observability["prompt_char_count"],
+            prompt_line_count=prompt_observability["prompt_line_count"],
+            prompt_bytes=prompt_observability["prompt_bytes"],
+            timed_out=False,
+            retry_scheduled=False,
+            success=completed.returncode == 0 and llm_error is None,
+            input_tokens=int(usage.get("input_tokens", 0)),
+            cached_input_tokens=int(usage.get("cached_input_tokens", 0)),
+            output_tokens=int(usage.get("output_tokens", 0)),
+            stdout_bytes=stdout_bytes,
+            stderr_bytes=stderr_bytes,
+            timeout_seconds=timeout_policy.timeout_seconds,
+            error=llm_error,
+            label=task_id,
+        )
+        update_activity(
+            project_root,
+            run_id,
+            task_id,
+            observability=accumulate_observability(
+                current_activity["observability"],
+                latency_ms=call_latency_ms,
+                input_tokens=int(usage.get("input_tokens", 0)),
+                cached_input_tokens=int(usage.get("cached_input_tokens", 0)),
+                output_tokens=int(usage.get("output_tokens", 0)),
+                stdout_bytes=stdout_bytes,
+                stderr_bytes=stderr_bytes,
+                timed_out=False,
+                timeout_retry_scheduled=False,
+            ),
+        )
+        if completed.returncode != 0 or failure is not None:
+            message = failure or completed.stderr.strip() or f"codex exec exited with code {completed.returncode}"
             update_activity(
                 project_root,
                 run_id,
                 task_id,
                 status="failed",
                 progress_stage="failed",
-                current_activity=failure_message,
-                status_reason="timeout_exhausted",
+                current_activity=message,
                 warnings=list(runtime.runtime_warnings),
                 parallel_execution_requested=runtime.parallel_execution_requested,
                 parallel_execution_granted=runtime.parallel_execution_granted,
@@ -528,92 +1181,76 @@ def execute_task(
                 phase=task["phase"],
                 activity_id=task_id,
                 event_type="task.failed",
-                message=failure_message,
-                payload={"timeout_seconds": timeout_policy.timeout_seconds, "attempts": total_attempts},
+                message=f"Task {task_id} failed.",
+                payload={"error": message},
             )
-            raise ExecutorError(failure_message) from exc
-    assert completed is not None
-    stdout_attempts.append(completed.stdout)
-    stderr_attempts.append(completed.stderr)
-
-    events = parse_jsonl_events(completed.stdout)
-    usage = extract_usage(events) or {}
-    current_activity = read_activity(project_root, run_id, task_id)
-    queue_wait_ms = int((current_activity.get("observability", {}) or {}).get("queue_wait_ms", 0))
-    stdout_bytes = len(completed.stdout.encode("utf-8"))
-    stderr_bytes = len(completed.stderr.encode("utf-8"))
-    record_llm_call(
-        project_root,
-        run_id,
-        phase=task["phase"],
-        activity_id=task_id,
-        kind="task_execution",
-        attempt=runtime.attempt,
-        started_at=call_started_at,
-        completed_at=call_completed_at,
-        latency_ms=call_latency_ms,
-        queue_wait_ms=queue_wait_ms,
-        prompt_char_count=prompt_observability["prompt_char_count"],
-        prompt_line_count=prompt_observability["prompt_line_count"],
-        prompt_bytes=prompt_observability["prompt_bytes"],
-        timed_out=False,
-        retry_scheduled=False,
-        success=completed.returncode == 0 and extract_turn_failure(events) is None,
-        input_tokens=int(usage.get("input_tokens", 0)),
-        cached_input_tokens=int(usage.get("cached_input_tokens", 0)),
-        output_tokens=int(usage.get("output_tokens", 0)),
-        stdout_bytes=stdout_bytes,
-        stderr_bytes=stderr_bytes,
-        timeout_seconds=timeout_policy.timeout_seconds,
-        error=extract_turn_failure(events),
-        label=task_id,
-    )
-    update_activity(
-        project_root,
-        run_id,
-        task_id,
-        observability=accumulate_observability(
-            current_activity["observability"],
-            latency_ms=call_latency_ms,
-            input_tokens=int(usage.get("input_tokens", 0)),
-            cached_input_tokens=int(usage.get("cached_input_tokens", 0)),
-            output_tokens=int(usage.get("output_tokens", 0)),
-            stdout_bytes=stdout_bytes,
-            stderr_bytes=stderr_bytes,
-            timed_out=False,
-            timeout_retry_scheduled=False,
-        ),
-    )
-    failure = extract_turn_failure(events)
-    if completed.returncode != 0 or failure is not None:
-        message = failure or completed.stderr.strip() or f"codex exec exited with code {completed.returncode}"
-        update_activity(
-            project_root,
-            run_id,
-            task_id,
-            status="failed",
-            progress_stage="failed",
-            current_activity=message,
-            warnings=list(runtime.runtime_warnings),
-            parallel_execution_requested=runtime.parallel_execution_requested,
-            parallel_execution_granted=runtime.parallel_execution_granted,
-            parallel_fallback_reason=runtime.parallel_fallback_reason,
-            workspace_path=runtime.workspace_path,
-            branch_name=runtime.branch_name,
-            process_metadata=None,
-        )
-        record_event(
-            project_root,
-            run_id,
-            phase=task["phase"],
-            activity_id=task_id,
-            event_type="task.failed",
-            message=f"Task {task_id} failed.",
-            payload={"error": message},
-        )
-        raise ExecutorError(message)
-
-    final_response = extract_final_response(events)
+            raise ExecutorError(message)
+        if final_response_candidate is None:
+            missing_final_message_attempt += 1
+            if missing_final_message_attempt <= MAX_TASK_EXECUTION_MISSING_FINAL_MESSAGE_RETRIES:
+                missing_final_message_retry_used = True
+                message = (
+                    f"Task {task_id} produced no final agent message; retrying "
+                    f"({missing_final_message_attempt}/{MAX_TASK_EXECUTION_MISSING_FINAL_MESSAGE_RETRIES + 1})."
+                )
+                update_activity(
+                    project_root,
+                    run_id,
+                    task_id,
+                    status="recovering",
+                    progress_stage="recovering",
+                    current_activity=message,
+                    status_reason="missing_final_message_retry_scheduled",
+                    warnings=list(runtime.runtime_warnings),
+                    parallel_execution_requested=runtime.parallel_execution_requested,
+                    parallel_execution_granted=runtime.parallel_execution_granted,
+                    parallel_fallback_reason=runtime.parallel_fallback_reason,
+                    workspace_path=runtime.workspace_path,
+                    branch_name=runtime.branch_name,
+                    process_metadata=None,
+                )
+                record_event(
+                    project_root,
+                    run_id,
+                    phase=task["phase"],
+                    activity_id=task_id,
+                    event_type="task.retry_scheduled",
+                    message=message,
+                    payload={
+                        "reason": "missing_final_agent_message",
+                        "attempt": missing_final_message_attempt,
+                        "max_attempts": MAX_TASK_EXECUTION_MISSING_FINAL_MESSAGE_RETRIES + 1,
+                    },
+                )
+                continue
+            message = "No final agent message was found in codex exec output"
+            update_activity(
+                project_root,
+                run_id,
+                task_id,
+                status="failed",
+                progress_stage="failed",
+                current_activity=message,
+                status_reason="missing_final_agent_message",
+                warnings=list(runtime.runtime_warnings),
+                parallel_execution_requested=runtime.parallel_execution_requested,
+                parallel_execution_granted=runtime.parallel_execution_granted,
+                parallel_fallback_reason=runtime.parallel_fallback_reason,
+                workspace_path=runtime.workspace_path,
+                branch_name=runtime.branch_name,
+                process_metadata=None,
+            )
+            record_event(
+                project_root,
+                run_id,
+                phase=task["phase"],
+                activity_id=task_id,
+                event_type="task.failed",
+                message=f"Task {task_id} failed during execution.",
+                payload={"error": message, "reason": "missing_final_agent_message"},
+            )
+            raise ExecutorError(message)
+        final_response = final_response_candidate
     try:
         parsed_response = json.loads(final_response)
     except json.JSONDecodeError as exc:
@@ -634,6 +1271,7 @@ def execute_task(
         )
         raise ExecutorError(f"Final response was not valid JSON: {final_response}") from exc
 
+    parsed_response = normalize_executor_response_payload(parsed_response)
     try:
         validate_document(parsed_response, "executor-response.v1", project_root)
     except SchemaValidationError as exc:
@@ -661,7 +1299,16 @@ def execute_task(
         runtime_warnings=runtime.runtime_warnings,
         runtime_recovery={
             "attempt": runtime.attempt,
-            "recovery_action": runtime.recovery_action or ("timeout_retry" if len(stdout_attempts) > 1 else None),
+            "recovery_action": runtime.recovery_action
+            or (
+                "missing_final_message_retry"
+                if missing_final_message_retry_used
+                else (
+                    "stall_retry"
+                    if stall_retry_used
+                    else ("timeout_retry" if len(stdout_attempts) > 1 else None)
+                )
+            ),
             "workspace_reused": runtime.workspace_reused,
             "timeout_retries_used": max(0, len(stdout_attempts) - 1),
         },
@@ -670,9 +1317,37 @@ def execute_task(
         ),
     )
     if task.get("execution_mode", "read_only") == "isolated_write" and report["status"] == "ready_for_bundle_review":
-        commit_result = commit_isolated_workspace(runtime, task_id)
+        commit_result = commit_isolated_workspace(runtime, task)
         runtime.commit_sha = commit_result.get("commit_sha")
-    recovery_action = runtime.recovery_action or ("timeout_retry" if len(stdout_attempts) > 1 else None)
+        if commit_result.get("discarded_paths"):
+            append_activity_warning(
+                project_root,
+                run_id,
+                task_id,
+                code="discarded_paths",
+                message=(
+                    "Discarded incidental workspace changes outside the task contract: "
+                    + ", ".join(commit_result["discarded_paths"])
+                ),
+            )
+            record_event(
+                project_root,
+                run_id,
+                phase=task["phase"],
+                activity_id=task_id,
+                event_type="task.workspace_sanitized",
+                message=f"Task {task_id} discarded incidental workspace changes before commit.",
+                payload={"discarded_paths": commit_result["discarded_paths"]},
+            )
+    recovery_action = runtime.recovery_action or (
+        "missing_final_message_retry"
+        if missing_final_message_retry_used
+        else (
+            "stall_retry"
+            if stall_retry_used
+            else ("timeout_retry" if len(stdout_attempts) > 1 else None)
+        )
+    )
     activity_status = "recovered" if runtime.attempt > 1 or recovery_action else report["status"]
     update_activity(
         project_root,
@@ -767,7 +1442,7 @@ def prepare_task_runtime(
     runtime: TaskExecutionRuntime | None = None,
 ) -> TaskExecutionRuntime:
     resolved = runtime or TaskExecutionRuntime()
-    if not task_needs_workspace_snapshot(task):
+    if not task_needs_workspace_snapshot(project_root, run_id, task):
         return resolved
     existing_workspace = task_workspace_exists(project_root, run_id, task["task_id"])
     refresh_workspace = existing_workspace and resolved.attempt > 1
@@ -792,12 +1467,14 @@ def prepare_task_runtime(
     return resolved
 
 
-def task_needs_workspace_snapshot(task: dict[str, Any]) -> bool:
+def task_needs_workspace_snapshot(project_root: Path, run_id: str, task: dict[str, Any]) -> bool:
     if task.get("execution_mode", "read_only") == "isolated_write":
         return True
     if referenced_task_output_ids(task):
         return True
     if any(isinstance(value, str) and value.strip() for value in task.get("handoff_dependencies", [])):
+        return True
+    if task_declares_resolved_workspace_file_inputs(project_root, run_id, task):
         return True
     return task_declares_workspace_file_inputs(task)
 
@@ -815,19 +1492,34 @@ def task_declares_workspace_file_inputs(task: dict[str, Any]) -> bool:
     return False
 
 
+def task_declares_resolved_workspace_file_inputs(project_root: Path, run_id: str, task: dict[str, Any]) -> bool:
+    resolved_inputs = preview_resolved_inputs(
+        project_root,
+        run_id,
+        task,
+        sandbox_mode=task.get("sandbox_mode"),
+    )
+    return bool(collect_resolved_input_file_paths(resolved_inputs))
+
+
 def materialize_task_context_files(
     project_root: Path,
     run_id: str,
     task: dict[str, Any],
     working_directory: Path,
-) -> None:
+) -> list[str]:
     if not working_directory.exists():
-        return
+        return []
     if working_directory.resolve() == project_root.resolve():
-        return
+        return []
+    materialized: set[str] = set()
     ensure_declared_output_parent_directories(task, working_directory)
-    mirror_explicit_input_files_into_workspace(project_root, run_id, task, working_directory)
-    mirror_resolved_input_files_into_workspace(project_root, run_id, task, working_directory)
+    materialized.update(
+        mirror_explicit_input_files_into_workspace(project_root, run_id, task, working_directory)
+    )
+    materialized.update(
+        mirror_resolved_input_files_into_workspace(project_root, run_id, task, working_directory)
+    )
     run_dir = project_root / "runs" / run_id
     source_task_ids = referenced_task_output_ids(task)
     for handoff_id in [value for value in task.get("handoff_dependencies", []) if isinstance(value, str)]:
@@ -841,14 +1533,22 @@ def materialize_task_context_files(
         for artifact_path, source_path in collect_handoff_artifact_paths(project_root, handoff).items():
             destination = (working_directory / artifact_path).resolve()
             ensure_dir(destination.parent)
-            if destination.exists() or destination == source_path.resolve():
+            if destination == source_path.resolve():
                 continue
-            shutil.copy2(source_path, destination)
+            mirror_input_file_into_workspace(project_root, run_id, source_path, destination)
+            materialized.add(str(destination.relative_to(working_directory)))
     for source_task_id in sorted(source_task_ids):
         report_path = run_dir / "reports" / f"{source_task_id}.json"
         if not report_path.exists():
             continue
-        mirror_report_into_workspace(project_root, run_id, source_task_id, report_path, working_directory)
+        materialized.update(
+            mirror_report_into_workspace(project_root, run_id, source_task_id, report_path, working_directory)
+        )
+    return sorted(materialized)
+
+
+def workspace_relative_path(working_directory: Path, destination: Path) -> str:
+    return str(destination.resolve().relative_to(working_directory.resolve()))
 
 
 def ensure_declared_output_parent_directories(task: dict[str, Any], working_directory: Path) -> None:
@@ -865,8 +1565,9 @@ def mirror_explicit_input_files_into_workspace(
     run_id: str,
     task: dict[str, Any],
     working_directory: Path,
-) -> None:
+) -> set[str]:
     mirrored: set[str] = set()
+    materialized: set[str] = set()
     for raw_input in task.get("inputs", []):
         if not isinstance(raw_input, str):
             continue
@@ -888,12 +1589,13 @@ def mirror_explicit_input_files_into_workspace(
             continue
         destination = (working_directory / input_path).resolve()
         destination_key = str(destination)
-        if destination_key in mirrored or destination.exists():
+        if destination_key in mirrored:
             mirrored.add(destination_key)
             continue
-        ensure_dir(destination.parent)
-        shutil.copy2(source_path, destination)
+        mirror_input_file_into_workspace(project_root, run_id, source_path, destination)
         mirrored.add(destination_key)
+        materialized.add(workspace_relative_path(working_directory, destination))
+    return materialized
 
 
 def mirror_resolved_input_files_into_workspace(
@@ -901,7 +1603,7 @@ def mirror_resolved_input_files_into_workspace(
     run_id: str,
     task: dict[str, Any],
     working_directory: Path,
-) -> None:
+) -> set[str]:
     resolved_inputs = preview_resolved_inputs(
         project_root,
         run_id,
@@ -910,18 +1612,20 @@ def mirror_resolved_input_files_into_workspace(
         sandbox_mode=task.get("sandbox_mode"),
     )
     mirrored: set[str] = set()
+    materialized: set[str] = set()
     for candidate_path in collect_resolved_input_file_paths(resolved_inputs):
         source_path = resolve_workspace_input_path(project_root, run_id, candidate_path)
         if source_path is None or not source_path.is_file():
             continue
         destination = (working_directory / candidate_path).resolve()
         destination_key = str(destination)
-        if destination_key in mirrored or destination.exists():
+        if destination_key in mirrored:
             mirrored.add(destination_key)
             continue
-        ensure_dir(destination.parent)
-        shutil.copy2(source_path, destination)
+        mirror_input_file_into_workspace(project_root, run_id, source_path, destination)
         mirrored.add(destination_key)
+        materialized.add(workspace_relative_path(working_directory, destination))
+    return materialized
 
 
 def collect_resolved_input_file_paths(payload: Any) -> set[str]:
@@ -980,11 +1684,11 @@ def mirror_report_into_workspace(
     source_task_id: str,
     report_path: Path,
     working_directory: Path,
-) -> None:
-    report = read_json(report_path)
+) -> set[str]:
+    report = load_input_artifact_for_run(project_root, run_id, report_path)
     report_destination = working_directory / "runs" / run_id / "reports" / f"{source_task_id}.json"
-    ensure_dir(report_destination.parent)
-    shutil.copy2(report_path, report_destination)
+    mirror_input_file_into_workspace(project_root, run_id, report_path, report_destination)
+    materialized = {workspace_relative_path(working_directory, report_destination)}
     for artifact in report.get("artifacts", [])[:12]:
         artifact_path = artifact.get("path")
         if not isinstance(artifact_path, str) or not artifact_path.strip():
@@ -996,26 +1700,88 @@ def mirror_report_into_workspace(
         ensure_dir(destination.parent)
         if destination == source_path.resolve():
             continue
-        shutil.copy2(source_path, destination)
+        mirror_input_file_into_workspace(project_root, run_id, source_path, destination)
+        materialized.add(workspace_relative_path(working_directory, destination))
+    return materialized
 
 
-def commit_isolated_workspace(runtime: TaskExecutionRuntime, task_id: str) -> dict[str, Any]:
+def mirror_input_file_into_workspace(
+    project_root: Path,
+    run_id: str,
+    source_path: Path,
+    destination: Path,
+) -> None:
+    ensure_dir(destination.parent)
+    if source_path.suffix == ".json":
+        write_json(destination, load_input_artifact_for_run(project_root, run_id, source_path))
+        return
+    shutil.copy2(source_path, destination)
+
+
+def task_landing_paths(task: dict[str, Any]) -> list[str]:
+    paths: list[str] = []
+    for path_value in task.get("owned_paths", []):
+        if isinstance(path_value, str) and path_value.strip() and path_value not in paths:
+            paths.append(path_value)
+    for path_value in task.get("writes_existing_paths", []):
+        if isinstance(path_value, str) and path_value.strip() and path_value not in paths:
+            paths.append(path_value)
+    for descriptor in normalize_output_descriptors(list(task.get("expected_outputs", []))):
+        path_value = descriptor.get("path")
+        if isinstance(path_value, str) and path_value.strip() and path_value not in paths:
+            paths.append(path_value)
+    return paths
+
+
+def commit_isolated_workspace(runtime: TaskExecutionRuntime, task: dict[str, Any]) -> dict[str, Any]:
     if not runtime.branch_name or not runtime.workspace_path:
-        return {"committed": False, "commit_sha": None}
+        return {"committed": False, "commit_sha": None, "discarded_paths": []}
     try:
         return commit_task_workspace(
             WorkspaceInfo(branch_name=runtime.branch_name, workspace_path=Path(runtime.workspace_path)),
-            task_id,
+            task["task_id"],
+            allowed_paths=task_landing_paths(task),
         )
     except WorktreeError as exc:
         raise ExecutorError(str(exc)) from exc
 
 
-def build_exec_environment() -> dict[str, str]:
+def task_temp_root(
+    run_dir: Path,
+    *,
+    task_id: str,
+    attempt: int,
+    runtime_requirements: dict[str, Any] | None = None,
+) -> Path:
+    requirements = runtime_requirements or {}
+    if requirements.get("requires_writable_temp"):
+        return ensure_dir(run_dir / "scratch" / task_id / f"attempt-{max(1, int(attempt))}")
+    return ensure_dir(run_dir / "scratch" / task_id / f"attempt-{max(1, int(attempt))}")
+
+
+def resolve_task_execution_mode(task: dict[str, Any], runtime_requirements: dict[str, Any] | None = None) -> str:
+    current_mode = str(task.get("execution_mode") or "read_only").strip() or "read_only"
+    requirements = runtime_requirements or infer_task_runtime_requirements(task)
+    if current_mode == "read_only" and (
+        task_requires_write_access(task)
+        or requirements.get("requires_writable_temp")
+        or requirements.get("requires_writable_workspace")
+    ):
+        return "isolated_write"
+    return current_mode
+
+
+def build_exec_environment(temp_root: Path | None = None) -> dict[str, str]:
     env = dict(os.environ)
     # Force the CLI to rely on its existing ChatGPT login/session path.
     env.pop("CODEX_API_KEY", None)
     env.pop("OPENAI_API_KEY", None)
+    if temp_root is not None:
+        temp_dir = ensure_dir(temp_root / ".codex-tmp")
+        temp_dir_str = str(temp_dir)
+        env["TMPDIR"] = temp_dir_str
+        env["TMP"] = temp_dir_str
+        env["TEMP"] = temp_dir_str
     return env
 
 
@@ -1076,41 +1842,64 @@ def build_codex_command(
 def build_execution_prompt(prompt_text: str) -> str:
     return (
         prompt_text
-        + "\n\n# Executor Output Requirements\n\n"
-        + "Use injected dependency artifact previews and resolved handoff payloads directly instead of rediscovering the same upstream files in sibling workspaces unless a validation command requires it.\n"
-        + "Once the workspace root is known, use workspace-relative paths as the canonical form and do not probe both relative and absolute versions of the same path.\n"
-        + "Do not waste turns on exploratory shell commands like `pwd`, `ls`, or repeated directory listings when the task assignment already declares the workspace root, owned paths, expected outputs, and resolved inputs.\n"
-        + "Do not read unrelated package manifests, READMEs, or source/test trees unless they are explicitly referenced by the task assignment, owned paths, expected outputs, or resolved inputs.\n"
-        + "Avoid no-op or duplicate shell commands once a path or artifact has already been confirmed.\n"
-        + "Return only one JSON object matching the output schema.\n"
-        + "Do not wrap the JSON in markdown fences.\n"
-        + "Use the `# Exact Task Contract` section as the hard boundary for required outputs, allowed existing-file edits, and declared inputs.\n"
-        + 'Use status "ready_for_bundle_review" when the task is complete.\n'
-        + 'Use status "blocked" when another team, manager, or custodian must act before completion.\n'
-        + 'If any open issue is still blocking completion, the status must be "blocked". Do not return "ready_for_bundle_review" with blocking open issues.\n'
-        + "If injected design artifacts, runtime contracts, or handoff payloads contradict each other, stop at the source of the contradiction and report the exact conflicting paths or artifacts instead of guessing a merged contract.\n"
-        + "If blocked because another team must answer or provide something, include a collaboration_request object.\n"
-        + "If blocked because the goal now requires a cross-boundary contract, shared-behavior, ownership-boundary, or acceptance-rule change, include a change_requests array.\n"
-        + "If blocked only because the task contract is locally inconsistent for an owned path (for example a required output file already exists but Allowed Existing-File Edits excludes it), do not emit change_requests. Emit a collaboration_request back to your manager for contract repair.\n"
-        + "Do not use change_requests for local bug fixes, cleanup, naming, refactors, docs, or optional improvements.\n"
-        + "A change request is valid only when it is goal-critical, blocking, impossible to resolve within your owned scope, and references the conflicting authoritative inputs or the affected shared outputs/handoffs.\n"
-        + "When a cross-boundary blocker comes from injected upstream inputs, cite the narrowest exact entries from Input Source Metadata in conflicting_input_refs and leave affected_output_ids, affected_handoff_ids, impacted_objective_ids, and impacted_task_ids as empty arrays. The orchestrator resolves canonical impact ids.\n"
-        + "Do not guess impact ids from your own local outputs when the blocker is caused by conflicting upstream contracts or handoffs.\n"
-        + "Emit multiple change requests only when they are distinct root blockers with different conflicting inputs or affected shared outputs/handoffs.\n"
-        + "Each change_requests entry must include these exact keys: change_category, summary, blocking_reason, why_local_resolution_is_invalid, blocking, goal_critical, affected_output_ids, affected_handoff_ids, impacted_objective_ids, impacted_task_ids, conflicting_input_refs, required_reentry_phase, impact.\n"
-        + "Return produced_outputs as structured objects using the exact same output_id values declared in the task assignment expected_outputs.\n"
-        + "Do not invent additional final produced_outputs beyond the outputs listed in the `# Exact Task Contract` section.\n"
-        + "Each produced_outputs entry must include these exact keys: kind, output_id, path, asset_id, description, evidence.\n"
-        + 'For artifact outputs: set kind="artifact", fill path, and set asset_id, description, evidence to null.\n'
-        + 'For asset outputs: set kind="asset", fill asset_id and path, and set description and evidence to null.\n'
-        + 'For assertion outputs: set kind="assertion", fill description and evidence={"validation_ids":[...],"artifact_paths":[...]}, and set path and asset_id to null.\n'
-        + "Do not emit plain strings in produced_outputs.\n"
-        + "Treat the injected Resolved Inputs as authoritative. If an `Output of <task-id>` input or handoff package is already present there, do not shell-search `runs/`, sibling task workspaces, or other task artifacts to rediscover the same context.\n"
-        + "Only inspect the filesystem for a referenced upstream artifact when the Resolved Inputs clearly indicate that the artifact preview or payload is missing.\n"
-        + "If the Task Assignment owns a new output path that is not present yet, create its parent directory and write the artifact directly instead of repeatedly probing sibling directories for the missing file.\n"
-        + "For discovery/design artifact tasks, start by authoring the declared outputs from the injected inputs rather than using shell commands to rediscover the current working directory or confirm that the destination directories exist.\n"
-        + "Do not re-read the generated prompt log or task prompt file from `runs/...` after launch unless the task assignment explicitly lists it as an input.\n"
-        + "For discovery/design producing tasks, do not run `test -f`, `rg`, or `grep` against files you just created merely to prove they exist or contain required headings. Write the declared outputs and return.\n"
+        + "\n\n# Execution Rules\n\n"
+        + "Use the task prompt above as the source of truth for what work to do.\n"
+        + "Use the rules below to decide how to carry out the task and how to format the result.\n\n"
+        + "## How To Use Inputs During Execution\n\n"
+        + "- Treat the injected `Resolved Inputs` as authoritative.\n"
+        + "- If an upstream artifact, handoff payload, or contract is already present in the resolved inputs, use it directly.\n"
+        + "- Do not re-discover the same upstream context by searching `runs/`, sibling task workspaces, or unrelated source trees.\n"
+        + "- Only inspect the filesystem for an upstream artifact when the resolved inputs clearly show that the preview or payload is missing.\n"
+        + "- Once the workspace root is known, use workspace-relative paths as the canonical form.\n"
+        + "- Do not probe both relative and absolute versions of the same path.\n\n"
+        + "## How To Use The Filesystem\n\n"
+        + "- Do not waste turns on exploratory commands such as repeated `pwd`, `ls`, or directory listings when the task prompt already provides the workspace root, owned paths, expected outputs, and resolved inputs.\n"
+        + "- Do not read unrelated manifests, READMEs, or source trees unless they are directly relevant to the assigned task.\n"
+        + "- Avoid duplicate shell commands once a path or artifact has already been confirmed.\n"
+        + "- If the task owns a new output path that does not exist yet, create its parent directory and write the artifact directly.\n"
+        + "- For discovery and design artifact tasks, start by producing the declared outputs from the provided inputs instead of rediscovering the workspace layout.\n"
+        + "- Do not re-read the generated prompt log or task prompt file from `runs/...` unless the task explicitly lists it as an input.\n"
+        + "- For discovery or design producing tasks, do not run `test -f`, `rg`, or `grep` against files you just created merely to prove they exist or contain required headings.\n\n"
+        + "## How To Handle Validation Failure\n\n"
+        + "- Rerun a required validation only after making a concrete change intended to fix the observed failure.\n"
+        + "- Do not repeat the same failing validation without a new fix.\n"
+        + "- If you no longer have a concrete next fix, return a final `blocked` response instead of continuing to iterate.\n"
+        + "- Always end the task with one final JSON response.\n\n"
+        + "## How To Decide Task Status\n\n"
+        + "Use `ready_for_bundle_review` only when:\n"
+        + "- the task contract is satisfied\n"
+        + "- required outputs are produced\n"
+        + "- required validations passed\n"
+        + "- no blocking issue remains\n\n"
+        + "Use `blocked` when:\n"
+        + "- another team, manager, or custodian must act before the task can continue\n"
+        + "- required context is missing and no allowed local substitute exists\n"
+        + "- required validation cannot pass because a true blocker is still unresolved\n\n"
+        + "If any open issue still prevents completion, do not return `ready_for_bundle_review`.\n\n"
+        + "## How To Report Blockers\n\n"
+        + "Use `blockers` to report factual execution blockers only.\n\n"
+        + "Use a blocker when:\n"
+        + "- a required input, artifact, or dependency is missing\n"
+        + "- the environment prevents a required validation or command from running\n"
+        + "- injected contracts or handoffs conflict and local guessing would be unsafe\n"
+        + "- another role or team owns the failing surface\n\n"
+        + "Do not use `blockers` to propose replans, collaboration workflows, or new plan structures.\n"
+        + "Keep blocker entries factual and concrete.\n\n"
+        + "## How To Report Produced Outputs\n\n"
+        + "- Use only declared `output_id` values\n"
+        + "- Do not invent outputs\n"
+        + "- For blocked responses, return an empty array\n\n"
+        + "## How To Handle Contradictions\n\n"
+        + "If injected design artifacts, runtime contracts, or handoff payloads contradict each other:\n"
+        + "- stop at the contradiction\n"
+        + "- report the exact conflicting paths or artifacts\n"
+        + "- do not guess a merged contract\n\n"
+        + "If a blocker comes from conflicting upstream inputs:\n"
+        + "- cite the narrowest exact entries from input source metadata\n"
+        + "- do not guess impact ids from local outputs\n\n"
+        + "## Response Rules\n\n"
+        + "- Return only one JSON object matching the output schema\n"
+        + "- Do not wrap the JSON in markdown fences\n"
     )
 
 
@@ -1118,6 +1907,7 @@ def handle_codex_event_line(project_root: Path, run_id: str, phase: str, activit
     line = raw_line.strip()
     if not line:
         return
+    observed_at = now_timestamp()
     try:
         event = json.loads(line)
     except json.JSONDecodeError:
@@ -1133,7 +1923,10 @@ def handle_codex_event_line(project_root: Path, run_id: str, phase: str, activit
         return
     if not isinstance(event, dict):
         return
-    event_type, message, payload, activity_updates = normalize_codex_event(event)
+    event_type, message, payload, activity_updates, timestamp_updates = normalize_codex_event(
+        event,
+        observed_at=observed_at,
+    )
     record_event(
         project_root,
         run_id,
@@ -1143,11 +1936,35 @@ def handle_codex_event_line(project_root: Path, run_id: str, phase: str, activit
         message=message,
         payload=payload,
     )
+    if timestamp_updates:
+        update_activity_observability_timestamps(project_root, run_id, activity_id, **timestamp_updates)
     if activity_updates:
         update_activity(project_root, run_id, activity_id, **activity_updates)
 
 
-def normalize_codex_event(event: dict[str, Any]) -> tuple[str, str, dict[str, Any], dict[str, Any] | None]:
+def validate_compiled_task_context(task_context: dict[str, Any]) -> None:
+    missing_inputs = list(task_context.get("missing_inputs", []))
+    if not missing_inputs:
+        return
+    details = []
+    for item in missing_inputs:
+        input_ref = str(item.get("input_ref") or "").strip()
+        reason = str(item.get("reason") or "").strip()
+        detail = str(item.get("detail") or "").strip()
+        if detail:
+            details.append(f"{input_ref} ({reason}: {detail})")
+        else:
+            details.append(f"{input_ref} ({reason})")
+    raise ExecutorError(
+        "Task references inputs that were not compiled into concrete context: " + "; ".join(details)
+    )
+
+
+def normalize_codex_event(
+    event: dict[str, Any],
+    *,
+    observed_at: str,
+) -> tuple[str, str, dict[str, Any], dict[str, Any] | None, dict[str, str] | None]:
     event_type = str(event.get("type", "codex.unknown"))
     if event_type == "thread.started":
         thread_id = event.get("thread_id")
@@ -1156,6 +1973,7 @@ def normalize_codex_event(event: dict[str, Any]) -> tuple[str, str, dict[str, An
             f"Codex thread started: {thread_id}",
             {"thread_id": thread_id},
             {"status": "launching", "progress_stage": "launching", "current_activity": "Codex thread started."},
+            {"thread_started_at": observed_at, "first_stream_at": observed_at},
         )
     if event_type == "turn.started":
         return (
@@ -1163,6 +1981,7 @@ def normalize_codex_event(event: dict[str, Any]) -> tuple[str, str, dict[str, An
             "Codex turn started.",
             {},
             {"status": "launching", "progress_stage": "launching", "current_activity": "Codex turn started."},
+            {"turn_started_at": observed_at},
         )
     if event_type == "turn.completed":
         usage = event.get("usage", {})
@@ -1170,7 +1989,12 @@ def normalize_codex_event(event: dict[str, Any]) -> tuple[str, str, dict[str, An
             "codex.turn.completed",
             "Codex turn completed.",
             {"usage": usage if isinstance(usage, dict) else {}},
-            {"status": "finalizing", "progress_stage": "finalizing", "current_activity": "Codex turn completed."},
+            {
+                "status": "finalizing",
+                "progress_stage": "finalizing",
+                "current_activity": "Codex turn completed.",
+            },
+            {"turn_completed_at": observed_at},
         )
     if event_type == "turn.failed":
         error = event.get("error", {})
@@ -1182,20 +2006,30 @@ def normalize_codex_event(event: dict[str, Any]) -> tuple[str, str, dict[str, An
             message,
             {"error": error if isinstance(error, dict) else {}},
             {"status": "failed", "progress_stage": "failed", "current_activity": message},
+            None,
         )
     if event_type == "error":
         message = str(event.get("message", "Codex stream error."))
+        if message.lower().startswith("reconnecting..."):
+            return (
+                "codex.error.transient",
+                message,
+                {"message": message},
+                None,
+                None,
+            )
         return (
             "codex.error",
             message,
             {"message": message},
             {"status": "failed", "progress_stage": "failed", "current_activity": message},
+            None,
         )
 
     if event_type in {"item.started", "item.completed"}:
         item = event.get("item", {})
         if not isinstance(item, dict):
-            return (f"codex.{event_type}", f"Codex {event_type}.", {}, None)
+            return (f"codex.{event_type}", f"Codex {event_type}.", {}, None, None)
         item_type = str(item.get("type", "unknown"))
         if item_type == "command_execution":
             command = truncate_text(str(item.get("command", "")), 160)
@@ -1210,6 +2044,7 @@ def normalize_codex_event(event: dict[str, Any]) -> tuple[str, str, dict[str, An
                     "item_id": item.get("id"),
                 },
                 {"status": status, "progress_stage": status, "current_activity": current},
+                None,
             )
         if item_type == "agent_message":
             text_preview = truncate_text(str(item.get("text", "")), 200)
@@ -1218,15 +2053,17 @@ def normalize_codex_event(event: dict[str, Any]) -> tuple[str, str, dict[str, An
                 "Received final agent message.",
                 {"item_id": item.get("id"), "text_preview": text_preview},
                 {"status": "finalizing", "progress_stage": "finalizing", "current_activity": "Received final agent response."},
+                None,
             )
         return (
             f"codex.{event_type}.{item_type}",
             f"Codex {event_type} for {item_type}.",
             {"item_id": item.get("id"), "item_type": item_type},
             None,
+            None,
         )
 
-    return (f"codex.{event_type}", f"Codex event {event_type}.", {}, None)
+    return (f"codex.{event_type}", f"Codex event {event_type}.", {}, None, None)
 
 
 def parse_jsonl_events(stdout: str) -> list[dict[str, Any]]:
@@ -1267,14 +2104,35 @@ def extract_usage(events: list[dict[str, Any]]) -> dict[str, Any] | None:
 
 
 def extract_turn_failure(events: list[dict[str, Any]]) -> str | None:
-    for event in events:
-        if event.get("type") == "turn.failed":
+    last_completed_index: int | None = None
+    last_failed_index: int | None = None
+    last_failed_message: str | None = None
+    last_error_index: int | None = None
+    last_error_message: str | None = None
+    for index, event in enumerate(events):
+        event_type = event.get("type")
+        if event_type == "turn.completed":
+            last_completed_index = index
+            continue
+        if event_type == "turn.failed":
             error = event.get("error", {})
             if isinstance(error, dict):
-                return str(error.get("message", "turn failed"))
-            return "turn failed"
-        if event.get("type") == "error":
-            return str(event.get("message", "stream error"))
+                last_failed_message = str(error.get("message", "turn failed"))
+            else:
+                last_failed_message = "turn failed"
+            last_failed_index = index
+            continue
+        if event_type == "error":
+            last_error_message = str(event.get("message", "stream error"))
+            last_error_index = index
+    if last_completed_index is not None and (
+        last_failed_index is None or last_completed_index > last_failed_index
+    ):
+        return None
+    if last_failed_index is not None:
+        return last_failed_message or "turn failed"
+    if last_error_index is not None:
+        return last_error_message or "stream error"
     return None
 
 
@@ -1290,6 +2148,27 @@ def extract_final_response(events: list[dict[str, Any]]) -> str:
     raise ExecutorError("No final agent message was found in codex exec output")
 
 
+def load_final_response_from_path(last_message_path: Path) -> str | None:
+    if not last_message_path.exists():
+        return None
+    try:
+        payload = read_text(last_message_path).strip()
+    except OSError:
+        return None
+    return payload or None
+
+
+def extract_final_response_with_fallback(
+    events: list[dict[str, Any]],
+    *,
+    last_message_path: Path,
+) -> str | None:
+    try:
+        return extract_final_response(events)
+    except ExecutorError:
+        return load_final_response_from_path(last_message_path)
+
+
 def resolve_change_request_payloads(
     project_root: Path,
     run_id: str,
@@ -1300,54 +2179,74 @@ def resolve_change_request_payloads(
         return []
     if not isinstance(payloads, list):
         raise ExecutorError("Executor response change_requests must be an array.")
-    input_source_metadata = build_task_input_source_metadata(project_root, run_id, task)
     resolved_payloads: list[dict[str, Any]] = []
     for index, raw in enumerate(payloads):
         if not isinstance(raw, dict):
             raise ExecutorError(f"Executor response change_requests[{index}] must be an object.")
         resolved = dict(raw)
-        conflicting_input_refs = normalize_string_list(raw.get("conflicting_input_refs"))
-        if not conflicting_input_refs:
-            resolved_payloads.append(resolved)
-            continue
-        resolved_output_ids: list[str] = []
-        resolved_handoff_ids: list[str] = []
-        resolved_source_task_ids: list[str] = []
-        unresolved_refs: list[str] = []
-        for input_ref in conflicting_input_refs:
-            metadata = input_source_metadata.get(input_ref)
-            if not isinstance(metadata, dict) or not metadata.get("resolved"):
-                unresolved_refs.append(input_ref)
-                continue
-            for output_id in normalize_string_list(metadata.get("output_ids")):
-                if output_id not in resolved_output_ids:
-                    resolved_output_ids.append(output_id)
-            for handoff_id in normalize_string_list(metadata.get("handoff_ids")):
-                if handoff_id not in resolved_handoff_ids:
-                    resolved_handoff_ids.append(handoff_id)
-            for source_task_id in normalize_string_list(metadata.get("source_task_ids")):
-                if source_task_id not in resolved_source_task_ids:
-                    resolved_source_task_ids.append(source_task_id)
-        if unresolved_refs:
-            refs = ", ".join(unresolved_refs)
-            raise ExecutorError(
-                f"Executor response change_requests[{index}] referenced unresolved conflicting_input_refs: {refs}."
-            )
-        if not resolved_output_ids and not resolved_handoff_ids:
-            raise ExecutorError(
-                f"Executor response change_requests[{index}] did not resolve any affected outputs or handoffs."
-            )
-        if resolved_source_task_ids and all(source_task_id == task["task_id"] for source_task_id in resolved_source_task_ids):
-            raise ExecutorError(
-                f"Executor response change_requests[{index}] cited only self-authored inputs in conflicting_input_refs."
-            )
-        resolved["conflicting_input_refs"] = conflicting_input_refs
-        resolved["affected_output_ids"] = resolved_output_ids
-        resolved["affected_handoff_ids"] = resolved_handoff_ids
-        resolved["impacted_objective_ids"] = []
-        resolved["impacted_task_ids"] = []
+        resolved.pop("conflicting_input_refs", None)
         resolved_payloads.append(resolved)
     return resolved_payloads
+
+
+def resolve_blocker_payloads(payloads: Any) -> list[dict[str, Any]]:
+    if payloads is None:
+        return []
+    if not isinstance(payloads, list):
+        raise ExecutorError("Executor response blockers must be an array.")
+    resolved_payloads: list[dict[str, Any]] = []
+    for index, raw in enumerate(payloads):
+        if not isinstance(raw, dict):
+            raise ExecutorError(f"Executor response blockers[{index}] must be an object.")
+        kind = str(raw.get("kind", "")).strip()
+        summary = str(raw.get("summary", "")).strip()
+        if not kind:
+            raise ExecutorError(f"Executor response blockers[{index}] must include a kind.")
+        if not summary:
+            raise ExecutorError(f"Executor response blockers[{index}] must include a summary.")
+        resolved_payloads.append(
+            {
+                "kind": kind,
+                "summary": summary,
+                "details": str(raw.get("details", "")).strip(),
+                "related_paths": normalize_string_list(raw.get("related_paths")),
+                "related_validation_ids": normalize_string_list(raw.get("related_validation_ids")),
+                "suggested_owner_capability": str(raw.get("suggested_owner_capability", "")).strip() or None,
+            }
+        )
+    return resolved_payloads
+
+
+def normalize_executor_response_payload(parsed_response: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(parsed_response)
+    if "produced_output_ids" not in normalized and isinstance(normalized.get("produced_outputs"), list):
+        normalized["produced_output_ids"] = [
+            output_id
+            for output_id in (
+                descriptor_output_id(item)
+                for item in normalize_output_descriptors(
+                    list(normalized.get("produced_outputs", [])),
+                    allow_legacy_strings=False,
+                )
+            )
+            if output_id
+        ]
+    normalized.setdefault("change_requests", [])
+    if isinstance(normalized.get("change_requests"), list):
+        cleaned_change_requests: list[Any] = []
+        for raw in normalized["change_requests"]:
+            if not isinstance(raw, dict):
+                cleaned_change_requests.append(raw)
+                continue
+            cleaned = dict(raw)
+            cleaned.pop("conflicting_input_refs", None)
+            cleaned_change_requests.append(cleaned)
+        normalized["change_requests"] = cleaned_change_requests
+    normalized.setdefault("collaboration_request", None)
+    normalized.setdefault("blockers", [])
+    normalized.pop("produced_outputs", None)
+    normalized.pop("context_echo", None)
+    return normalized
 
 
 def normalize_string_list(values: Any) -> list[str]:
@@ -1367,16 +2266,20 @@ def normalize_string_list(values: Any) -> list[str]:
 
 
 def is_probable_local_contract_repair_request(task: dict[str, Any], payload: dict[str, Any]) -> bool:
-    conflicting_input_refs = normalize_string_list(payload.get("conflicting_input_refs"))
-    affected_handoff_ids = normalize_string_list(payload.get("affected_handoff_ids"))
-    if conflicting_input_refs or affected_handoff_ids:
+    impacted_objective_ids = normalize_string_list(payload.get("impacted_objective_ids"))
+    impacted_task_ids = normalize_string_list(payload.get("impacted_task_ids"))
+    if impacted_objective_ids or impacted_task_ids:
         return False
+    affected_handoff_ids = normalize_string_list(payload.get("affected_handoff_ids"))
     affected_output_ids = normalize_string_list(payload.get("affected_output_ids"))
     own_output_ids = {
         descriptor_output_id(item)
         for item in normalize_output_descriptors(list(task.get("expected_outputs", [])))
     }
     if affected_output_ids and not set(affected_output_ids).issubset(own_output_ids):
+        return False
+    change_category = str(payload.get("change_category", "")).strip().lower()
+    if affected_handoff_ids and change_category not in {"ownership_boundary", "interface_contract"}:
         return False
     text_parts = [
         str(payload.get("summary", "")).strip().lower(),
@@ -1391,11 +2294,16 @@ def is_probable_local_contract_repair_request(task: dict[str, Any], payload: dic
         "already exists",
         "task contract",
         "write contract",
+        "write scope",
+        "write set",
+        "ownership boundary",
         "entrypoint",
         "out of bounds",
         "forbids",
     )
     if any(marker in haystack for marker in contract_markers):
+        return True
+    if change_category == "ownership_boundary" and affected_output_ids and set(affected_output_ids).issubset(own_output_ids):
         return True
     return not affected_output_ids
 
@@ -1452,6 +2360,9 @@ def materialize_executor_response(
             "Executor response marked the task complete while reporting blocking issues: "
             + "; ".join(blocking_open_issues[:3])
         )
+    blockers = resolve_blocker_payloads(parsed_response.get("blockers", []))
+    if blockers and parsed_response["status"] != "blocked":
+        raise ExecutorError("Executor response reported blockers without blocked status.")
     raw_change_requests = parsed_response.get("change_requests", [])
     raw_change_requests, synthesized_collaboration_payload = extract_local_contract_repair_requests(
         task,
@@ -1501,8 +2412,10 @@ def materialize_executor_response(
         "artifacts": parsed_response["artifacts"],
         "validation_results": parsed_response["validation_results"],
         "open_issues": parsed_response["open_issues"],
+        "blockers": blockers,
         "produced_outputs": normalize_report_outputs(project_root, run_id, task, parsed_response),
         "change_requests": persisted_change_requests,
+        "context_echo": system_context_echo(project_root, run_id, task),
     }
     if runtime_warnings:
         report["runtime_warnings"] = runtime_warnings
@@ -1510,11 +2423,28 @@ def materialize_executor_response(
         report["runtime_recovery"] = runtime_recovery
     if runtime_observability is not None:
         report["runtime_observability"] = runtime_observability
-    if parsed_response.get("context_echo") is not None:
-        report["context_echo"] = parsed_response["context_echo"]
     validate_document(report, "completion-report.v1", project_root)
     write_json(run_dir / "reports" / f"{task['task_id']}.json", report)
     return report, collaboration_ids, change_request_ids
+
+
+def system_context_echo(project_root: Path, run_id: str, task: dict[str, Any]) -> dict[str, Any]:
+    prompt_layers: list[str] = []
+    prompt_log_path = project_root / "runs" / run_id / "prompt-logs" / f"{task['task_id']}.json"
+    if prompt_log_path.exists():
+        prompt_log = read_json(prompt_log_path)
+        prompt_layers = [
+            str(item).strip()
+            for item in prompt_log.get("files_loaded", [])
+            if isinstance(item, str) and str(item).strip()
+        ]
+    return {
+        "role_id": task["assigned_role"],
+        "objective_id": task["objective_id"],
+        "phase": task["phase"],
+        "prompt_layers": prompt_layers,
+        "schema": task["schema"],
+    }
 
 
 def issue_is_blocking(issue: str) -> bool:
@@ -1528,12 +2458,30 @@ def normalize_report_outputs(
     task: dict[str, Any],
     parsed_response: dict[str, Any],
 ) -> list[dict[str, Any]]:
+    if parsed_response.get("status") != "ready_for_bundle_review":
+        return []
     expected_by_id = output_descriptor_map(task.get("expected_outputs", []))
-    produced_outputs = normalize_output_descriptors(list(parsed_response.get("produced_outputs", [])), allow_legacy_strings=False)
-    if parsed_response.get("status") == "ready_for_bundle_review" and not produced_outputs:
-        raise ExecutorError(f"Task {task['task_id']} completed without produced_outputs")
-    produced_by_id = {descriptor_output_id(item): item for item in produced_outputs}
-    unknown_output_ids = sorted(set(produced_by_id) - set(expected_by_id))
+    raw_output_ids = parsed_response.get("produced_output_ids")
+    if raw_output_ids is None and "produced_outputs" in parsed_response:
+        raw_output_ids = [
+            descriptor_output_id(item)
+            for item in normalize_output_descriptors(list(parsed_response.get("produced_outputs", [])), allow_legacy_strings=False)
+        ]
+    produced_output_ids = [
+        str(item).strip()
+        for item in list(raw_output_ids or [])
+        if str(item).strip()
+    ]
+    if parsed_response.get("status") == "ready_for_bundle_review" and not produced_output_ids:
+        raise ExecutorError(f"Task {task['task_id']} completed without produced_output_ids")
+    unique_output_ids: list[str] = []
+    seen_output_ids: set[str] = set()
+    for output_id in produced_output_ids:
+        if output_id in seen_output_ids:
+            continue
+        seen_output_ids.add(output_id)
+        unique_output_ids.append(output_id)
+    unknown_output_ids = sorted(set(unique_output_ids) - set(expected_by_id))
     if unknown_output_ids:
         raise ExecutorError(
             f"Task {task['task_id']} reported outputs not declared in expected_outputs: {', '.join(unknown_output_ids)}"
@@ -1545,38 +2493,18 @@ def normalize_report_outputs(
     }
     search_roots = deliverable_search_roots(project_root, run_id, task["task_id"])
     canonical_outputs: list[dict[str, Any]] = []
-    for output_id, produced in produced_by_id.items():
+    for output_id in unique_output_ids:
         expected = expected_by_id[output_id]
         expected_kind = str(expected.get("kind"))
-        produced_kind = str(produced.get("kind"))
-        if produced_kind != expected_kind:
-            raise ExecutorError(
-                f"Task {task['task_id']} reported output {output_id} with kind {produced_kind}, expected {expected_kind}"
-            )
         if expected_kind in {"artifact", "asset"}:
-            path = str(produced.get("path", "")).strip()
+            path = str(expected.get("path", "")).strip()
             if not path:
                 raise ExecutorError(f"Task {task['task_id']} reported output {output_id} without a path")
-            expected_path = str(expected.get("path", "")).strip()
-            if path != expected_path:
-                raise ExecutorError(
-                    f"Task {task['task_id']} reported output {output_id} at {path}, expected {expected_path}"
-                )
-            if expected_kind == "asset":
-                expected_asset_id = str(expected.get("asset_id", "")).strip()
-                produced_asset_id = str(produced.get("asset_id", "")).strip()
-                if produced_asset_id != expected_asset_id:
-                    raise ExecutorError(
-                        f"Task {task['task_id']} reported asset output {output_id} with asset_id {produced_asset_id}, "
-                        f"expected {expected_asset_id}"
-                    )
             if not repo_relative_path_exists(search_roots, path):
                 raise ExecutorError(
                     f"Task {task['task_id']} reported output {output_id} at {path}, but the artifact does not exist"
                 )
         elif expected_kind == "assertion":
-            if produced.get("path") is not None:
-                raise ExecutorError(f"Task {task['task_id']} reported assertion output {output_id} with a non-null path")
             evidence = expected.get("evidence", {})
             validation_ids = [
                 str(item).strip()

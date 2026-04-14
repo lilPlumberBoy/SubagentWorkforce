@@ -70,6 +70,7 @@ test('runtime startup script reports the integrated workflow and serves both rea
 
     const frontendHtmlResponse = await fetch(startupPayload.frontend.url);
     assert.equal(frontendHtmlResponse.status, 200);
+    assert.equal(frontendHtmlResponse.headers.get('cache-control'), 'no-store');
     const frontendHtml = await frontendHtmlResponse.text();
     assert.match(frontendHtml, /__TODO_RUNTIME_CONFIG__/);
 
@@ -77,6 +78,72 @@ test('runtime startup script reports the integrated workflow and serves both rea
     assert.equal(backendListResponse.status, 200);
     const backendList = await backendListResponse.json();
     assert.deepEqual(backendList, { items: [] });
+  } finally {
+    child.kill('SIGTERM');
+    await waitForChildExit(child);
+    fs.rmSync(tempDirectory, { force: true, recursive: true });
+  }
+
+  assert.equal(stderr.trim(), '');
+});
+
+test('runtime startup script normalizes wildcard bind hosts into loopback-safe public URLs and origins', async () => {
+  const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'todo-runtime-wildcard-'));
+  const databasePath = path.join(tempDirectory, 'runtime.sqlite');
+  const child = spawn(
+    process.execPath,
+    ['--no-warnings', 'apps/todo/runtime/scripts/start.js'],
+    {
+      cwd: REPO_ROOT,
+      env: {
+        ...process.env,
+        TODO_BACKEND_DB_PATH: databasePath,
+        TODO_BACKEND_HOST: '0.0.0.0',
+        TODO_BACKEND_PORT: '0',
+        TODO_FRONTEND_HOST: '0.0.0.0',
+        TODO_FRONTEND_PORT: '0',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }
+  );
+
+  let stdout = '';
+  let stderr = '';
+
+  child.stdout.on('data', (chunk) => {
+    stdout += chunk.toString();
+  });
+  child.stderr.on('data', (chunk) => {
+    stderr += chunk.toString();
+  });
+
+  try {
+    const startupPayload = await waitFor(async () => {
+      assert.equal(child.exitCode, null, stderr || 'Runtime process exited early.');
+
+      const line = stdout
+        .split(/\r?\n/)
+        .map((entry) => entry.trim())
+        .find(Boolean);
+
+      assert.ok(line, 'Expected runtime startup output.');
+
+      return JSON.parse(line);
+    });
+
+    assert.match(startupPayload.backend.url, /^http:\/\/127\.0\.0\.1:\d+$/);
+    assert.match(startupPayload.frontend.url, /^http:\/\/127\.0\.0\.1:\d+$/);
+    assert.equal(startupPayload.backend.allowedOrigin, startupPayload.frontend.url);
+    assert.equal(startupPayload.frontend.apiBaseUrl, startupPayload.backend.url);
+
+    const frontendHealthResponse = await fetch(`${startupPayload.frontend.url}/health`);
+    assert.equal(frontendHealthResponse.status, 200);
+    const frontendHealth = await frontendHealthResponse.json();
+    assert.equal(frontendHealth.apiBaseUrl, startupPayload.backend.url);
+
+    const frontendHtmlResponse = await fetch(startupPayload.frontend.url);
+    assert.equal(frontendHtmlResponse.status, 200);
+    assert.equal(frontendHtmlResponse.headers.get('cache-control'), 'no-store');
   } finally {
     child.kill('SIGTERM');
     await waitForChildExit(child);

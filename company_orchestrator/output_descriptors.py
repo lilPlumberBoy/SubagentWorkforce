@@ -10,6 +10,21 @@ REPO_PATH_PATTERN = re.compile(r"^(?:\./)?[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.*?@:-]+
 NULL_SENTINELS = {"none", "null"}
 
 
+def sanitize_output_descriptors(values: list[Any] | None) -> list[Any]:
+    sanitized: list[Any] = []
+    for value in values or []:
+        if isinstance(value, dict):
+            updated = dict(value)
+            kind = str(updated.get("kind", "") or "").strip()
+            if kind == "assertion":
+                updated["path"] = None
+                updated["asset_id"] = None
+            sanitized.append(updated)
+            continue
+        sanitized.append(value)
+    return sanitized
+
+
 def normalize_output_descriptors(values: list[Any] | None, *, allow_legacy_strings: bool = True) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -242,6 +257,15 @@ def repo_relative_path_exists(search_roots: list[Path], path_value: str) -> bool
     path = Path(path_value)
     if path.is_absolute():
         return path.exists()
+    normalized = str(path_value or "").strip()
+    if any(token in normalized for token in "*?["):
+        for root in search_roots:
+            try:
+                if any(root.glob(normalized)):
+                    return True
+            except Exception:
+                continue
+        return False
     return any((root / path).exists() for root in search_roots)
 
 

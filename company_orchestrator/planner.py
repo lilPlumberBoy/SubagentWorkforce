@@ -28,6 +28,7 @@ def initialize_run(project_root: Path, run_id: str, goal_text: str) -> Path:
         "tasks",
         "reports",
         "bundles",
+        "feedback",
         "collaboration",
         "collaboration-plans",
         "phase-reports",

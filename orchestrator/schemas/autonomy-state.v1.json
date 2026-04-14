@@ -22,14 +22,20 @@
     "last_action_status",
     "stop_reason",
     "stop_phase",
-    "last_tuning_decision"
+    "last_tuning_decision",
+    "lease_owner",
+    "lease_started_at",
+    "lease_heartbeat_at",
+    "lease_timeout_seconds",
+    "lease_action_kind",
+    "lease_timeouts"
   ],
   "additionalProperties": false,
   "properties": {
     "schema": {"type": "string", "enum": ["autonomy-state.v1"]},
     "run_id": {"type": "string"},
     "enabled": {"type": "boolean"},
-    "status": {"type": "string", "enum": ["inactive", "active", "stopped", "completed"]},
+    "status": {"type": "string", "enum": ["inactive", "running", "waiting_for_approval", "stopped", "completed"]},
     "auto_approve": {"type": "boolean"},
     "sandbox_mode": {"type": "string"},
     "max_concurrency": {"type": "number"},
@@ -47,6 +53,24 @@
     "last_action_status": {"type": ["string", "null"]},
     "stop_reason": {"type": ["string", "null"]},
     "stop_phase": {"type": ["string", "null"]},
+    "lease_owner": {"type": ["string", "null"]},
+    "lease_started_at": {"type": ["string", "null"]},
+    "lease_heartbeat_at": {"type": ["string", "null"]},
+    "lease_timeout_seconds": {"type": ["number", "null"]},
+    "lease_action_kind": {"type": ["string", "null"]},
+    "lease_timeouts": {
+      "type": "object",
+      "required": ["default", "planning", "execution", "monitor", "advance", "review"],
+      "additionalProperties": false,
+      "properties": {
+        "default": {"type": "number"},
+        "planning": {"type": "number"},
+        "execution": {"type": "number"},
+        "monitor": {"type": "number"},
+        "advance": {"type": "number"},
+        "review": {"type": "number"}
+      }
+    },
     "last_tuning_decision": {
       "type": ["object", "null"],
       "required": [

@@ -14,7 +14,12 @@ from unittest.mock import patch
 
 from rich.console import Console
 
-from company_orchestrator.autonomy import default_autonomy_state, run_autonomous
+from company_orchestrator.autonomy import (
+    autonomy_lease_timeout_seconds,
+    classify_autonomy_stop,
+    default_autonomy_state,
+    run_autonomous,
+)
 from company_orchestrator.bundles import assemble_review_bundle, review_bundle
 from company_orchestrator.change_replan import apply_approved_changes_and_resume
 from company_orchestrator.cli import augment_result_with_guidance, format_result_summary, main as cli_main
@@ -29,20 +34,51 @@ from company_orchestrator.executor import (
     CodexProcessStall,
     ExecutorError,
     TaskExecutionRuntime,
+    apply_repair_context_to_task,
+    apply_run_state_repair_preflight,
+    build_exec_environment,
     build_codex_command,
     build_execution_prompt,
     execute_task,
+    extract_turn_failure,
+    infer_attempt_run_state_repair_context,
+    handle_codex_event_line,
     materialize_task_context_files,
     materialize_executor_response,
     prepare_task_runtime,
+    resolve_task_execution_mode,
+    task_temp_root,
+    validate_compiled_task_context,
 )
-from company_orchestrator.filesystem import read_json, write_json
+from company_orchestrator.feedback import (
+    active_approved_feedback,
+    apply_feedback_and_resume,
+    build_feedback_repair_context,
+    collect_existing_feedback_scope_files,
+    list_feedback,
+    refresh_feedback_resolution_state,
+    submit_feedback,
+    triage_feedback,
+)
+from company_orchestrator.filesystem import read_json, read_text, write_json, write_text
 from company_orchestrator.handoffs import blocking_handoffs_for_task, evaluate_handoff, list_handoffs
 from company_orchestrator.impact import apply_approved_change_impacts, analyze_change_request_impact, stale_task_notifications
-from company_orchestrator.management import finalize_objective_bundle, run_guidance, run_phase, schedule_tasks
+from company_orchestrator.management import (
+    attempt_bundle_repair,
+    build_bundle_broad_retry_context,
+    build_bundle_run_state_repair_context,
+    choose_bundle_repair_strategy,
+    finalize_objective_bundle,
+    phase_tasks,
+    run_guidance,
+    run_phase,
+    schedule_tasks,
+)
 from company_orchestrator.monitoring import (
     build_activity_detail,
+    build_prompt_debug_detail,
     build_run_dashboard,
+    debug_prompt,
     inspect_activity,
 )
 from company_orchestrator.observability import (
@@ -51,16 +87,21 @@ from company_orchestrator.observability import (
     recommend_runtime_tuning,
     refresh_run_observability,
 )
-from company_orchestrator.objective_roots import capability_shared_asset_hints
+from company_orchestrator.objective_roots import capability_shared_asset_hints, find_objective_root
 from company_orchestrator.objective_planner import (
     PlanningLimiter,
     aggregate_capability_plans,
     align_required_outbound_handoff_output_ids,
     attach_handoff_dependencies,
+    collect_polish_validation_steps,
+    build_deterministic_polish_objective_plan,
+    build_deterministic_polish_outline,
     build_capability_planning_prompt,
     build_planning_prompt,
     canonicalize_input_reference,
+    execute_planning_activity,
     normalize_task_execution_metadata,
+    normalize_task_execution_entry,
     normalize_capability_plan,
     normalize_objective_outline,
     owned_path_targets_prefix,
@@ -68,10 +109,21 @@ from company_orchestrator.objective_planner import (
     plan_objective,
     plan_phase,
     planning_stall_timeout_seconds,
+    planning_repair_payload_slice,
     quarantined_objective_phase_artifacts,
+    sanitize_outline_for_release_repair,
+    should_reuse_existing_outline_for_repair,
+    validate_capability_plan_planning_input_addressability,
+    validate_objective_outline_planning_input_addressability,
+    validate_scope_override_coverage_for_capability_plan,
+    validate_scope_override_coverage_for_objective_outline,
     validate_capability_plan_contents,
+    validate_objective_plan_contents,
+    validate_validation_commands,
+    validate_planned_task_inputs,
 )
-from company_orchestrator.output_descriptors import normalize_output_descriptors
+from company_orchestrator.output_descriptors import normalize_output_descriptors, sanitize_output_descriptors
+from company_orchestrator.output_descriptors import repo_relative_path_exists
 from company_orchestrator.parallelism import infer_execution_metadata
 from company_orchestrator.parallelism import effective_sandbox_mode
 from company_orchestrator.parallelism import normalize_task_artifact_descriptors
@@ -83,11 +135,15 @@ from company_orchestrator.planner import (
     suggest_team_proposals,
 )
 from company_orchestrator.prompts import (
+    build_capability_planning_prompt_packet,
+    build_objective_planning_prompt_packet,
     build_capability_planning_payload,
     build_dependency_preview_section,
+    build_execution_repair_section,
     build_capability_prompt_payload,
     build_planning_payload,
     build_planning_prompt_payload,
+    compile_task_context_packet,
     compact_goal_context,
     compact_resolved_inputs_for_prompt,
     preview_resolved_inputs,
@@ -96,9 +152,15 @@ from company_orchestrator.prompts import (
     render_prompt,
 )
 from company_orchestrator.recovery import RecoveryBlockedError, inspect_planning_artifacts, reconcile_for_command, reconcile_run
-from company_orchestrator.reports import advance_phase, generate_phase_report, record_human_approval
+from company_orchestrator.reports import advance_phase, evaluate_polish_release_validation, generate_phase_report, record_human_approval
 from company_orchestrator.schemas import SchemaValidationError, validate_document
 from company_orchestrator.smoke import scaffold_smoke_test, simulate_context_echo_completion, verify_smoke_reports
+from company_orchestrator.task_graph import (
+    infer_task_runtime_requirements,
+    load_objective_task_graph_manifest,
+    load_run_file_graph,
+    update_run_file_graph_capability_plan,
+)
 from company_orchestrator.live import ensure_activity, note_activity_stream, read_activity, read_activity_history, record_event, update_activity
 from company_orchestrator.worktree_manager import commit_task_workspace, ensure_run_integration_workspace, ensure_task_workspace
 from company_orchestrator.bundles import land_accepted_bundle
@@ -123,6 +185,49 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(planning_stall_timeout_seconds(240), 60)
         self.assertEqual(planning_stall_timeout_seconds(900), 180)
 
+    def test_build_exec_environment_uses_explicit_scratch_tempdir(self) -> None:
+        scratch = self.project_root / "runs" / "sample" / "scratch" / "task-a" / "attempt-1"
+        env = build_exec_environment(scratch)
+
+        expected_tempdir = scratch / ".codex-tmp"
+        self.assertEqual(env["TMPDIR"], str(expected_tempdir))
+        self.assertEqual(env["TMP"], str(expected_tempdir))
+        self.assertEqual(env["TEMP"], str(expected_tempdir))
+        self.assertTrue(expected_tempdir.exists())
+
+    def test_task_temp_root_uses_run_scoped_scratch_directory(self) -> None:
+        run_dir = self.project_root / "runs" / "sample"
+        root = task_temp_root(
+            run_dir,
+            task_id="backend-discovery-reconciliation",
+            attempt=2,
+            runtime_requirements={"requires_writable_temp": True},
+        )
+
+        self.assertEqual(
+            root,
+            run_dir / "scratch" / "backend-discovery-reconciliation" / "attempt-2",
+        )
+        self.assertTrue(root.exists())
+
+    def test_resolve_task_execution_mode_promotes_read_only_task_that_needs_writable_temp(self) -> None:
+        task = {
+            "execution_mode": "read_only",
+            "expected_outputs": [],
+            "writes_existing_paths": [],
+            "validation": [
+                {
+                    "id": "validate-backend-bootstrap",
+                    "command": "npm run validate:todo-backend-bootstrap",
+                }
+            ],
+        }
+
+        self.assertEqual(
+            resolve_task_execution_mode(task, infer_task_runtime_requirements(task)),
+            "isolated_write",
+        )
+
     def test_prompt_inheritance_for_smoke_task(self) -> None:
         scaffold_smoke_test(self.project_root, "smoke")
         metadata = read_json(self.project_root / "runs" / "smoke" / "prompt-logs" / "APP-A-SMOKE-001.json")
@@ -132,6 +237,107 @@ class OrchestratorTests(unittest.TestCase):
         self.assertIn("orchestrator/roles/capabilities/frontend.md", metadata["files_loaded"])
         self.assertIn("orchestrator/phase-overlays/discovery/task-execution.md", metadata["files_loaded"])
 
+    def test_cli_watch_run_web_launches_monitor_runtime_for_run_id(self) -> None:
+        with patch("company_orchestrator.cli.subprocess.run") as run_mock:
+            run_mock.return_value = subprocess.CompletedProcess(args=[], returncode=0)
+            argv = [
+                "company-orchestrator",
+                "--project-root",
+                str(self.project_root),
+                "watch-run-web",
+                "auto-todo-mvp-094-full",
+                "--node-path",
+                "node-custom",
+                "--api-host",
+                "127.0.0.2",
+                "--api-port",
+                "9901",
+                "--frontend-host",
+                "127.0.0.3",
+                "--frontend-port",
+                "9902",
+                "--python-command",
+                "python-custom",
+            ]
+
+            with patch.object(sys, "argv", argv):
+                with self.assertRaises(SystemExit) as ctx:
+                    cli_main()
+
+        self.assertEqual(ctx.exception.code, 0)
+        run_mock.assert_called_once()
+        command = run_mock.call_args.args[0]
+        self.assertEqual(
+            command,
+            [
+                "node-custom",
+                "--no-warnings",
+                "apps/monitor/runtime/scripts/start.js",
+                "auto-todo-mvp-094-full",
+            ],
+        )
+        self.assertEqual(Path(run_mock.call_args.kwargs["cwd"]).resolve(), REPO_ROOT)
+        env = run_mock.call_args.kwargs["env"]
+        self.assertEqual(
+            Path(env["MONITOR_PROJECT_ROOT"]).resolve(),
+            self.project_root.resolve(),
+        )
+        self.assertEqual(env["MONITOR_RUN_ID"], "auto-todo-mvp-094-full")
+        self.assertEqual(env["MONITOR_API_HOST"], "127.0.0.2")
+        self.assertEqual(env["MONITOR_API_PORT"], "9901")
+        self.assertEqual(env["MONITOR_FRONTEND_HOST"], "127.0.0.3")
+        self.assertEqual(env["MONITOR_FRONTEND_PORT"], "9902")
+        self.assertEqual(env["MONITOR_API_PYTHON"], "python-custom")
+
+    def test_cli_watch_run_web_uses_ephemeral_ports_by_default(self) -> None:
+        with patch("company_orchestrator.cli.subprocess.run") as run_mock:
+            run_mock.return_value = subprocess.CompletedProcess(args=[], returncode=0)
+            argv = [
+                "company-orchestrator",
+                "--project-root",
+                str(self.project_root),
+                "watch-run-web",
+                "auto-todo-mvp-095-full",
+            ]
+
+            with patch.object(sys, "argv", argv):
+                with self.assertRaises(SystemExit) as ctx:
+                    cli_main()
+
+        self.assertEqual(ctx.exception.code, 0)
+        env = run_mock.call_args.kwargs["env"]
+        self.assertEqual(env["MONITOR_API_PORT"], "0")
+        self.assertEqual(env["MONITOR_FRONTEND_PORT"], "0")
+
+    def test_cli_watch_run_web_allows_omitting_run_id(self) -> None:
+        with patch("company_orchestrator.cli.subprocess.run") as run_mock:
+            run_mock.return_value = subprocess.CompletedProcess(args=[], returncode=0)
+            argv = [
+                "company-orchestrator",
+                "--project-root",
+                str(self.project_root),
+                "watch-run-web",
+            ]
+
+            with patch.object(sys, "argv", argv):
+                with self.assertRaises(SystemExit) as ctx:
+                    cli_main()
+
+        self.assertEqual(ctx.exception.code, 0)
+        command = run_mock.call_args.args[0]
+        self.assertEqual(
+            command,
+            [
+                "node",
+                "--no-warnings",
+                "apps/monitor/runtime/scripts/start.js",
+            ],
+        )
+        env = run_mock.call_args.kwargs["env"]
+        self.assertNotIn("MONITOR_RUN_ID", env)
+        self.assertEqual(env["MONITOR_API_PORT"], "0")
+        self.assertEqual(env["MONITOR_FRONTEND_PORT"], "0")
+
     def test_planning_renderers_load_planning_overlays_only(self) -> None:
         scaffold_planning_run(self.project_root, "planning-overlays", ["frontend"])
         objective_metadata = render_objective_planning_prompt(self.project_root, "planning-overlays", "app-a")
@@ -139,7 +345,7 @@ class OrchestratorTests(unittest.TestCase):
         self.assertIn("orchestrator/phase-overlays/discovery/objective-planning.md", objective_metadata["files_loaded"])
         self.assertNotIn("orchestrator/phase-overlays/discovery/task-execution.md", objective_metadata["files_loaded"])
         self.assertNotIn("Allowed work: implement", objective_prompt)
-        self.assertIn("This prompt is for planning only.", objective_prompt)
+        self.assertIn("Return exactly one `objective-outline.v1` JSON object.", objective_prompt)
 
         objective_outline = objective_outline_for_objective("planning-overlays", "app-a", ["frontend"])
         capability_metadata = render_capability_planning_prompt(
@@ -156,7 +362,7 @@ class OrchestratorTests(unittest.TestCase):
         )
         self.assertNotIn("orchestrator/phase-overlays/discovery/task-execution.md", capability_metadata["files_loaded"])
         self.assertNotIn("Allowed work: implement", capability_prompt)
-        self.assertIn("This prompt is for planning only.", capability_prompt)
+        self.assertIn("Return exactly one `capability-plan.v1` JSON object.", capability_prompt)
 
     def test_normalize_output_descriptors_rejects_stringified_null_sentinels(self) -> None:
         with self.assertRaises(ValueError):
@@ -210,6 +416,36 @@ class OrchestratorTests(unittest.TestCase):
             "output-descriptor.v1",
             self.project_root,
         )
+
+    def test_sanitize_output_descriptors_canonicalizes_assertion_paths(self) -> None:
+        sanitized = sanitize_output_descriptors(
+            [
+                {
+                    "kind": "assertion",
+                    "output_id": "frontend.scope.validated",
+                    "path": "apps/todo/frontend/design/scope.md",
+                    "asset_id": "asset.frontend.scope",
+                    "description": "Frontend scope validated.",
+                    "evidence": {"validation_ids": ["frontend-check"], "artifact_paths": []},
+                }
+            ]
+        )
+
+        self.assertEqual(
+            sanitized,
+            [
+                {
+                    "kind": "assertion",
+                    "output_id": "frontend.scope.validated",
+                    "path": None,
+                    "asset_id": None,
+                    "description": "Frontend scope validated.",
+                    "evidence": {"validation_ids": ["frontend-check"], "artifact_paths": []},
+                }
+            ],
+        )
+        normalized = normalize_output_descriptors(sanitized, allow_legacy_strings=False)
+        self.assertIsNone(normalized[0]["path"])
 
     def test_canonicalize_input_reference_normalizes_bracketed_goal_context_refs(self) -> None:
         self.assertEqual(
@@ -294,7 +530,7 @@ class OrchestratorTests(unittest.TestCase):
         state.update(
             {
                 "enabled": True,
-                "status": "active",
+                "status": "running",
                 "active_phase": "discovery",
                 "started_at": "2026-03-16T00:00:00Z",
                 "last_action": "run-phase",
@@ -317,7 +553,7 @@ class OrchestratorTests(unittest.TestCase):
 
         after = read_json(autonomy_path)
         self.assertEqual(result["stop_condition"], "active_external_work")
-        self.assertEqual(after["status"], "active")
+        self.assertEqual(after["status"], "running")
         self.assertEqual(after["started_at"], "2026-03-16T00:00:00Z")
 
     def test_render_prompt_resolves_planning_inputs_and_prior_outputs(self) -> None:
@@ -380,20 +616,25 @@ class OrchestratorTests(unittest.TestCase):
         metadata = render_prompt(self.project_root, "overlay-guard", task_path)
         prompt_text = (self.project_root / metadata["prompt_path"]).read_text()
 
-        self.assertIn("Use only the injected Resolved Inputs", prompt_text)
-        self.assertIn("Do not mine `docs/design`", prompt_text)
+        self.assertIn("# Inputs You Can Use", prompt_text)
+        self.assertIn("# Existing Files You May Change", prompt_text)
 
-    def test_render_objective_prompt_includes_exact_objective_contract_section(self) -> None:
+    def test_render_objective_prompt_includes_semantic_objective_sections(self) -> None:
         scaffold_planning_run(self.project_root, "objective-contract-prompt", ["frontend", "backend"])
         metadata = render_objective_planning_prompt(self.project_root, "objective-contract-prompt", "app-a")
         prompt_text = (self.project_root / metadata["prompt_path"]).read_text(encoding="utf-8")
 
-        self.assertIn("# Exact Objective Contract", prompt_text)
-        self.assertIn("## Allowed Capabilities", prompt_text)
+        self.assertIn("# Assignment", prompt_text)
+        self.assertIn("You are creating the planning outline for one project objective.", prompt_text)
+        self.assertIn("# Available Context", prompt_text)
+        self.assertIn("# Allowed Capabilities", prompt_text)
+        self.assertIn("# Output Shape Reference", prompt_text)
         self.assertIn("`frontend`", prompt_text)
         self.assertIn("`backend`", prompt_text)
-        self.assertIn("## Allowed Output Surfaces By Capability", prompt_text)
+        self.assertIn("Allowed output surfaces", prompt_text)
         self.assertIn("runs/objective-contract-prompt/reports", prompt_text)
+        self.assertNotIn("available_roles", prompt_text)
+        self.assertNotIn("worker_roles", prompt_text)
 
     def test_middleware_mvp_build_objective_contract_excludes_runtime_tree_paths(self) -> None:
         scaffold_planning_run(self.project_root, "objective-contract-middleware-mvp", ["middleware"])
@@ -429,7 +670,7 @@ class OrchestratorTests(unittest.TestCase):
         self.assertNotIn("apps/todo/runtime/**", prompt_text)
         self.assertNotIn("docs/objectives/app-a/**", prompt_text)
 
-    def test_render_prompt_includes_exact_task_contract_section(self) -> None:
+    def test_render_prompt_includes_semantic_task_sections(self) -> None:
         scaffold_planning_run(self.project_root, "task-contract-prompt", ["frontend"])
         task = {
             "schema": "task-assignment.v1",
@@ -470,30 +711,276 @@ class OrchestratorTests(unittest.TestCase):
         metadata = render_prompt(self.project_root, "task-contract-prompt", task_path)
         prompt_text = (self.project_root / metadata["prompt_path"]).read_text(encoding="utf-8")
 
-        self.assertIn("# Exact Task Contract", prompt_text)
-        self.assertIn("## Required Outputs", prompt_text)
+        self.assertIn("# Inputs You Can Use", prompt_text)
+        self.assertIn("# Outputs To Produce", prompt_text)
         self.assertIn("`frontend-discovery-brief` (artifact) -> path `apps/app-a/frontend/discovery-brief.md`", prompt_text)
-        self.assertIn("## Declared Inputs", prompt_text)
+        self.assertIn("# Existing Files You May Change", prompt_text)
+        self.assertIn("This section covers only pre-existing files you may edit.", prompt_text)
+        self.assertIn("These are the declared output paths this task owns.", prompt_text)
         self.assertIn("`Planning Inputs.goal_markdown`", prompt_text)
+        self.assertIn("# Field Semantics", prompt_text)
+        self.assertIn("`blockers`", prompt_text)
+        self.assertNotIn("# System Mapping", prompt_text)
+        self.assertNotIn("`collaboration_request`", prompt_text)
+        self.assertNotIn("`change_requests`", prompt_text)
+
+    def test_render_mvp_prompt_includes_task_repair_focus(self) -> None:
+        scaffold_planning_run(self.project_root, "task-repair-prompt", ["frontend"])
+        run_dir = self.project_root / "runs" / "task-repair-prompt"
+        phase_plan = read_json(run_dir / "phase-plan.json")
+        phase_plan["current_phase"] = "mvp-build"
+        write_json(run_dir / "phase-plan.json", phase_plan)
+        task = {
+            "schema": "task-assignment.v1",
+            "run_id": "task-repair-prompt",
+            "phase": "mvp-build",
+            "objective_id": "app-a",
+            "capability": "frontend",
+            "task_id": "frontend_crud_tests",
+            "assigned_role": "objectives.app-a.frontend-worker",
+            "manager_role": "objectives.app-a.objective-manager",
+            "acceptance_role": "objectives.app-a.acceptance-manager",
+            "objective": "Create CRUD coverage.",
+            "inputs": ["Planning Inputs.goal_markdown"],
+            "expected_outputs": [
+                {
+                    "kind": "artifact",
+                    "output_id": "crud-tests",
+                    "path": "apps/todo/frontend/test/todos-crud.test.js",
+                    "asset_id": None,
+                    "description": None,
+                    "evidence": None,
+                }
+            ],
+            "done_when": ["crud coverage exists"],
+            "depends_on": [],
+            "execution_mode": "read_only",
+            "parallel_policy": "allow",
+            "owned_paths": ["apps/todo/frontend/test/todos-crud.test.js"],
+            "writes_existing_paths": [],
+            "shared_asset_ids": [],
+            "validation": [{"id": "run_frontend_crud_tests", "command": "npm test -- --runTestsByPath apps/todo/frontend/test/todos-crud.test.js"}],
+            "collaboration_rules": [],
+            "working_directory": None,
+            "additional_directories": [],
+            "sandbox_mode": "read-only",
+        }
+        task_path = run_dir / "tasks" / "frontend_crud_tests.json"
+        write_json(task_path, task)
+        repair_context_dir = run_dir / "repair-contexts"
+        repair_context_dir.mkdir(parents=True, exist_ok=True)
+        write_json(
+            repair_context_dir / "frontend_crud_tests.json",
+            {
+                "source": "bundle_task_repair",
+                "summary": "Repair only the validation scope issue for this task.",
+                "task_id": "frontend_crud_tests",
+                "objective_id": "app-a",
+                "bundle_id": "frontend-mvp-bundle",
+                "failures": [
+                    {
+                        "source_test": "validation_command_scope",
+                        "summary": "Validation command ran unrelated tests.",
+                        "details": "Repo-root npm test script ignored path narrowing.",
+                        "paths": ["apps/todo/frontend/test/todos-crud.test.js", "package.json"],
+                    }
+                ],
+                "focus_paths": ["apps/todo/frontend/test/todos-crud.test.js", "package.json"],
+            },
+        )
+
+        metadata = render_prompt(self.project_root, "task-repair-prompt", task_path)
+        prompt_text = (self.project_root / metadata["prompt_path"]).read_text(encoding="utf-8")
+
+        self.assertIn("# Repair Focus", prompt_text)
+        self.assertIn("Repair only the validation scope issue for this task.", prompt_text)
+        self.assertIn("validation_command_scope", prompt_text)
 
     def test_build_execution_prompt_forbids_rediscovering_resolved_task_outputs(self) -> None:
         prompt = build_execution_prompt("# Task prompt")
-        self.assertIn("`# Exact Task Contract` section as the hard boundary", prompt)
-        self.assertIn("do not shell-search `runs/`, sibling task workspaces", prompt)
-        self.assertIn("Resolved Inputs as authoritative", prompt)
+        self.assertIn("# Execution Rules", prompt)
+        self.assertIn("## How To Use Inputs During Execution", prompt)
+        self.assertIn("Do not re-discover the same upstream context by searching `runs/`, sibling task workspaces", prompt)
+        self.assertIn("Treat the injected `Resolved Inputs` as authoritative", prompt)
         self.assertIn("create its parent directory and write the artifact directly", prompt)
-        self.assertIn("Do not waste turns on exploratory shell commands like `pwd`, `ls`", prompt)
+        self.assertIn("Do not waste turns on exploratory commands such as repeated `pwd`, `ls`", prompt)
         self.assertIn("Do not re-read the generated prompt log or task prompt file from `runs/...`", prompt)
         self.assertIn("do not run `test -f`, `rg`, or `grep` against files you just created", prompt)
+        self.assertIn("## How To Handle Validation Failure", prompt)
+        self.assertIn("Do not repeat the same failing validation without a new fix.", prompt)
+        self.assertIn("Always end the task with one final JSON response.", prompt)
 
     def test_build_execution_prompt_requires_blocking_issues_to_use_blocked_status(self) -> None:
         prompt = build_execution_prompt("# Task prompt")
-        self.assertIn('status must be "blocked"', prompt)
+        self.assertIn("## How To Decide Task Status", prompt)
+        self.assertIn("Use `blocked` when:", prompt)
         self.assertIn("design artifacts, runtime contracts, or handoff payloads contradict each other", prompt)
-        self.assertIn("goal-critical, blocking, impossible to resolve within your owned scope", prompt)
-        self.assertIn("include a change_requests array", prompt)
-        self.assertIn("conflicting_input_refs", prompt)
-        self.assertIn("leave affected_output_ids, affected_handoff_ids, impacted_objective_ids, and impacted_task_ids as empty arrays", prompt)
+        self.assertIn("## How To Report Blockers", prompt)
+        self.assertIn("Use `blockers` to report factual execution blockers only.", prompt)
+        self.assertIn("another role or team owns the failing surface", prompt)
+        self.assertIn("cite the narrowest exact entries from input source metadata", prompt)
+        self.assertIn("do not guess impact ids from local outputs", prompt)
+        self.assertIn("## How To Report Produced Outputs", prompt)
+        self.assertIn("Use only declared `output_id` values", prompt)
+
+    def test_render_prompt_preserves_full_validation_commands_in_task_assignment(self) -> None:
+        scaffold_planning_run(self.project_root, "full-validation-command", ["backend"])
+        task = {
+            "schema": "task-assignment.v1",
+            "run_id": "full-validation-command",
+            "phase": "discovery",
+            "objective_id": "app-a",
+            "capability": "backend",
+            "task_id": "APP-A-BACKEND-VALIDATION-001",
+            "assigned_role": "objectives.app-a.backend-worker",
+            "manager_role": "objectives.app-a.backend-manager",
+            "acceptance_role": "objectives.app-a.acceptance-manager",
+            "objective": "Render a prompt with an exact validation command.",
+            "inputs": [],
+            "expected_outputs": [],
+            "done_when": [],
+            "depends_on": [],
+            "validation": [
+                {
+                    "id": "validate-discovery-context",
+                    "command": "node -e \"const objective='simple-backend-api-and-persistence-layer-for-storing-todo-items'; const capability='backend'; const phase='discovery'; if (!objective || capability !== 'backend' || phase !== 'discovery') process.exit(1);\"",
+                }
+            ],
+            "collaboration_rules": [],
+            "writes_existing_paths": [],
+            "owned_paths": [],
+            "shared_asset_ids": [],
+        }
+        task_path = self.project_root / "runs" / "full-validation-command" / "tasks" / "APP-A-BACKEND-VALIDATION-001.json"
+        write_json(task_path, task)
+
+        metadata = render_prompt(self.project_root, "full-validation-command", task_path)
+        prompt_text = (self.project_root / metadata["prompt_path"]).read_text(encoding="utf-8")
+
+        self.assertIn("# Validation To Run", prompt_text)
+        self.assertIn("const capability='backend'; const phase='discovery';", prompt_text)
+        self.assertNotIn("const capability='backend'; const phase='discovery'; if (!objective || capability !== 'backend' || phase !== 'discovery') process.exit(1)...", prompt_text)
+
+    def test_validate_validation_commands_rejects_missing_prefix_package_root(self) -> None:
+        frontend_root = self.project_root / "apps" / "app-a" / "frontend"
+        (frontend_root / "src").mkdir(parents=True)
+        tasks = [
+            {
+                "task_id": "frontend-polish-bootstrap",
+                "validation": [
+                    {
+                        "id": "validate-frontend-polish-bootstrap",
+                        "command": "npm --prefix apps/app-a/frontend test -- --runInBand",
+                    }
+                ],
+            }
+        ]
+
+        with self.assertRaises(ExecutorError) as context:
+            validate_validation_commands(
+                tasks,
+                project_root=self.project_root,
+                phase="polish",
+                plan_label="Capability plan",
+            )
+
+        self.assertIn("apps/app-a/frontend/package.json", str(context.exception))
+
+    def test_repo_relative_path_exists_accepts_glob_when_matches_exist(self) -> None:
+        target = self.project_root / "apps" / "todo" / "frontend" / "src" / "todos" / "TodoApp.jsx"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("export {};\n", encoding="utf-8")
+
+        self.assertTrue(repo_relative_path_exists([self.project_root], "apps/todo/frontend/src/**"))
+
+    def test_normalize_task_execution_entry_infers_existing_write_paths_from_broad_outputs(self) -> None:
+        target = self.project_root / "apps" / "todo" / "backend" / "src" / "server.js"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("module.exports = {};\n", encoding="utf-8")
+
+        task = {
+            "task_id": "backend-polish-crud-service",
+            "phase": "polish",
+            "execution_mode": "isolated_write",
+            "parallel_policy": "serialize",
+            "expected_outputs": [
+                {
+                    "kind": "artifact",
+                    "output_id": "backend-polish-implementation",
+                    "path": "apps/todo/backend/src/**",
+                    "asset_id": None,
+                    "description": None,
+                    "evidence": None,
+                }
+            ],
+            "writes_existing_paths": [],
+            "owned_paths": [],
+            "shared_asset_ids": [],
+            "validation": [],
+            "additional_directories": [],
+        }
+
+        normalize_task_execution_entry(
+            self.project_root,
+            "simple-backend-api-and-persistence-layer-for-storing-todo-items",
+            "backend",
+            task,
+            phase_override="polish",
+            run_id=None,
+            default_sandbox_mode="read-only",
+        )
+
+        self.assertIn("apps/todo/backend/src/server.js", task["writes_existing_paths"])
+
+    def test_normalize_task_execution_entry_rewrites_invalid_backend_prefix_validation(self) -> None:
+        (self.project_root / "apps" / "todo" / "backend").mkdir(parents=True, exist_ok=True)
+        write_json(
+            self.project_root / "package.json",
+            {
+                "scripts": {
+                    "validate:todo-backend": "node --no-warnings --test apps/todo/backend/test/*.test.js",
+                    "todo-backend:start": "node apps/todo/backend/scripts/start.js",
+                }
+            },
+        )
+        task = {
+            "task_id": "backend-polish-readiness-summary",
+            "phase": "polish",
+            "execution_mode": "isolated_write",
+            "parallel_policy": "serialize",
+            "expected_outputs": [
+                {
+                    "kind": "artifact",
+                    "output_id": "backend-polish-summary",
+                    "path": "apps/todo/backend/design/polish-backend-api-and-persistence-summary.md",
+                    "asset_id": None,
+                    "description": None,
+                    "evidence": None,
+                }
+            ],
+            "writes_existing_paths": [],
+            "owned_paths": [],
+            "shared_asset_ids": [],
+            "validation": [
+                {
+                    "id": "backend_polish_crud_persistence_checks",
+                    "command": "npm --prefix apps/todo/backend test",
+                }
+            ],
+            "additional_directories": [],
+        }
+
+        normalize_task_execution_entry(
+            self.project_root,
+            "simple-backend-api-and-persistence-layer-for-storing-todo-items",
+            "backend",
+            task,
+            phase_override="polish",
+            run_id=None,
+            default_sandbox_mode="read-only",
+        )
+
+        self.assertEqual(task["validation"][0]["command"], "npm run validate:todo-backend")
 
     def test_normalize_change_request_payloads_auto_approves_small_interface_change(self) -> None:
         normalized = normalize_change_request_payloads(
@@ -760,9 +1247,17 @@ url = "https://example.com/mcp"
         self.assertEqual(retried["observability"]["runtime_ms"], 0)
         self.assertEqual(retried["observability"]["stream_stdout_bytes"], 0)
         self.assertEqual(retried["observability"]["stream_stderr_bytes"], 0)
+        self.assertEqual(retried["observability"]["submitted_at"], retried["started_at"])
         self.assertIsNone(retried["observability"]["queued_at"])
         self.assertIsNone(retried["observability"]["launched_at"])
+        self.assertIsNone(retried["observability"]["thread_started_at"])
+        self.assertIsNone(retried["observability"]["turn_started_at"])
+        self.assertIsNone(retried["observability"]["first_stream_at"])
+        self.assertIsNone(retried["observability"]["turn_completed_at"])
         self.assertIsNone(retried["observability"]["completed_at"])
+        self.assertEqual(retried["observability"]["time_to_first_stream_ms"], 0)
+        self.assertEqual(retried["observability"]["processing_ms"], 0)
+        self.assertEqual(retried["observability"]["wall_clock_ms"], 0)
         self.assertEqual(retried["started_at"], retried["updated_at"])
 
     def test_render_prompt_resolves_natural_language_goal_refs(self) -> None:
@@ -1078,6 +1573,44 @@ url = "https://example.com/mcp"
         self.assertEqual(normalized["tasks"][0]["execution_mode"], "isolated_write")
         self.assertEqual(normalized["tasks"][0]["parallel_policy"], "allow")
         self.assertEqual(normalized["tasks"][0]["sandbox_mode"], "workspace-write")
+
+    def test_normalize_capability_plan_injects_canonical_worker_role_when_missing(self) -> None:
+        scaffold_planning_run(self.project_root, "normalize-missing-role", ["backend"])
+        outline = objective_outline_for_objective("normalize-missing-role", "app-a", ["backend"])
+        plan = capability_plan_for_objective("normalize-missing-role", "app-a", "backend")
+        del plan["tasks"][0]["assigned_role"]
+
+        normalized, _ = normalize_capability_plan(
+            self.project_root,
+            plan,
+            run_id="normalize-missing-role",
+            phase="discovery",
+            objective_id="app-a",
+            capability="backend",
+            objective_outline=outline,
+            default_sandbox_mode="workspace-write",
+        )
+
+        self.assertEqual(normalized["tasks"][0]["assigned_role"], "objectives.app-a.backend-worker")
+
+    def test_normalize_capability_plan_overwrites_invalid_worker_role(self) -> None:
+        scaffold_planning_run(self.project_root, "normalize-invalid-role", ["frontend"])
+        outline = objective_outline_for_objective("normalize-invalid-role", "app-a", ["frontend"])
+        plan = capability_plan_for_objective("normalize-invalid-role", "app-a", "frontend")
+        plan["tasks"][0]["assigned_role"] = "frontend-manager"
+
+        normalized, _ = normalize_capability_plan(
+            self.project_root,
+            plan,
+            run_id="normalize-invalid-role",
+            phase="discovery",
+            objective_id="app-a",
+            capability="frontend",
+            objective_outline=outline,
+            default_sandbox_mode="workspace-write",
+        )
+
+        self.assertEqual(normalized["tasks"][0]["assigned_role"], "objectives.app-a.frontend-worker")
 
     def test_normalize_objective_outline_promotes_bare_non_lane_role_refs(self) -> None:
         scaffold_planning_run(self.project_root, "normalize-outline-role", ["backend"])
@@ -1833,6 +2366,82 @@ url = "https://example.com/mcp"
         )
 
         self.assertEqual(normalized["tasks"][0]["inputs"], [discovery_path])
+
+    def test_normalize_capability_plan_allows_task_input_for_own_existing_output_path(self) -> None:
+        run_id = "allow-self-existing-output-input"
+        scaffold_planning_run(self.project_root, run_id, ["frontend"])
+        existing_path = "apps/app-a/frontend/src/App.tsx"
+        existing_file = self.project_root / existing_path
+        existing_file.parent.mkdir(parents=True, exist_ok=True)
+        existing_file.write_text("export function App() { return null; }\n", encoding="utf-8")
+
+        outline = objective_outline_for_objective(run_id, "app-a", ["frontend"])
+        outline["phase"] = "mvp-build"
+        outline["capability_lanes"][0]["expected_outputs"] = [
+            {
+                "kind": "artifact",
+                "output_id": "frontend-app-shell",
+                "path": existing_path,
+                "asset_id": None,
+                "description": None,
+                "evidence": None,
+            }
+        ]
+        plan = {
+            "schema": "capability-plan.v1",
+            "run_id": run_id,
+            "phase": "mvp-build",
+            "objective_id": "app-a",
+            "capability": "frontend",
+            "summary": "Update the existing app shell in place.",
+            "tasks": [
+                {
+                    "task_id": "APP-A-MVP-001",
+                    "capability": "frontend",
+                    "assigned_role": "objectives.app-a.frontend-worker",
+                    "execution_mode": "isolated_write",
+                    "parallel_policy": "serialize",
+                    "owned_paths": [existing_path],
+                    "writes_existing_paths": [existing_path],
+                    "shared_asset_ids": [],
+                    "objective": "Update the existing app shell in place.",
+                    "inputs": [existing_path],
+                    "expected_outputs": [
+                        {
+                            "kind": "artifact",
+                            "output_id": "frontend-app-shell",
+                            "path": existing_path,
+                            "asset_id": None,
+                            "description": None,
+                            "evidence": None,
+                        }
+                    ],
+                    "done_when": ["the existing app shell is updated"],
+                    "depends_on": [],
+                    "validation": [],
+                    "collaboration_rules": [],
+                    "working_directory": None,
+                    "additional_directories": [],
+                    "sandbox_mode": "workspace-write",
+                }
+            ],
+            "bundle_plan": [{"bundle_id": "frontend-bundle", "task_ids": ["APP-A-MVP-001"], "summary": "frontend bundle"}],
+            "dependency_notes": [],
+            "collaboration_handoffs": [],
+        }
+
+        normalized, _ = normalize_capability_plan(
+            self.project_root,
+            plan,
+            run_id=run_id,
+            phase="mvp-build",
+            objective_id="app-a",
+            capability="frontend",
+            objective_outline=outline,
+            default_sandbox_mode="workspace-write",
+        )
+
+        self.assertEqual(normalized["tasks"][0]["inputs"], [existing_path])
 
     def test_normalize_capability_plan_backfills_required_handoff_output_ids(self) -> None:
         run_id = "backfill-required-handoff-outputs"
@@ -2658,6 +3267,361 @@ url = "https://example.com/mcp"
         self.assertIn("test -f apps/todo/backend/discovery/backend-discovery-brief.md", prompt_text)
         self.assertNotIn("test -f backend/discovery/backend-discovery-brief.md", prompt_text)
 
+    def test_compile_task_context_packet_flags_missing_planning_inputs(self) -> None:
+        scaffold_planning_run(self.project_root, "compiled-missing-inputs", ["frontend"])
+        task = {
+            "schema": "task-assignment.v1",
+            "run_id": "compiled-missing-inputs",
+            "phase": "discovery",
+            "objective_id": "app-a",
+            "capability": "frontend",
+            "task_id": "APP-A-FRONTEND-EXEC-003",
+            "assigned_role": "objectives.app-a.frontend-worker",
+            "manager_role": "objectives.app-a.frontend-manager",
+            "acceptance_role": "objectives.app-a.acceptance-manager",
+            "objective": "Try to consume a missing canonical contract.",
+            "inputs": ["Planning Inputs.canonical_contracts.api_contract.path"],
+            "expected_outputs": [],
+            "owned_paths": [],
+            "sandbox_mode": "read-only",
+            "execution_mode": "read_only",
+            "parallel_policy": "allow",
+            "done_when": ["context packet is compiled"],
+            "depends_on": [],
+            "validation": [],
+            "collaboration_rules": [],
+            "additional_directories": [],
+        }
+
+        packet = compile_task_context_packet(
+            self.project_root,
+            "compiled-missing-inputs",
+            task,
+            files_loaded=[],
+            prompt_path="runs/compiled-missing-inputs/prompt-logs/APP-A-FRONTEND-EXEC-003.prompt.md",
+            role_kind="worker",
+        )
+
+        self.assertEqual(packet["available_inputs"], {})
+        self.assertEqual(
+            packet["missing_inputs"],
+            [
+                {
+                    "input_ref": "Planning Inputs.canonical_contracts.api_contract.path",
+                    "reason": "missing_planning_input",
+                    "detail": "canonical_contracts.api_contract.path",
+                }
+            ],
+        )
+
+    def test_render_prompt_records_missing_input_refs_in_compiled_context(self) -> None:
+        scaffold_planning_run(self.project_root, "compiled-render", ["frontend"])
+        task = {
+            "schema": "task-assignment.v1",
+            "run_id": "compiled-render",
+            "phase": "discovery",
+            "objective_id": "app-a",
+            "capability": "frontend",
+            "task_id": "APP-A-FRONTEND-EXEC-004",
+            "assigned_role": "objectives.app-a.frontend-worker",
+            "manager_role": "objectives.app-a.frontend-manager",
+            "acceptance_role": "objectives.app-a.acceptance-manager",
+            "objective": "Render a prompt with a missing planning input.",
+            "inputs": ["Planning Inputs.canonical_contracts.api_contract.path"],
+            "expected_outputs": [],
+            "owned_paths": [],
+            "sandbox_mode": "read-only",
+            "execution_mode": "read_only",
+            "parallel_policy": "allow",
+            "done_when": ["prompt is rendered"],
+            "depends_on": [],
+            "validation": [],
+            "collaboration_rules": [],
+            "additional_directories": [],
+        }
+        task_path = self.project_root / "runs" / "compiled-render" / "tasks" / "APP-A-FRONTEND-EXEC-004.json"
+        write_json(task_path, task)
+
+        metadata = render_prompt(self.project_root, "compiled-render", task_path)
+        prompt_text = (self.project_root / metadata["prompt_path"]).read_text(encoding="utf-8")
+
+        self.assertIn("# Compiled Task Context", prompt_text)
+        self.assertIn('"missing_inputs"', prompt_text)
+        self.assertEqual(
+            metadata["missing_input_refs"],
+            ["Planning Inputs.canonical_contracts.api_contract.path"],
+        )
+
+    def test_render_prompt_only_lists_materialized_read_paths(self) -> None:
+        init_git_repo(self.project_root)
+        run_id = "materialized-read-paths"
+        scaffold_planning_run(self.project_root, run_id, ["middleware"])
+        run_dir = self.project_root / "runs" / run_id
+        phase_plan = read_json(run_dir / "phase-plan.json")
+        phase_plan["current_phase"] = "design"
+        for item in phase_plan["phases"]:
+            item["status"] = "complete" if item["phase"] == "discovery" else ("active" if item["phase"] == "design" else "pending")
+        write_json(run_dir / "phase-plan.json", phase_plan)
+        backend_artifact = (
+            run_dir
+            / "artifacts"
+            / "app-b"
+            / "backend"
+            / "discovery"
+            / "backend-discovery-brief.md"
+        )
+        backend_artifact.parent.mkdir(parents=True, exist_ok=True)
+        backend_artifact.write_text("backend discovery brief\n", encoding="utf-8")
+
+        task = {
+            "schema": "task-assignment.v1",
+            "run_id": run_id,
+            "phase": "design",
+            "objective_id": "app-a",
+            "capability": "middleware",
+            "task_id": "APP-A-MID-READ-001",
+            "assigned_role": "objectives.app-a.middleware-worker",
+            "manager_role": "objectives.app-a.middleware-manager",
+            "acceptance_role": "objectives.app-a.acceptance-manager",
+            "objective": "Use only staged upstream artifacts.",
+            "inputs": [
+                "Planning Inputs.related_prior_phase_reports",
+                "Planning Inputs.prior_phase_reports",
+            ],
+            "expected_outputs": [],
+            "owned_paths": [],
+            "writes_existing_paths": [],
+            "sandbox_mode": "read-only",
+            "execution_mode": "read_only",
+            "parallel_policy": "serialize",
+            "done_when": ["staged upstream artifacts are referenced deterministically"],
+            "depends_on": [],
+            "validation": [],
+            "collaboration_rules": [],
+            "additional_directories": [],
+        }
+        task_path = run_dir / "tasks" / "APP-A-MID-READ-001.json"
+        write_json(task_path, task)
+        workspace = self.project_root / "workspaces" / "materialized-read-paths-task"
+        workspace.mkdir(parents=True, exist_ok=True)
+
+        compiled_task_context = {
+            "runtime_context": {
+                "run_id": run_id,
+                "phase": "design",
+                "task_id": "APP-A-MID-READ-001",
+            },
+            "planning_payload": {},
+            "resolved_inputs": {},
+            "available_inputs": {
+                "Planning Inputs.related_prior_phase_reports": [
+                    {
+                        "artifacts": [
+                            {
+                                "path": f"runs/{run_id}/artifacts/app-b/backend/discovery/backend-discovery-brief.md",
+                                "status": "created",
+                            }
+                        ]
+                    }
+                ],
+                "Planning Inputs.prior_phase_reports": [
+                    {
+                        "artifacts": [
+                            {
+                                "path": f"runs/{run_id}/plan:discovery:app-a:middleware/integration-boundary-and-open-contracts.md",
+                                "status": "created",
+                            }
+                        ]
+                    }
+                ],
+            },
+            "missing_inputs": [],
+            "input_source_metadata": {},
+            "available_input_refs": [
+                "Planning Inputs.prior_phase_reports",
+                "Planning Inputs.related_prior_phase_reports",
+            ],
+        }
+
+        compiled_task_context["materialized_read_paths"] = [
+            f"runs/{run_id}/artifacts/app-b/backend/discovery/backend-discovery-brief.md"
+        ]
+
+        metadata = render_prompt(
+            self.project_root,
+            run_id,
+            task_path,
+            working_directory=workspace,
+            compiled_task_context=compiled_task_context,
+        )
+        prompt_text = (self.project_root / metadata["prompt_path"]).read_text(encoding="utf-8")
+
+        self.assertIn(
+            f"`runs/{run_id}/artifacts/app-b/backend/discovery/backend-discovery-brief.md`",
+            prompt_text,
+        )
+        self.assertNotIn(
+            f"`runs/{run_id}/plan:discovery:app-a:middleware/integration-boundary-and-open-contracts.md`",
+            prompt_text,
+        )
+
+    def test_render_prompt_omits_files_section_for_unstaged_prior_phase_artifact_paths(self) -> None:
+        init_git_repo(self.project_root)
+        run_id = "unstaged-prior-phase-paths"
+        scaffold_planning_run(self.project_root, run_id, ["middleware"])
+        run_dir = self.project_root / "runs" / run_id
+        phase_plan = read_json(run_dir / "phase-plan.json")
+        phase_plan["current_phase"] = "design"
+        for item in phase_plan["phases"]:
+            item["status"] = "complete" if item["phase"] == "discovery" else ("active" if item["phase"] == "design" else "pending")
+        write_json(run_dir / "phase-plan.json", phase_plan)
+
+        task = {
+            "schema": "task-assignment.v1",
+            "run_id": run_id,
+            "phase": "design",
+            "objective_id": "app-a",
+            "capability": "middleware",
+            "task_id": "APP-A-MID-READ-002",
+            "assigned_role": "objectives.app-a.middleware-worker",
+            "manager_role": "objectives.app-a.middleware-manager",
+            "acceptance_role": "objectives.app-a.acceptance-manager",
+            "objective": "Do not advertise unstaged prior-phase artifact paths.",
+            "inputs": [
+                "Planning Inputs.related_prior_phase_reports",
+                "Planning Inputs.prior_phase_reports",
+            ],
+            "expected_outputs": [],
+            "owned_paths": [],
+            "writes_existing_paths": [],
+            "sandbox_mode": "read-only",
+            "execution_mode": "read_only",
+            "parallel_policy": "serialize",
+            "done_when": ["unstaged artifact paths stay out of the read-files contract"],
+            "depends_on": [],
+            "validation": [],
+            "collaboration_rules": [],
+            "additional_directories": [],
+        }
+        task_path = run_dir / "tasks" / "APP-A-MID-READ-002.json"
+        write_json(task_path, task)
+        workspace = self.project_root / "workspaces" / "unstaged-prior-phase-paths-task"
+        workspace.mkdir(parents=True, exist_ok=True)
+
+        compiled_task_context = {
+            "runtime_context": {
+                "run_id": run_id,
+                "phase": "design",
+                "task_id": "APP-A-MID-READ-002",
+            },
+            "planning_payload": {},
+            "resolved_inputs": {},
+            "available_inputs": {
+                "Planning Inputs.related_prior_phase_reports": [
+                    {
+                        "artifacts": [
+                            {
+                                "path": f"runs/{run_id}/artifacts/app-b/backend/discovery/backend-discovery-brief.md",
+                                "status": "created",
+                            }
+                        ]
+                    }
+                ],
+                "Planning Inputs.prior_phase_reports": [
+                    {
+                        "artifacts": [
+                            {
+                                "path": f"runs/{run_id}/plan:discovery:app-a:middleware/integration-boundary-and-open-contracts.md",
+                                "status": "created",
+                            }
+                        ]
+                    }
+                ],
+            },
+            "missing_inputs": [],
+            "input_source_metadata": {},
+            "available_input_refs": [
+                "Planning Inputs.prior_phase_reports",
+                "Planning Inputs.related_prior_phase_reports",
+            ],
+            "materialized_read_paths": [],
+        }
+
+        metadata = render_prompt(
+            self.project_root,
+            run_id,
+            task_path,
+            working_directory=workspace,
+            compiled_task_context=compiled_task_context,
+        )
+        prompt_text = (self.project_root / metadata["prompt_path"]).read_text(encoding="utf-8")
+
+        self.assertNotIn("# Files You May Read", prompt_text)
+        self.assertIn(
+            f"runs/{run_id}/artifacts/app-b/backend/discovery/backend-discovery-brief.md",
+            prompt_text,
+        )
+        self.assertIn(
+            f"runs/{run_id}/plan:discovery:app-a:middleware/integration-boundary-and-open-contracts.md",
+            prompt_text,
+        )
+
+    def test_execute_task_fails_before_launch_when_compiled_inputs_are_missing(self) -> None:
+        scaffold_planning_run(self.project_root, "compiled-gate", ["frontend"])
+        task = {
+            "schema": "task-assignment.v1",
+            "run_id": "compiled-gate",
+            "phase": "discovery",
+            "objective_id": "app-a",
+            "capability": "frontend",
+            "task_id": "APP-A-FRONTEND-EXEC-005",
+            "assigned_role": "objectives.app-a.frontend-worker",
+            "manager_role": "objectives.app-a.frontend-manager",
+            "acceptance_role": "objectives.app-a.acceptance-manager",
+            "objective": "Fail before launch on missing compiled inputs.",
+            "inputs": [],
+            "expected_outputs": [],
+            "owned_paths": [],
+            "sandbox_mode": "read-only",
+            "execution_mode": "read_only",
+            "parallel_policy": "allow",
+            "done_when": ["task fails fast"],
+            "depends_on": [],
+            "validation": [],
+            "collaboration_rules": [],
+            "additional_directories": [],
+        }
+        task_path = self.project_root / "runs" / "compiled-gate" / "tasks" / "APP-A-FRONTEND-EXEC-005.json"
+        write_json(task_path, task)
+        workspace_path = self.project_root / "workspace"
+        workspace_path.mkdir(parents=True, exist_ok=True)
+
+        with patch("company_orchestrator.executor.reconcile_for_command"), patch(
+            "company_orchestrator.executor.prepare_task_runtime",
+            return_value=TaskExecutionRuntime(workspace_path=str(workspace_path), attempt=1),
+        ), patch(
+            "company_orchestrator.executor.compile_task_context_packet",
+            return_value={
+                "runtime_context": {},
+                "available_inputs": {},
+                "missing_inputs": [
+                    {
+                        "input_ref": "Planning Inputs.canonical_contracts.api_contract.path",
+                        "reason": "missing_planning_input",
+                        "detail": "canonical_contracts.api_contract.path",
+                    }
+                ],
+                "input_source_metadata": {},
+                "available_input_refs": [],
+            },
+        ), patch("company_orchestrator.executor.materialize_task_context_files") as materialize_mock:
+            with self.assertRaisesRegex(
+                ExecutorError,
+                "Task references inputs that were not compiled into concrete context",
+            ):
+                execute_task(self.project_root, "compiled-gate", "APP-A-FRONTEND-EXEC-005")
+            materialize_mock.assert_not_called()
+
     def test_render_prompt_resolves_capability_planning_inputs(self) -> None:
         scaffold_planning_run(self.project_root, "capability-input-resolution", ["frontend", "backend", "middleware"])
         objective_outline = objective_outline_for_objective(
@@ -2752,6 +3716,359 @@ url = "https://example.com/mcp"
         self.assertNotIn('"missing_path": "required_inbound_handoffs[0].deliverables[0]"', prompt_text)
         self.assertNotIn('"missing_path": "required_outbound_handoffs[0].deliverables[0]"', prompt_text)
         self.assertNotIn('"missing_path": "objective_outline.relevant_collaboration_edges[0].deliverables[0]"', prompt_text)
+
+    def test_planning_prompt_packets_drop_broad_catalog_context(self) -> None:
+        scaffold_planning_run(self.project_root, "planning-packet", ["frontend", "backend"])
+        objective_outline = objective_outline_for_objective("planning-packet", "app-a", ["frontend", "backend"])
+        write_json(
+            self.project_root / "package.json",
+            {
+                "scripts": {
+                    "validate:app-a-frontend-flows": "node --test apps/app-a/frontend/test/app.flows.test.js",
+                }
+            },
+        )
+        objective_payload = build_planning_prompt_payload(self.project_root, "planning-packet", "app-a")
+        capability_payload = build_capability_prompt_payload(
+            self.project_root,
+            "planning-packet",
+            "app-a",
+            "frontend",
+            objective_outline,
+        )
+
+        objective_packet = build_objective_planning_prompt_packet(objective_payload)
+        capability_packet = build_capability_planning_prompt_packet(capability_payload)
+
+        self.assertNotIn("approved_inputs_catalog", objective_packet)
+        self.assertNotIn("approved_inputs_catalog", capability_packet)
+        self.assertIn("input_availability", objective_packet)
+        self.assertIn("input_availability", capability_packet)
+        self.assertNotIn("api_contract", objective_packet["canonical_contracts"])
+        self.assertNotIn("api_contract", capability_packet["canonical_contracts"])
+        self.assertIn(
+            "Planning Inputs.canonical_contracts.api_contract",
+            objective_packet["missing_dependencies"],
+        )
+        self.assertIn(
+            "Planning Inputs.canonical_contracts.api_contract",
+            capability_packet["missing_dependencies"],
+        )
+        self.assertIn("validation_environment_hints", capability_packet)
+        self.assertEqual(capability_packet["validation_environment_hints"]["repo_manifest_path"], "package.json")
+
+    def test_capability_payload_includes_validation_environment_hints(self) -> None:
+        scaffold_planning_run(self.project_root, "validation-env-hints", ["frontend"])
+        generic_objective_root = self.project_root / "orchestrator" / "roles" / "objectives" / "app-a"
+        app_objective_root = self.project_root / "apps" / "app-a" / "orchestrator" / "roles" / "objectives" / "app-a"
+        app_objective_root.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(generic_objective_root, app_objective_root, dirs_exist_ok=True)
+        shutil.rmtree(generic_objective_root)
+        (self.project_root / "apps" / "app-a" / "frontend" / "src").mkdir(parents=True)
+        (self.project_root / "apps" / "app-a" / "frontend" / "test").mkdir(parents=True)
+        write_json(
+            self.project_root / "package.json",
+            {
+                "scripts": {
+                    "validate:app-a-frontend-flows": "node --test apps/app-a/frontend/test/app.flows.test.js",
+                    "validate:app-a-frontend-editing": "node --test apps/app-a/frontend/test/app.editing.test.js",
+                }
+            },
+        )
+        objective_outline = objective_outline_for_objective("validation-env-hints", "app-a", ["frontend"])
+
+        payload = build_capability_prompt_payload(
+            self.project_root,
+            "validation-env-hints",
+            "app-a",
+            "frontend",
+            objective_outline,
+        )
+
+        hints = payload["validation_environment_hints"]
+        self.assertEqual(hints["repo_manifest_path"], "package.json")
+        self.assertIsNone(hints["capability_manifest_path"])
+        self.assertIn(
+            "npm run validate:app-a-frontend-flows",
+            hints["recommended_repo_scripts"],
+        )
+        self.assertEqual(hints["allowed_package_roots"], ["."])
+        self.assertTrue(
+            any("do not use `npm --prefix apps/app-a/frontend`" in note for note in hints["notes"])
+        )
+        self.assertTrue(
+            any(
+                item.get("kind") == "single_test_template"
+                and item.get("command_template") == "CI=1 node --no-warnings --test {test_path}"
+                and item.get("allowed_test_path_prefixes") == ["apps/app-a/frontend/test/"]
+                for item in hints["allowed_validation_commands"]
+                if isinstance(item, dict)
+            )
+        )
+
+    def test_normalize_task_execution_entry_rewrites_invalid_frontend_prefix_validation_to_direct_node_test(self) -> None:
+        scaffold_planning_run(self.project_root, "validation-env-hints", ["frontend"])
+        generic_objective_root = self.project_root / "orchestrator" / "roles" / "objectives" / "app-a"
+        app_objective_root = self.project_root / "apps" / "app-a" / "orchestrator" / "roles" / "objectives" / "app-a"
+        app_objective_root.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(generic_objective_root, app_objective_root, dirs_exist_ok=True)
+        shutil.rmtree(generic_objective_root)
+        (self.project_root / "apps" / "app-a" / "frontend" / "test").mkdir(parents=True, exist_ok=True)
+        write_json(
+            self.project_root / "package.json",
+            {
+                "scripts": {
+                    "validate:app-a-frontend-flows": "node --test apps/app-a/frontend/test/app.flows.test.js",
+                }
+            },
+        )
+        task = {
+            "task_id": "frontend-todo-tests",
+            "phase": "mvp-build",
+            "execution_mode": "isolated_write",
+            "parallel_policy": "serialize",
+            "expected_outputs": [
+                {
+                    "kind": "artifact",
+                    "output_id": "frontend_mvp_tests",
+                    "path": "apps/app-a/frontend/test/todos-crud.test.js",
+                    "asset_id": None,
+                    "description": None,
+                    "evidence": None,
+                }
+            ],
+            "writes_existing_paths": [],
+            "owned_paths": [],
+            "shared_asset_ids": [],
+            "validation": [
+                {
+                    "id": "frontend_mvp_crud_tests",
+                    "command": "CI=1 npm --prefix apps/app-a/frontend test -- --runInBand test/todos-crud.test.js",
+                }
+            ],
+            "additional_directories": [],
+        }
+
+        normalize_task_execution_entry(
+            self.project_root,
+            "app-a",
+            "frontend",
+            task,
+            phase_override="mvp-build",
+            run_id="validation-env-hints",
+            default_sandbox_mode="read-only",
+        )
+
+        self.assertEqual(
+            task["validation"][0]["command"],
+            "CI=1 node --no-warnings --test apps/app-a/frontend/test/todos-crud.test.js",
+        )
+
+    def test_validate_validation_commands_rejects_repo_root_npm_test_wrapper_when_catalog_exists(self) -> None:
+        scaffold_planning_run(self.project_root, "validation-env-hints", ["frontend"])
+        generic_objective_root = self.project_root / "orchestrator" / "roles" / "objectives" / "app-a"
+        app_objective_root = self.project_root / "apps" / "app-a" / "orchestrator" / "roles" / "objectives" / "app-a"
+        app_objective_root.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(generic_objective_root, app_objective_root, dirs_exist_ok=True)
+        shutil.rmtree(generic_objective_root)
+        (self.project_root / "apps" / "app-a" / "frontend" / "test").mkdir(parents=True, exist_ok=True)
+        write_json(
+            self.project_root / "package.json",
+            {
+                "scripts": {
+                    "test": "node --test apps/app-a/frontend/test/*.test.js",
+                    "validate:app-a-frontend-flows": "node --test apps/app-a/frontend/test/app.flows.test.js",
+                }
+            },
+        )
+        tasks = [
+            {
+                "task_id": "frontend-todo-tests",
+                "validation": [
+                    {
+                        "id": "frontend_mvp_crud_tests",
+                        "command": "CI=1 npm test -- --runInBand apps/app-a/frontend/test/todos-crud.test.js",
+                    }
+                ],
+            }
+        ]
+
+        with self.assertRaises(ExecutorError) as context:
+            validate_validation_commands(
+                tasks,
+                project_root=self.project_root,
+                phase="mvp-build",
+                plan_label="Capability plan",
+                objective_id="app-a",
+                capability="frontend",
+            )
+
+        self.assertIn("does not match any allowed validation command", str(context.exception))
+
+    def test_validate_planned_task_inputs_rejects_non_materializable_planning_inputs(self) -> None:
+        scaffold_planning_run(self.project_root, "planned-input-materialization", ["frontend"])
+        planned_task = {
+            "capability": "frontend",
+            "working_directory": None,
+            "sandbox_mode": "read-only",
+            "additional_directories": [],
+            "execution_mode": "read_only",
+            "parallel_policy": "allow",
+            "owned_paths": [],
+            "writes_existing_paths": [],
+            "shared_asset_ids": [],
+            "handoff_dependencies": [],
+            "task_id": "APP-A-FRONTEND-PLAN-001",
+            "assigned_role": "objectives.app-a.frontend-worker",
+            "objective": "Use a missing canonical contract.",
+            "inputs": ["Planning Inputs.canonical_contracts.api_contract"],
+            "expected_outputs": [
+                {
+                    "kind": "artifact",
+                    "output_id": "frontend_design_spec",
+                    "path": "runs/planned-input-materialization/artifacts/frontend-spec.md",
+                }
+            ],
+            "done_when": ["spec exists"],
+            "depends_on": [],
+            "validation": [],
+            "collaboration_rules": [],
+        }
+
+        with self.assertRaisesRegex(
+            ExecutorError,
+            "Objective plan produced non-materializable task inputs",
+        ):
+            validate_planned_task_inputs(
+                self.project_root,
+                "planned-input-materialization",
+                "discovery",
+                "app-a",
+                [planned_task],
+            )
+
+    def test_validate_planned_task_inputs_accepts_validation_environment_hints(self) -> None:
+        scaffold_planning_run(self.project_root, "planned-input-validation-env", ["frontend"])
+        (self.project_root / "apps" / "app-a" / "frontend" / "src").mkdir(parents=True)
+        write_json(
+            self.project_root / "package.json",
+            {
+                "scripts": {
+                    "validate:app-a-frontend-flows": "node --test apps/app-a/frontend/test/app.flows.test.js",
+                }
+            },
+        )
+        planned_task = {
+            "capability": "frontend",
+            "working_directory": None,
+            "sandbox_mode": "read-only",
+            "additional_directories": [],
+            "execution_mode": "read_only",
+            "parallel_policy": "allow",
+            "owned_paths": [],
+            "writes_existing_paths": [],
+            "shared_asset_ids": [],
+            "handoff_dependencies": [],
+            "task_id": "APP-A-FRONTEND-PLAN-VALIDATION-ENV",
+            "assigned_role": "objectives.app-a.frontend-worker",
+            "objective": "Use the validation environment hints as planning input.",
+            "inputs": ["Planning Inputs.validation_environment_hints"],
+            "expected_outputs": [],
+            "done_when": ["validation hints were considered"],
+            "depends_on": [],
+            "validation": [],
+            "collaboration_rules": [],
+        }
+
+        validate_planned_task_inputs(
+            self.project_root,
+            "planned-input-validation-env",
+            "discovery",
+            "app-a",
+            [planned_task],
+        )
+
+    def test_validate_objective_outline_rejects_missing_prompt_packet_ref(self) -> None:
+        scaffold_planning_run(self.project_root, "outline-missing-packet-ref", ["frontend"])
+        outline = objective_outline_for_objective("outline-missing-packet-ref", "app-a", ["frontend"])
+        outline["capability_lanes"][0]["inputs"] = ["Planning Inputs.canonical_contracts.api_contract"]
+
+        with self.assertRaisesRegex(
+            ExecutorError,
+            "Objective outline capability lane frontend referenced unavailable planning inputs",
+        ):
+            validate_objective_outline_planning_input_addressability(
+                self.project_root,
+                "outline-missing-packet-ref",
+                "discovery",
+                "app-a",
+                outline,
+            )
+
+    def test_validate_capability_plan_rejects_missing_prompt_packet_ref(self) -> None:
+        scaffold_planning_run(self.project_root, "capability-missing-packet-ref", ["frontend"])
+        objective_outline = objective_outline_for_objective("capability-missing-packet-ref", "app-a", ["frontend"])
+        capability_plan = {
+            "schema": "capability-plan.v1",
+            "run_id": "capability-missing-packet-ref",
+            "phase": "discovery",
+            "objective_id": "app-a",
+            "capability": "frontend",
+            "summary": "Frontend discovery plan.",
+            "tasks": [
+                {
+                    "task_id": "APP-A-FRONTEND-DISCOVERY",
+                    "capability": "frontend",
+                    "assigned_role": "objectives.app-a.frontend-worker",
+                    "execution_mode": "read_only",
+                    "parallel_policy": "allow",
+                    "owned_paths": [],
+                    "writes_existing_paths": [],
+                    "shared_asset_ids": [],
+                    "handoff_dependencies": [],
+                    "objective": "Use a missing planning packet dependency.",
+                    "inputs": ["Planning Inputs.canonical_contracts.api_contract"],
+                    "expected_outputs": [
+                        {
+                            "kind": "assertion",
+                            "output_id": "frontend_discovery_done",
+                            "path": None,
+                            "description": "Discovery is complete.",
+                            "evidence": {"validation_ids": [], "artifact_paths": []},
+                        }
+                    ],
+                    "done_when": ["done"],
+                    "depends_on": [],
+                    "validation": [],
+                    "collaboration_rules": [],
+                    "working_directory": None,
+                    "sandbox_mode": "read-only",
+                    "additional_directories": [],
+                }
+            ],
+            "bundle_plan": [
+                {
+                    "bundle_id": "frontend-discovery-bundle",
+                    "task_ids": ["APP-A-FRONTEND-DISCOVERY"],
+                    "summary": "Frontend discovery bundle.",
+                }
+            ],
+            "dependency_notes": [],
+            "collaboration_handoffs": [],
+        }
+
+        with self.assertRaisesRegex(
+            ExecutorError,
+            "Capability plan task APP-A-FRONTEND-DISCOVERY referenced unavailable planning inputs",
+        ):
+            validate_capability_plan_planning_input_addressability(
+                self.project_root,
+                "capability-missing-packet-ref",
+                "app-a",
+                "frontend",
+                objective_outline,
+                capability_plan,
+            )
 
     def test_aggregate_capability_plans_attach_inbound_handoff_dependencies_from_required_inputs(self) -> None:
         scaffold_planning_run(self.project_root, "inbound-handoff-deps", ["backend", "middleware"])
@@ -3936,36 +5253,11 @@ url = "https://example.com/mcp"
         final_payload = {
             "summary": "Finished the smoke task.",
             "status": "ready_for_bundle_review",
-            "produced_outputs": [
-                {
-                    "kind": "assertion",
-                    "output_id": "smoke.context-echo",
-                    "path": None,
-                    "asset_id": None,
-                    "description": "Smoke task echoed the assigned role, objective id, phase, and prompt layers.",
-                    "evidence": {
-                        "validation_ids": ["context-echo"],
-                        "artifact_paths": [],
-                    },
-                }
-            ],
+            "produced_output_ids": ["smoke.context-echo"],
             "artifacts": [{"path": "runs/exec/prompt-logs/APP-A-SMOKE-001.prompt.md", "status": "referenced"}],
             "validation_results": [{"id": "context-echo", "status": "passed", "evidence": "returned expected context"}],
             "open_issues": [],
             "change_requests": [],
-            "context_echo": {
-                "role_id": "objectives.app-a.frontend-worker",
-                "objective_id": "app-a",
-                "phase": "discovery",
-                "prompt_layers": [
-                    "orchestrator/roles/base/company.md",
-                    "orchestrator/roles/base/worker.md",
-                    "orchestrator/roles/capabilities/frontend.md",
-                    "orchestrator/roles/objectives/app-a/approved/frontend-worker.md",
-                    "orchestrator/phase-overlays/discovery/task-execution.md",
-                ],
-                "schema": "task-assignment.v1",
-            },
             "collaboration_request": None,
         }
         stdout = "\n".join(
@@ -3993,20 +5285,7 @@ url = "https://example.com/mcp"
             "validation_results": [{"id": "context-echo", "status": "passed", "evidence": "returned expected context"}],
             "open_issues": [],
             "change_requests": [],
-            "produced_outputs": [
-                {
-                    "kind": "assertion",
-                    "output_id": "smoke.context-echo",
-                    "path": None,
-                    "asset_id": None,
-                    "description": "Smoke task echoed the assigned role, objective id, phase, and prompt layers.",
-                    "evidence": {
-                        "validation_ids": [],
-                        "artifact_paths": [],
-                    },
-                }
-            ],
-            "context_echo": None,
+            "produced_output_ids": ["smoke.context-echo"],
             "collaboration_request": None,
         }
         stdout = "\n".join(
@@ -4042,6 +5321,54 @@ url = "https://example.com/mcp"
         self.assertEqual(run_observability["total_calls"], 1)
         self.assertEqual(run_observability["completed_calls"], 1)
         self.assertEqual(run_observability["calls_by_kind"]["task_execution"], 1)
+
+    def test_execute_task_records_discarded_path_warning_for_isolated_write_commits(self) -> None:
+        init_git_repo(self.project_root)
+        scaffold_smoke_test(self.project_root, "exec-discard-warning")
+        task_path = self.project_root / "runs" / "exec-discard-warning" / "tasks" / "APP-A-SMOKE-001.json"
+        task = read_json(task_path)
+        task["execution_mode"] = "isolated_write"
+        write_json(task_path, task)
+        final_payload = {
+            "summary": "Finished the smoke task.",
+            "status": "ready_for_bundle_review",
+            "artifacts": [],
+            "validation_results": [{"id": "context-echo", "status": "passed", "evidence": "returned expected context"}],
+            "open_issues": [],
+            "change_requests": [],
+            "produced_outputs": [
+                {
+                    "kind": "assertion",
+                    "output_id": "smoke.context-echo",
+                    "path": None,
+                    "asset_id": None,
+                    "description": "Smoke task echoed the assigned role, objective id, phase, and prompt layers.",
+                    "evidence": {
+                        "validation_ids": [],
+                        "artifact_paths": [],
+                    },
+                }
+            ],
+            "context_echo": None,
+            "collaboration_request": None,
+        }
+        stdout = "\n".join(
+            [
+                '{"type":"thread.started","thread_id":"thread-discard"}',
+                '{"type":"turn.started"}',
+                json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(final_payload)}),
+                '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
+            ]
+        )
+        completed = completed_process(stdout=stdout, stderr="", returncode=0)
+        with patch("company_orchestrator.executor.run_codex_command", return_value=completed), patch(
+            "company_orchestrator.executor.commit_isolated_workspace",
+            return_value={"commit_sha": "abc123", "discarded_paths": [".codex-tmp/cache.bin"]},
+        ) as commit_mock:
+            summary = execute_task(self.project_root, "exec-discard-warning", "APP-A-SMOKE-001")
+
+        self.assertEqual(summary["status"], "ready_for_bundle_review")
+        commit_mock.assert_called_once()
 
     def test_execute_task_streams_live_activity_updates_and_events(self) -> None:
         scaffold_smoke_test(self.project_root, "exec-live")
@@ -4193,6 +5520,29 @@ url = "https://example.com/mcp"
         self.assertEqual(len(report["change_requests"]), 1)
         self.assertEqual(report["change_requests"][0]["approval"], {"mode": "auto", "status": "approved"})
 
+    def test_extract_turn_failure_ignores_transient_error_before_turn_completion(self) -> None:
+        events = [
+            {"type": "thread.started", "thread_id": "thread-1"},
+            {"type": "turn.started"},
+            {"type": "error", "message": "Reconnecting... 1/5 (stream disconnected before completion)"},
+            {
+                "type": "item.completed",
+                "item": {"id": "item_0", "type": "agent_message", "text": "{\"ok\":true}"},
+            },
+            {"type": "turn.completed", "usage": {"input_tokens": 1, "cached_input_tokens": 0, "output_tokens": 1}},
+        ]
+
+        self.assertIsNone(extract_turn_failure(events))
+
+    def test_extract_turn_failure_still_reports_error_without_completion(self) -> None:
+        events = [
+            {"type": "thread.started", "thread_id": "thread-1"},
+            {"type": "turn.started"},
+            {"type": "error", "message": "Reconnecting... 1/5 (stream disconnected before completion)"},
+        ]
+
+        self.assertIn("Reconnecting...", extract_turn_failure(events) or "")
+
     def test_materialize_executor_response_converts_local_contract_change_request_to_collaboration_request(self) -> None:
         scaffold_planning_run(self.project_root, "local-contract-repair", ["frontend"])
         run_dir = self.project_root / "runs" / "local-contract-repair"
@@ -4264,6 +5614,92 @@ url = "https://example.com/mcp"
         report, collaboration_ids, change_request_ids = materialize_executor_response(
             self.project_root,
             "local-contract-repair",
+            task,
+            parsed_response,
+            runtime_warnings=[],
+            runtime_recovery=None,
+            runtime_observability=None,
+        )
+
+        self.assertEqual(change_request_ids, [])
+        self.assertEqual(report["change_requests"], [])
+        self.assertEqual(len(collaboration_ids), 1)
+        collaboration = read_json(
+            run_dir / "collaboration" / f"{collaboration_ids[0]}.json"
+        )
+        self.assertEqual(collaboration["to_role"], "objectives.app-a.frontend-manager")
+        self.assertEqual(collaboration["type"], "contract_resolution")
+
+    def test_materialize_executor_response_converts_local_ownership_boundary_request_to_collaboration_request(self) -> None:
+        scaffold_planning_run(self.project_root, "local-ownership-repair", ["frontend"])
+        run_dir = self.project_root / "runs" / "local-ownership-repair"
+        task = {
+            "schema": "task-assignment.v1",
+            "run_id": "local-ownership-repair",
+            "phase": "polish",
+            "objective_id": "app-a",
+            "capability": "frontend",
+            "task_id": "APP-A-FRONTEND-LOCAL-OWN-001",
+            "assigned_role": "objectives.app-a.frontend-worker",
+            "manager_role": "objectives.app-a.frontend-manager",
+            "acceptance_role": "objectives.app-a.acceptance-manager",
+            "objective": "Repair a local polish bug.",
+            "inputs": [],
+            "expected_outputs": [
+                {
+                    "kind": "artifact",
+                    "output_id": "frontend_todo_app",
+                    "path": "apps/todo/frontend/src/todos/TodoApp.jsx",
+                    "asset_id": None,
+                    "description": None,
+                    "evidence": None,
+                }
+            ],
+            "done_when": [],
+            "depends_on": [],
+            "validation": [],
+            "collaboration_rules": [],
+            "writes_existing_paths": ["apps/todo/frontend/src/todos/TodoApp.jsx"],
+        }
+        parsed_response = {
+            "summary": "Blocked by a local ownership mismatch.",
+            "status": "blocked",
+            "artifacts": [],
+            "validation_results": [],
+            "open_issues": ["Blocking: the real bug is in app.js, which is outside the current write scope."],
+            "change_requests": [
+                {
+                    "change_category": "ownership_boundary",
+                    "summary": "Expand the local frontend repair scope to include the runtime TodoApp module.",
+                    "blocking_reason": "The bug is implemented in `apps/todo/frontend/src/todos/app.js`, outside the approved write set.",
+                    "why_local_resolution_is_invalid": "Fixing only `TodoApp.jsx` would remain import-order dependent.",
+                    "blocking": True,
+                    "goal_critical": True,
+                    "affected_output_ids": ["frontend_todo_app"],
+                    "affected_handoff_ids": ["frontend-review-handoff"],
+                    "impacted_objective_ids": [],
+                    "impacted_task_ids": [],
+                    "conflicting_input_refs": [],
+                    "required_reentry_phase": "polish",
+                    "impact": {
+                        "goal_changed": False,
+                        "scope_changed": True,
+                        "boundary_changed": True,
+                        "interface_changed": False,
+                        "architecture_changed": False,
+                        "team_changed": False,
+                        "implementation_changed": True,
+                    },
+                }
+            ],
+            "produced_outputs": [],
+            "context_echo": None,
+            "collaboration_request": None,
+        }
+
+        report, collaboration_ids, change_request_ids = materialize_executor_response(
+            self.project_root,
+            "local-ownership-repair",
             task,
             parsed_response,
             runtime_warnings=[],
@@ -4371,6 +5807,460 @@ url = "https://example.com/mcp"
         events = read_json_lines(self.project_root / "runs" / "timeout-retry-exec" / "live" / "events.jsonl")
         self.assertIn("task.timeout_retry_scheduled", {event["event_type"] for event in events})
 
+    def test_execute_task_retries_missing_final_agent_message_once(self) -> None:
+        scaffold_smoke_test(self.project_root, "missing-final-message-exec")
+        final_payload = {
+            "summary": "Recovered after missing final message retry.",
+            "status": "ready_for_bundle_review",
+            "artifacts": [],
+            "validation_results": [{"id": "context-echo", "status": "passed", "evidence": "returned expected context"}],
+            "open_issues": [],
+            "change_requests": [],
+            "produced_outputs": [
+                {
+                    "kind": "assertion",
+                    "output_id": "smoke.context-echo",
+                    "path": None,
+                    "asset_id": None,
+                    "description": "Smoke task echoed the assigned role, objective id, phase, and prompt layers.",
+                    "evidence": {
+                        "validation_ids": [],
+                        "artifact_paths": [],
+                    },
+                }
+            ],
+            "context_echo": None,
+            "collaboration_request": None,
+        }
+        missing_final_message = completed_process(
+            stdout="\n".join(
+                [
+                    '{"type":"thread.started","thread_id":"thread-missing-final"}',
+                    '{"type":"turn.started"}',
+                    '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
+                ]
+            ),
+            stderr="",
+            returncode=0,
+        )
+        completed = completed_process(
+            stdout="\n".join(
+                [
+                    '{"type":"thread.started","thread_id":"thread-missing-final-retry"}',
+                    '{"type":"turn.started"}',
+                    json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(final_payload)}),
+                    '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
+                ]
+            ),
+            stderr="",
+            returncode=0,
+        )
+        with patch("company_orchestrator.executor.run_codex_command", side_effect=[missing_final_message, completed]):
+            summary = execute_task(self.project_root, "missing-final-message-exec", "APP-A-SMOKE-001")
+
+        self.assertEqual(summary["status"], "ready_for_bundle_review")
+        activity = read_activity(self.project_root, "missing-final-message-exec", "APP-A-SMOKE-001")
+        self.assertEqual(activity["status"], "recovered")
+        self.assertEqual(activity["recovery_action"], "missing_final_message_retry")
+        events = read_json_lines(self.project_root / "runs" / "missing-final-message-exec" / "live" / "events.jsonl")
+        self.assertIn("task.retry_scheduled", {event["event_type"] for event in events})
+
+    def test_infer_attempt_run_state_repair_context_from_validation_attempt(self) -> None:
+        task = {
+            "task_id": "frontend-list-integration-and-tests",
+            "objective_id": "app-a",
+            "owned_paths": ["apps/todo/frontend/test/todos-crud.test.js"],
+            "writes_existing_paths": ["apps/todo/frontend/src/todos/TodoApp.jsx"],
+            "expected_outputs": [{"output_id": "crud-tests", "path": "apps/todo/frontend/test/todos-crud.test.js"}],
+            "validation": [
+                {"id": "validate_todo_frontend_flows", "command": "npm run validate:todo-frontend-flows"},
+                {"id": "validate_todo_frontend_client", "command": "npm run validate:todo-frontend-client"},
+            ],
+        }
+        attempt_events = [
+            {
+                "type": "item.started",
+                "item": {"type": "command_execution", "command": "/bin/zsh -lc 'npm run validate:todo-frontend-flows'"},
+            },
+            {
+                "type": "item.started",
+                "item": {
+                    "type": "command_execution",
+                    "command": "/bin/zsh -lc \"sed -n '1,260p' apps/todo/frontend/src/index.js\"",
+                },
+            },
+        ]
+
+        repair_context = infer_attempt_run_state_repair_context(
+            task,
+            attempt_events,
+            existing_repair_context=None,
+            trigger_reason="timeout_exhausted",
+        )
+
+        self.assertIsNotNone(repair_context)
+        assert repair_context is not None
+        self.assertEqual(repair_context["source"], "run_state_repair")
+        self.assertIn("apps/todo/frontend/src/index.js", repair_context["focus_paths"])
+        self.assertIn("apps/todo/frontend/test/todos-crud.test.js", repair_context["focus_paths"])
+
+    def test_infer_attempt_run_state_repair_context_detects_validation_commands_without_declared_validations(self) -> None:
+        task = {
+            "task_id": "frontend_mvp_ui",
+            "objective_id": "app-a",
+            "owned_paths": [
+                "apps/todo/frontend/src/index.js",
+                "apps/todo/frontend/src/todos/TodoApp.js",
+            ],
+            "writes_existing_paths": ["apps/todo/frontend/src/index.js"],
+            "expected_outputs": [
+                {"output_id": "frontend_entrypoint", "path": "apps/todo/frontend/src/index.js"},
+                {"output_id": "todo_app_shell", "path": "apps/todo/frontend/src/todos/TodoApp.js"},
+            ],
+            "validation": [],
+        }
+        attempt_events = [
+            {
+                "type": "item.started",
+                "item": {"type": "command_execution", "command": "/bin/zsh -lc 'npm run validate:todo-frontend-client'"},
+            },
+            {
+                "type": "item.started",
+                "item": {
+                    "type": "command_execution",
+                    "command": "/bin/zsh -lc \"sed -n '1,320p' apps/todo/backend/src/server.js\"",
+                },
+            },
+        ]
+
+        repair_context = infer_attempt_run_state_repair_context(
+            task,
+            attempt_events,
+            existing_repair_context=None,
+            trigger_reason="stall_after_turn_started",
+        )
+
+        self.assertIsNotNone(repair_context)
+        assert repair_context is not None
+        self.assertEqual(repair_context["source"], "run_state_repair")
+        self.assertIn("apps/todo/backend/src/server.js", repair_context["focus_paths"])
+        self.assertIn("apps/todo/frontend/src/index.js", repair_context["focus_paths"])
+
+    def test_infer_attempt_run_state_repair_context_detects_stalled_run_report_exploration_before_validation(self) -> None:
+        task = {
+            "task_id": "frontend_todo_shell_and_client",
+            "objective_id": "app-a",
+            "owned_paths": [
+                "apps/todo/frontend/src/index.js",
+                "apps/todo/frontend/src/todos/TodoApp.jsx",
+                "apps/todo/frontend/src/todos/todosApi.js",
+            ],
+            "writes_existing_paths": ["apps/todo/frontend/src/index.js"],
+            "expected_outputs": [
+                {"output_id": "frontend_entry_point", "path": "apps/todo/frontend/src/index.js"},
+                {"output_id": "todo_app_shell", "path": "apps/todo/frontend/src/todos/TodoApp.jsx"},
+                {"output_id": "todo_api_client", "path": "apps/todo/frontend/src/todos/todosApi.js"},
+            ],
+            "validation": [
+                {"id": "validate_frontend_client", "command": "npm run validate:todo-frontend-client"},
+                {"id": "validate_frontend_client_errors", "command": "npm run validate:todo-frontend-client-errors"},
+            ],
+        }
+        attempt_events = [
+            {
+                "type": "item.started",
+                "item": {
+                    "type": "command_execution",
+                    "command": "/bin/zsh -lc \"sed -n '1,260p' runs/auto-todo-mvp-102-full/reports/frontend_todo_components.json\"",
+                },
+            },
+            {
+                "type": "item.started",
+                "item": {
+                    "type": "command_execution",
+                    "command": "/bin/zsh -lc \"sed -n '1,260p' apps/todo/frontend/src/todos/TodoForm.jsx\"",
+                },
+            },
+            {
+                "type": "item.started",
+                "item": {
+                    "type": "command_execution",
+                    "command": "/bin/zsh -lc \"sed -n '1,320p' apps/todo/frontend/src/todos/TodoList.jsx\"",
+                },
+            },
+        ]
+
+        repair_context = infer_attempt_run_state_repair_context(
+            task,
+            attempt_events,
+            existing_repair_context=None,
+            trigger_reason="stall_after_turn_started",
+        )
+
+        self.assertIsNotNone(repair_context)
+        assert repair_context is not None
+        self.assertEqual(repair_context["source"], "run_state_repair")
+        self.assertIn("apps/todo/frontend/src/todos/TodoForm.jsx", repair_context["focus_paths"])
+        self.assertIn("apps/todo/frontend/src/todos/TodoList.jsx", repair_context["focus_paths"])
+        self.assertIn("apps/todo/frontend/src/index.js", repair_context["focus_paths"])
+
+    def test_execute_task_retries_stalled_codex_once(self) -> None:
+        scaffold_smoke_test(self.project_root, "stalled-exec")
+        final_payload = {
+            "summary": "Recovered after stalled task retry.",
+            "status": "ready_for_bundle_review",
+            "artifacts": [],
+            "validation_results": [{"id": "context-echo", "status": "passed", "evidence": "returned expected context"}],
+            "open_issues": [],
+            "change_requests": [],
+            "produced_outputs": [
+                {
+                    "kind": "assertion",
+                    "output_id": "smoke.context-echo",
+                    "path": None,
+                    "asset_id": None,
+                    "description": "Smoke task echoed the assigned role, objective id, phase, and prompt layers.",
+                    "evidence": {
+                        "validation_ids": [],
+                        "artifact_paths": [],
+                    },
+                }
+            ],
+            "context_echo": None,
+            "collaboration_request": None,
+        }
+        stalled_process = CodexProcessStall(
+            cmd=["codex", "exec"],
+            stall_seconds=90,
+            reason="stall_after_turn_started",
+            output='{"type":"thread.started","thread_id":"thread-stalled"}\n{"type":"turn.started"}\n',
+            stderr="",
+        )
+        completed = completed_process(
+            stdout="\n".join(
+                [
+                    '{"type":"thread.started","thread_id":"thread-stalled-retry"}',
+                    '{"type":"turn.started"}',
+                    json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(final_payload)}),
+                    '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
+                ]
+            ),
+            stderr="",
+            returncode=0,
+        )
+        with patch("company_orchestrator.executor.run_codex_command", side_effect=[stalled_process, completed]):
+            summary = execute_task(self.project_root, "stalled-exec", "APP-A-SMOKE-001")
+
+        self.assertEqual(summary["status"], "ready_for_bundle_review")
+        activity = read_activity(self.project_root, "stalled-exec", "APP-A-SMOKE-001")
+        self.assertEqual(activity["status"], "recovered")
+        self.assertEqual(activity["recovery_action"], "stall_retry")
+        report = read_json(self.project_root / "runs" / "stalled-exec" / "reports" / "APP-A-SMOKE-001.json")
+        self.assertEqual(report["runtime_recovery"]["recovery_action"], "stall_retry")
+        events = read_json_lines(self.project_root / "runs" / "stalled-exec" / "live" / "events.jsonl")
+        event_types = {event["event_type"] for event in events}
+        self.assertIn("task.stall_detected", event_types)
+        self.assertIn("task.retry_scheduled", event_types)
+
+    def test_execute_task_timeout_retry_promotes_to_run_state_repair(self) -> None:
+        scaffold_planning_run(self.project_root, "timeout-run-state-repair", ["frontend"])
+        run_dir = self.project_root / "runs" / "timeout-run-state-repair"
+        phase_plan = read_json(run_dir / "phase-plan.json")
+        phase_plan["current_phase"] = "mvp-build"
+        for item in phase_plan["phases"]:
+            if item["phase"] == "mvp-build":
+                item["status"] = "active"
+            elif item["phase"] in {"discovery", "design"}:
+                item["status"] = "complete"
+                item["human_approved"] = True
+        write_json(run_dir / "phase-plan.json", phase_plan)
+        task_id = "frontend-list-integration-and-tests"
+        task = {
+            "schema": "task-assignment.v1",
+            "run_id": "timeout-run-state-repair",
+            "phase": "mvp-build",
+            "objective_id": "app-a",
+            "capability": "frontend",
+            "task_id": task_id,
+            "assigned_role": "objectives.app-a.frontend-worker",
+            "manager_role": "objectives.app-a.objective-manager",
+            "acceptance_role": "objectives.app-a.acceptance-manager",
+            "objective": "Integrate todo list UI and verify CRUD coverage.",
+            "inputs": [],
+            "expected_outputs": [
+                {
+                    "kind": "artifact",
+                    "output_id": "crud-tests",
+                    "path": "apps/todo/frontend/test/todos-crud.test.js",
+                    "asset_id": None,
+                    "description": None,
+                    "evidence": None,
+                }
+            ],
+            "done_when": ["frontend validations pass"],
+            "depends_on": [],
+            "execution_mode": "isolated_write",
+            "parallel_policy": "serialize",
+            "owned_paths": ["apps/todo/frontend/test/todos-crud.test.js"],
+            "writes_existing_paths": ["apps/todo/frontend/src/todos/TodoApp.jsx"],
+            "shared_asset_ids": [],
+            "validation": [{"id": "validate_todo_frontend_flows", "command": "npm run validate:todo-frontend-flows"}],
+            "collaboration_rules": [],
+            "working_directory": None,
+            "additional_directories": [],
+            "sandbox_mode": "workspace-write",
+        }
+        write_json(run_dir / "tasks" / f"{task_id}.json", task)
+        task_root = self.project_root / ".orchestrator-worktrees" / "timeout-run-state-repair" / "tasks" / task_id
+        integration_root = self.project_root / ".orchestrator-worktrees" / "timeout-run-state-repair" / "integration"
+        write_text(self.project_root / "apps" / "todo" / "frontend" / "src" / "index.js", "export const createTodoApiClient = () => 'repo';\n")
+        write_text(self.project_root / "apps" / "todo" / "frontend" / "src" / "todos" / "TodoApp.jsx", "export function TodoApp() { return null; }\n")
+        write_text(task_root / "apps" / "todo" / "frontend" / "src" / "index.js", "export const createTodosApi = () => 'stale';\n")
+        write_text(integration_root / "apps" / "todo" / "frontend" / "src" / "index.js", "export const createTodosApi = () => 'stale';\n")
+        write_text(task_root / "apps" / "todo" / "frontend" / "src" / "todos" / "TodoApp.jsx", "export function TodoApp() { return null; }\n")
+        write_text(task_root / "apps" / "todo" / "frontend" / "test" / "todos-crud.test.js", "console.log('crud');\n")
+
+        timeout_output = "\n".join(
+            [
+                '{"type":"thread.started","thread_id":"thread-timeout-repair"}',
+                '{"type":"turn.started"}',
+                json.dumps(
+                    {
+                        "type": "item.started",
+                        "item": {
+                            "id": "item_0",
+                            "type": "command_execution",
+                            "command": "/bin/zsh -lc 'npm run validate:todo-frontend-flows'",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "item.started",
+                        "item": {
+                            "id": "item_1",
+                            "type": "command_execution",
+                            "command": "/bin/zsh -lc \"sed -n '1,260p' apps/todo/frontend/src/index.js\"",
+                        },
+                    }
+                ),
+            ]
+        )
+        timeout_error = subprocess.TimeoutExpired(
+            cmd=["codex", "exec"],
+            timeout=300,
+            output=timeout_output.encode("utf-8"),
+            stderr=b"still running\n",
+        )
+        final_payload = {
+            "summary": "Recovered after run-state repair.",
+            "status": "ready_for_bundle_review",
+            "artifacts": [{"path": "apps/todo/frontend/test/todos-crud.test.js", "status": "created"}],
+            "validation_results": [{"id": "validate_todo_frontend_flows", "status": "passed", "evidence": "ok"}],
+            "open_issues": [],
+            "change_requests": [],
+            "produced_outputs": [
+                {
+                    "kind": "artifact",
+                    "output_id": "crud-tests",
+                    "path": "apps/todo/frontend/test/todos-crud.test.js",
+                    "asset_id": None,
+                    "description": None,
+                    "evidence": None,
+                }
+            ],
+            "collaboration_request": None,
+        }
+        completed = completed_process(
+            stdout="\n".join(
+                [
+                    '{"type":"thread.started","thread_id":"thread-timeout-repair-2"}',
+                    '{"type":"turn.started"}',
+                    json_line_event("item.completed", {"id": "item_9", "type": "agent_message", "text": json.dumps(final_payload)}),
+                    '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
+                ]
+            ),
+            stderr="",
+            returncode=0,
+        )
+
+        with (
+            patch(
+                "company_orchestrator.executor.prepare_task_runtime",
+                return_value=TaskExecutionRuntime(
+                    workspace_path=str(task_root),
+                    branch_name="codex/test-timeout-run-state-repair",
+                ),
+            ),
+            patch("company_orchestrator.executor.commit_task_workspace", return_value={"committed": False, "commit_sha": None, "discarded_paths": []}),
+            patch("company_orchestrator.executor.run_codex_command", side_effect=[timeout_error, completed]),
+        ):
+            summary = execute_task(self.project_root, "timeout-run-state-repair", task_id, timeout_seconds=None)
+
+        self.assertEqual(summary["status"], "ready_for_bundle_review")
+        repaired_task = read_json(run_dir / "tasks" / f"{task_id}.json")
+        self.assertIn("apps/todo/frontend/src/index.js", repaired_task["writes_existing_paths"])
+        self.assertEqual(
+            read_text(task_root / "apps" / "todo" / "frontend" / "src" / "index.js"),
+            "export const createTodoApiClient = () => 'repo';\n",
+        )
+        self.assertEqual(
+            read_text(integration_root / "apps" / "todo" / "frontend" / "src" / "index.js"),
+            "export const createTodoApiClient = () => 'repo';\n",
+        )
+        events = read_json_lines(run_dir / "live" / "events.jsonl")
+        self.assertIn("task.run_state_repair_applied", {event["event_type"] for event in events})
+
+    def test_execute_task_uses_last_message_file_when_stdout_missing_final_agent_message(self) -> None:
+        scaffold_smoke_test(self.project_root, "missing-final-message-file-fallback")
+        final_payload = {
+            "summary": "Recovered using last-message file fallback.",
+            "status": "ready_for_bundle_review",
+            "artifacts": [],
+            "validation_results": [{"id": "context-echo", "status": "passed", "evidence": "returned expected context"}],
+            "open_issues": [],
+            "change_requests": [],
+            "produced_outputs": [
+                {
+                    "kind": "assertion",
+                    "output_id": "smoke.context-echo",
+                    "path": None,
+                    "asset_id": None,
+                    "description": "Smoke task echoed the assigned role, objective id, phase, and prompt layers.",
+                    "evidence": {
+                        "validation_ids": [],
+                        "artifact_paths": [],
+                    },
+                }
+            ],
+            "context_echo": None,
+            "collaboration_request": None,
+        }
+
+        def side_effect(command: list[str], **_: object):
+            output_index = command.index("-o") + 1
+            Path(command[output_index]).write_text(json.dumps(final_payload), encoding="utf-8")
+            return completed_process(
+                stdout="\n".join(
+                    [
+                        '{"type":"thread.started","thread_id":"thread-last-message-file"}',
+                        '{"type":"turn.started"}',
+                        '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
+                    ]
+                ),
+                stderr="",
+                returncode=0,
+            )
+
+        with patch("company_orchestrator.executor.run_codex_command", side_effect=side_effect):
+            summary = execute_task(self.project_root, "missing-final-message-file-fallback", "APP-A-SMOKE-001")
+
+        self.assertEqual(summary["status"], "ready_for_bundle_review")
+        report = read_json(
+            self.project_root / "runs" / "missing-final-message-file-fallback" / "reports" / "APP-A-SMOKE-001.json"
+        )
+        self.assertEqual(report["summary"], "Recovered using last-message file fallback.")
+
     def test_run_phase_executes_all_tasks_and_generates_phase_report(self) -> None:
         scaffold_smoke_test(self.project_root, "managed")
 
@@ -4472,200 +6362,180 @@ url = "https://example.com/mcp"
             [{"objective_id": "app-a", "status": "accepted", "accepted_bundles": []}],
         )
 
-    def test_generate_polish_phase_report_requires_integrated_release_validation(self) -> None:
-        scaffold_planning_run(self.project_root, "polish-release-pass", ["middleware"])
-        run_dir = self.project_root / "runs" / "polish-release-pass"
+    def test_generate_polish_phase_report_advances_when_checklist_items_pass(self) -> None:
+        run_dir = initialize_run(self.project_root, "polish-checklist-pass", "# Goal\n\n## Objectives\n- Middleware")
+        write_json(
+            run_dir / "objective-map.json",
+            {
+                "schema": "objective-map.v1",
+                "run_id": "polish-checklist-pass",
+                "objectives": [
+                    {
+                        "objective_id": "app-a",
+                        "title": "Middleware",
+                        "summary": "Middleware",
+                        "status": "approved",
+                        "capabilities": ["middleware"],
+                    }
+                ],
+                "dependencies": [],
+            },
+        )
         phase_plan = read_json(run_dir / "phase-plan.json")
         phase_plan["current_phase"] = "polish"
         for item in phase_plan["phases"]:
-            if item["phase"] == "discovery":
-                item["status"] = "complete"
-            elif item["phase"] == "design":
-                item["status"] = "complete"
-            elif item["phase"] == "mvp-build":
-                item["status"] = "complete"
-            elif item["phase"] == "polish":
-                item["status"] = "active"
+            item["status"] = "complete" if item["phase"] != "polish" else "active"
         write_json(run_dir / "phase-plan.json", phase_plan)
         write_json(
             run_dir / "manager-plans" / "polish-app-a.json",
             {
                 "schema": "objective-plan.v1",
-                "run_id": "polish-release-pass",
+                "run_id": "polish-checklist-pass",
                 "phase": "polish",
                 "objective_id": "app-a",
-                "summary": "Polish plan uses the integrated release gate as the canonical finish check.",
-                "tasks": [
-                    {
-                        "task_id": "APP-A-POLISH-001",
-                        "capability": "middleware",
-                        "assigned_role": "objectives.app-a.middleware-worker",
-                        "objective": "Package final polish evidence.",
-                        "inputs": [],
-                        "expected_outputs": [
-                            {
-                                "kind": "artifact",
-                                "output_id": "app-a-polish-readiness",
-                                "path": "runs/polish-release-pass/reports/app-a-polish-readiness.json",
-                                "asset_id": None,
-                                "description": None,
-                                "evidence": None,
-                            }
-                        ],
-                        "done_when": ["final polish evidence is packaged"],
-                        "execution_mode": "read_only",
-                        "parallel_policy": "serialize",
-                        "writes_existing_paths": [],
-                        "owned_paths": [],
-                        "shared_asset_ids": [],
-                        "depends_on": [],
-                        "validation": [],
-                        "collaboration_rules": [],
-                        "working_directory": None,
-                        "additional_directories": [],
-                        "sandbox_mode": "read-only",
-                    }
-                ],
+                "summary": "Polish plan.",
+                "tasks": [],
                 "bundle_plan": [],
                 "dependency_notes": [],
                 "collaboration_handoffs": [],
             },
         )
-        integration_workspace = self.project_root / ".orchestrator-worktrees" / "polish-release-pass" / "integration"
-        integration_workspace.mkdir(parents=True, exist_ok=True)
         write_json(
-            integration_workspace / "package.json",
+            run_dir / "tasks" / "APP-A-POLISH-001.json",
             {
-                "name": "polish-release-pass",
-                "private": True,
-                "scripts": {
-                    "validate:release-readiness": "node -e \"process.exit(0)\""
-                },
+                "task_id": "APP-A-POLISH-001",
+                "phase": "polish",
+                "objective_id": "app-a",
+                "capability": "middleware",
+                "assigned_role": "objectives.app-a.middleware-worker",
+                "validation": [{"id": "runtime-readiness", "command": "npm run validate:todo-runtime"}],
+                "depends_on": [],
+            },
+        )
+        write_json(
+            run_dir / "reports" / "APP-A-POLISH-001.json",
+            {
+                "status": "ready_for_bundle_review",
+                "summary": "Middleware polish verification passed.",
+                "validation_results": [{"id": "runtime-readiness", "status": "passed", "summary": "Passed."}],
             },
         )
 
-        report, _ = generate_phase_report(self.project_root, "polish-release-pass")
+        with patch(
+            "company_orchestrator.reports.run_polish_phase_release_gate",
+            return_value={
+                "status": "passed",
+                "command": "npm run validate:todo-release-readiness",
+                "working_directory": str(self.project_root),
+                "stdout_path": "runs/polish-checklist-pass/phase-reports/polish-release-validation.stdout.log",
+                "stderr_path": "runs/polish-checklist-pass/phase-reports/polish-release-validation.stderr.log",
+                "summary": "Polish validation checklist passed and the phase-level release gate succeeded.",
+                "item": {
+                    "task_id": "__phase_release_gate__",
+                    "objective_id": None,
+                    "capability": None,
+                    "validation_id": "phase-release-gate",
+                    "command": "npm run validate:todo-release-readiness",
+                    "status": "passed",
+                    "summary": "Phase release gate passed.",
+                },
+                "failure_diagnostics": [],
+            },
+        ) as release_gate_mock:
+            report, _ = generate_phase_report(self.project_root, "polish-checklist-pass")
 
         self.assertEqual(report["recommendation"], "advance")
         self.assertEqual(report["release_validation_summary"]["status"], "passed")
+        self.assertEqual(report["release_validation_summary"]["evaluation_mode"], "task_validation_checklist")
+        self.assertEqual(len(report["release_validation_summary"]["items"]), 2)
+        release_gate_mock.assert_called_once()
         self.assertEqual(
             report["objective_outcomes"],
             [{"objective_id": "app-a", "status": "accepted", "accepted_bundles": []}],
         )
 
-    def test_generate_polish_phase_report_holds_when_integrated_release_validation_fails(self) -> None:
-        scaffold_planning_run(self.project_root, "polish-release-fail", ["middleware"])
-        run_dir = self.project_root / "runs" / "polish-release-fail"
+    def test_generate_polish_phase_report_holds_when_checklist_item_fails(self) -> None:
+        run_dir = initialize_run(self.project_root, "polish-checklist-fail", "# Goal\n\n## Objectives\n- Middleware")
+        write_json(
+            run_dir / "objective-map.json",
+            {
+                "schema": "objective-map.v1",
+                "run_id": "polish-checklist-fail",
+                "objectives": [
+                    {
+                        "objective_id": "app-a",
+                        "title": "Middleware",
+                        "summary": "Middleware",
+                        "status": "approved",
+                        "capabilities": ["middleware"],
+                    }
+                ],
+                "dependencies": [],
+            },
+        )
         phase_plan = read_json(run_dir / "phase-plan.json")
         phase_plan["current_phase"] = "polish"
         for item in phase_plan["phases"]:
-            if item["phase"] == "discovery":
-                item["status"] = "complete"
-            elif item["phase"] == "design":
-                item["status"] = "complete"
-            elif item["phase"] == "mvp-build":
-                item["status"] = "complete"
-            elif item["phase"] == "polish":
-                item["status"] = "active"
+            item["status"] = "complete" if item["phase"] != "polish" else "active"
         write_json(run_dir / "phase-plan.json", phase_plan)
         write_json(
             run_dir / "manager-plans" / "polish-app-a.json",
             {
                 "schema": "objective-plan.v1",
-                "run_id": "polish-release-fail",
+                "run_id": "polish-checklist-fail",
                 "phase": "polish",
                 "objective_id": "app-a",
-                "summary": "Polish plan is still incomplete until integrated validation passes.",
-                "tasks": [
-                    {
-                        "task_id": "APP-A-POLISH-001",
-                        "capability": "middleware",
-                        "assigned_role": "objectives.app-a.middleware-worker",
-                        "objective": "Package final polish evidence.",
-                        "inputs": [],
-                        "expected_outputs": [
-                            {
-                                "kind": "artifact",
-                                "output_id": "app-a-polish-readiness",
-                                "path": "runs/polish-release-fail/reports/app-a-polish-readiness.json",
-                                "asset_id": None,
-                                "description": None,
-                                "evidence": None,
-                            }
-                        ],
-                        "done_when": ["final polish evidence is packaged"],
-                        "execution_mode": "read_only",
-                        "parallel_policy": "serialize",
-                        "writes_existing_paths": [],
-                        "owned_paths": [],
-                        "shared_asset_ids": [],
-                        "depends_on": [],
-                        "validation": [],
-                        "collaboration_rules": [],
-                        "working_directory": None,
-                        "additional_directories": [],
-                        "sandbox_mode": "read-only",
-                    }
-                ],
+                "summary": "Polish plan.",
+                "tasks": [],
                 "bundle_plan": [],
                 "dependency_notes": [],
                 "collaboration_handoffs": [],
             },
         )
-        integration_workspace = self.project_root / ".orchestrator-worktrees" / "polish-release-fail" / "integration"
-        integration_workspace.mkdir(parents=True, exist_ok=True)
         write_json(
-            integration_workspace / "package.json",
+            run_dir / "tasks" / "APP-A-POLISH-001.json",
             {
-                "name": "polish-release-fail",
-                "private": True,
-                "scripts": {
-                    "validate:release-readiness": "node -e \"process.exit(1)\""
-                },
+                "task_id": "APP-A-POLISH-001",
+                "phase": "polish",
+                "objective_id": "app-a",
+                "capability": "middleware",
+                "assigned_role": "objectives.app-a.middleware-worker",
+                "validation": [{"id": "runtime-readiness", "command": "npm run validate:todo-runtime"}],
+                "depends_on": [],
+            },
+        )
+        write_json(
+            run_dir / "reports" / "APP-A-POLISH-001.json",
+            {
+                "status": "blocked",
+                "summary": "Runtime polish verification is blocked.",
+                "validation_results": [{"id": "runtime-readiness", "status": "failed", "summary": "Runtime check failed."}],
             },
         )
 
-        report, _ = generate_phase_report(self.project_root, "polish-release-fail")
+        with patch("company_orchestrator.reports.run_polish_phase_release_gate") as release_gate_mock:
+            report, _ = generate_phase_report(self.project_root, "polish-checklist-fail")
 
         self.assertEqual(report["recommendation"], "hold")
         self.assertEqual(report["release_validation_summary"]["status"], "failed")
         self.assertIn("polish_release_validation", report["unresolved_risks"])
+        release_gate_mock.assert_not_called()
 
-    def test_generate_polish_phase_report_extracts_repairable_failure_diagnostics(self) -> None:
-        run_dir = initialize_run(self.project_root, "polish-release-diagnostics", "# Goal\n\n## Objectives\n- Frontend\n- Backend\n- Middleware")
+    def test_generate_polish_phase_report_extracts_task_owned_failure_diagnostics(self) -> None:
+        run_dir = initialize_run(self.project_root, "polish-checklist-diagnostics", "# Goal\n\n## Objectives\n- Frontend\n- Backend\n- Middleware")
         write_json(
             run_dir / "objective-map.json",
             {
                 "schema": "objective-map.v1",
-                "run_id": "polish-release-diagnostics",
+                "run_id": "polish-checklist-diagnostics",
                 "objectives": [
-                    {
-                        "objective_id": "frontend-obj",
-                        "title": "Frontend",
-                        "summary": "Frontend",
-                        "status": "approved",
-                        "capabilities": ["frontend"],
-                    },
-                    {
-                        "objective_id": "backend-obj",
-                        "title": "Backend",
-                        "summary": "Backend",
-                        "status": "approved",
-                        "capabilities": ["backend"],
-                    },
-                    {
-                        "objective_id": "middleware-obj",
-                        "title": "Middleware",
-                        "summary": "Middleware",
-                        "status": "approved",
-                        "capabilities": ["middleware"],
-                    },
+                    {"objective_id": "frontend-obj", "title": "Frontend", "summary": "Frontend", "status": "approved", "capabilities": ["frontend"]},
+                    {"objective_id": "backend-obj", "title": "Backend", "summary": "Backend", "status": "approved", "capabilities": ["backend"]},
+                    {"objective_id": "middleware-obj", "title": "Middleware", "summary": "Middleware", "status": "approved", "capabilities": ["middleware"]},
                 ],
                 "dependencies": [],
             },
         )
-        suggest_team_proposals(self.project_root, "polish-release-diagnostics")
-        generate_role_files(self.project_root, "polish-release-diagnostics", approve=True)
         phase_plan = read_json(run_dir / "phase-plan.json")
         phase_plan["current_phase"] = "polish"
         for item in phase_plan["phases"]:
@@ -4676,7 +6546,7 @@ url = "https://example.com/mcp"
                 run_dir / "manager-plans" / f"polish-{objective_id}.json",
                 {
                     "schema": "objective-plan.v1",
-                    "run_id": "polish-release-diagnostics",
+                    "run_id": "polish-checklist-diagnostics",
                     "phase": "polish",
                     "objective_id": objective_id,
                     "summary": f"Polish plan for {objective_id}",
@@ -4686,31 +6556,366 @@ url = "https://example.com/mcp"
                     "collaboration_handoffs": [],
                 },
             )
-        integration_workspace = self.project_root / ".orchestrator-worktrees" / "polish-release-diagnostics" / "integration"
-        integration_workspace.mkdir(parents=True, exist_ok=True)
-        failure_script = (
-            "node -e \"console.log('✖ apps/todo/frontend/test/app.editing.test.js'); "
-            "console.log('Error [ERR_MODULE_NOT_FOUND]: Cannot find module \\'/tmp/apps/todo/frontend/src/todos/TodoApp\\' imported from /tmp/apps/todo/frontend/src/index.js'); "
-            "console.log('✖ crud-contract + no-op-update: HTTP contract supports list, create, edit, complete, uncomplete, no-op patch, delete, and stable ordering'); "
-            "console.log('✖ runtime connectivity serves the frontend, wires the backend origin, and supports CRUD through the integrated runtime'); "
-            "console.log('NotFoundError: Not Found at /tmp/apps/todo/runtime/src/frontend-server.js:34:14'); "
-            "process.exit(1)\""
-        )
-        write_json(
-            integration_workspace / "package.json",
-            {
-                "name": "polish-release-diagnostics",
-                "private": True,
-                "scripts": {"validate:release-readiness": failure_script},
-            },
-        )
+        task_specs = [
+            ("FRONTEND-POLISH-001", "frontend-obj", "frontend", "edit-regression", "apps/todo/frontend/src/TodoApp.js import failed"),
+            ("BACKEND-POLISH-001", "backend-obj", "backend", "api-regression", "apps/todo/backend/src/server.js contract drift"),
+            ("MIDDLEWARE-POLISH-001", "middleware-obj", "middleware", "runtime-readiness", "apps/todo/runtime/src/runtime.js startup mismatch"),
+        ]
+        for task_id, objective_id, capability, validation_id, summary in task_specs:
+            write_json(
+                run_dir / "tasks" / f"{task_id}.json",
+                {
+                    "task_id": task_id,
+                    "phase": "polish",
+                    "objective_id": objective_id,
+                    "capability": capability,
+                    "assigned_role": f"objectives.{objective_id}.{capability}-worker",
+                    "validation": [{"id": validation_id, "command": f"node {validation_id}.js"}],
+                    "depends_on": [],
+                },
+            )
+            write_json(
+                run_dir / "reports" / f"{task_id}.json",
+                {
+                    "status": "blocked",
+                    "summary": summary,
+                    "validation_results": [{"id": validation_id, "status": "failed", "summary": summary}],
+                },
+            )
 
-        report, _ = generate_phase_report(self.project_root, "polish-release-diagnostics")
+        report, _ = generate_phase_report(self.project_root, "polish-checklist-diagnostics")
 
         diagnostics = report["release_validation_summary"]["failure_diagnostics"]
         self.assertEqual(report["recommendation"], "hold")
         self.assertEqual({item["owner_capability"] for item in diagnostics}, {"frontend", "backend", "middleware"})
         self.assertTrue(all(item["repairable"] for item in diagnostics))
+        self.assertTrue(all(item.get("task_id") for item in diagnostics))
+
+    def test_collect_polish_validation_steps_excludes_phase_gate_commands_from_capability_tasks(self) -> None:
+        run_dir = initialize_run(self.project_root, "polish-scope-filter", "# Goal\n\n## Objectives\n- Frontend")
+        write_json(
+            run_dir / "tasks" / "FRONTEND-MVP-001.json",
+            {
+                "schema": "task-assignment.v1",
+                "run_id": "polish-scope-filter",
+                "phase": "mvp-build",
+                "objective_id": "frontend-obj",
+                "capability": "frontend",
+                "task_id": "FRONTEND-MVP-001",
+                "assigned_role": "objectives.frontend-obj.frontend-worker",
+                "validation": [
+                    {
+                        "id": "frontend-direct",
+                        "command": "node --no-warnings --test apps/todo/frontend/test/app.editing.test.js",
+                    },
+                    {
+                        "id": "frontend-broad",
+                        "command": "npm test -- --runTestsByPath apps/todo/frontend/test/todos/TodoApp.test.js",
+                    },
+                    {
+                        "id": "phase-gate",
+                        "command": "npm run validate:todo-release-readiness",
+                    },
+                ],
+            },
+        )
+
+        steps = collect_polish_validation_steps(
+            self.project_root,
+            run_dir,
+            run_id="polish-scope-filter",
+            objective_id="frontend-obj",
+            capability="frontend",
+            phase="polish",
+        )
+
+        commands = [item["command"] for item in steps]
+        self.assertIn("node --no-warnings --test apps/todo/frontend/test/app.editing.test.js", commands)
+        self.assertNotIn("npm test -- --runTestsByPath apps/todo/frontend/test/todos/TodoApp.test.js", commands)
+        self.assertNotIn("npm run validate:todo-release-readiness", commands)
+
+    def test_evaluate_polish_release_validation_appends_phase_gate_after_task_checks_pass(self) -> None:
+        run_dir = initialize_run(self.project_root, "polish-phase-gate-pass", "# Goal\n\n## Objectives\n- Middleware")
+        write_json(
+            run_dir / "objective-map.json",
+            {
+                "schema": "objective-map.v1",
+                "run_id": "polish-phase-gate-pass",
+                "objectives": [
+                    {
+                        "objective_id": "app-a",
+                        "title": "Middleware",
+                        "summary": "Middleware",
+                        "status": "approved",
+                        "capabilities": ["middleware"],
+                    }
+                ],
+                "dependencies": [],
+            },
+        )
+        write_json(
+            run_dir / "tasks" / "APP-A-POLISH-001.json",
+            {
+                "task_id": "APP-A-POLISH-001",
+                "phase": "polish",
+                "objective_id": "app-a",
+                "capability": "middleware",
+                "assigned_role": "objectives.app-a.middleware-worker",
+                "validation": [{"id": "runtime-readiness", "command": "node runtime-check.js"}],
+                "depends_on": [],
+            },
+        )
+        write_json(
+            run_dir / "reports" / "APP-A-POLISH-001.json",
+            {
+                "status": "ready_for_bundle_review",
+                "summary": "Runtime checks passed.",
+                "validation_results": [{"id": "runtime-readiness", "status": "passed", "summary": "Passed."}],
+            },
+        )
+
+        with patch(
+            "company_orchestrator.reports.run_polish_phase_release_gate",
+            return_value={
+                "status": "passed",
+                "command": "npm run validate:todo-release-readiness",
+                "working_directory": str(self.project_root),
+                "stdout_path": "runs/polish-phase-gate-pass/phase-reports/polish-release-validation.stdout.log",
+                "stderr_path": "runs/polish-phase-gate-pass/phase-reports/polish-release-validation.stderr.log",
+                "summary": "Polish validation checklist passed and the phase-level release gate succeeded.",
+                "item": {
+                    "task_id": "__phase_release_gate__",
+                    "objective_id": None,
+                    "capability": None,
+                    "validation_id": "phase-release-gate",
+                    "command": "npm run validate:todo-release-readiness",
+                    "status": "passed",
+                    "summary": "Phase release gate passed.",
+                },
+                "failure_diagnostics": [],
+            },
+        ):
+            summary = evaluate_polish_release_validation(self.project_root, "polish-phase-gate-pass")
+
+        self.assertEqual(summary["status"], "passed")
+        self.assertEqual(summary["command"], "npm run validate:todo-release-readiness")
+        self.assertEqual(summary["items"][-1]["task_id"], "__phase_release_gate__")
+        self.assertEqual(summary["items"][-1]["status"], "passed")
+
+    def test_deterministic_polish_plan_gives_middleware_runtime_repair_surface(self) -> None:
+        run_dir = initialize_run(self.project_root, "polish-runtime-surface", "# Goal\n\n## Objectives\n- Middleware")
+        write_json(
+            run_dir / "objective-map.json",
+            {
+                "schema": "objective-map.v1",
+                "run_id": "polish-runtime-surface",
+                "objectives": [
+                    {
+                        "objective_id": "app-a",
+                        "title": "Middleware",
+                        "summary": "Middleware",
+                        "status": "approved",
+                        "capabilities": ["middleware"],
+                    }
+                ],
+                "dependencies": [],
+            },
+        )
+        apps_root = self.project_root / "apps" / "todo"
+        (apps_root / "runtime" / "src").mkdir(parents=True, exist_ok=True)
+        (apps_root / "runtime" / "scripts").mkdir(parents=True, exist_ok=True)
+        (apps_root / "runtime" / "test").mkdir(parents=True, exist_ok=True)
+        generic_objective_root = self.project_root / "orchestrator" / "roles" / "objectives" / "app-a"
+        if generic_objective_root.exists():
+            shutil.rmtree(generic_objective_root)
+        objective_root = apps_root / "orchestrator" / "roles" / "objectives" / "app-a"
+        objective_root.mkdir(parents=True, exist_ok=True)
+        write_text(objective_root / "charter.md", "# Charter\n")
+        write_text(apps_root / "runtime" / "src" / "runtime.js", "export const runtime = true;\n")
+        write_text(apps_root / "runtime" / "src" / "frontend-server.js", "export const server = true;\n")
+        write_text(apps_root / "runtime" / "scripts" / "start.js", "console.log('start');\n")
+        write_text(apps_root / "runtime" / "test" / "connectivity.test.js", "test('connectivity', () => {});\n")
+        write_text(apps_root / "runtime" / "test" / "e2e-smoke.test.js", "test('e2e', () => {});\n")
+
+        objective = read_json(run_dir / "objective-map.json")["objectives"][0]
+        outline = build_deterministic_polish_outline(
+            self.project_root,
+            run_id="polish-runtime-surface",
+            objective=objective,
+        )
+        plan, _ = build_deterministic_polish_objective_plan(
+            self.project_root,
+            "polish-runtime-surface",
+            objective=objective,
+            outline=outline,
+            sandbox_mode="read-only",
+        )
+
+        implementation_task = next(task for task in plan["tasks"] if task["task_id"].endswith("-polish-implementation"))
+        self.assertIn("apps/todo/runtime/src/runtime.js", implementation_task["owned_paths"])
+        self.assertIn("apps/todo/runtime/src/frontend-server.js", implementation_task["owned_paths"])
+        self.assertIn("apps/todo/runtime/scripts/start.js", implementation_task["owned_paths"])
+
+    def test_polish_validation_diagnostics_target_implementation_task_for_repair(self) -> None:
+        run_dir = initialize_run(self.project_root, "polish-repair-routing", "# Goal\n\n## Objectives\n- Middleware")
+        write_json(
+            run_dir / "objective-map.json",
+            {
+                "schema": "objective-map.v1",
+                "run_id": "polish-repair-routing",
+                "objectives": [
+                    {
+                        "objective_id": "middleware-obj",
+                        "title": "Middleware",
+                        "summary": "Middleware",
+                        "status": "approved",
+                        "capabilities": ["middleware"],
+                    }
+                ],
+                "dependencies": [],
+            },
+        )
+        write_json(
+            run_dir / "tasks" / "middleware-obj-middleware-polish-implementation.json",
+            {
+                "task_id": "middleware-obj-middleware-polish-implementation",
+                "phase": "polish",
+                "objective_id": "middleware-obj",
+                "capability": "middleware",
+                "assigned_role": "objectives.middleware-obj.middleware-worker",
+                "owned_paths": [
+                    "apps/todo/runtime/src/runtime.js",
+                    "apps/todo/orchestrator/roles/objectives/middleware-obj/polish/middleware-implementation-summary.md",
+                ],
+                "writes_existing_paths": ["apps/todo/runtime/src/runtime.js"],
+                "validation": [],
+                "depends_on": [],
+            },
+        )
+        write_json(
+            run_dir / "tasks" / "middleware-obj-middleware-polish-validation.json",
+            {
+                "task_id": "middleware-obj-middleware-polish-validation",
+                "phase": "polish",
+                "objective_id": "middleware-obj",
+                "capability": "middleware",
+                "assigned_role": "objectives.middleware-obj.middleware-worker",
+                "owned_paths": [
+                    "apps/todo/orchestrator/roles/objectives/middleware-obj/polish/middleware-validation-summary.md",
+                ],
+                "writes_existing_paths": [],
+                "validation": [
+                    {
+                        "id": "middleware-workspace-tests",
+                        "command": "node --no-warnings --test apps/todo/runtime/test/connectivity.test.js",
+                    }
+                ],
+                "depends_on": ["middleware-obj-middleware-polish-implementation"],
+            },
+        )
+        write_json(
+            run_dir / "reports" / "middleware-obj-middleware-polish-validation.json",
+            {
+                "status": "blocked",
+                "summary": "apps/todo/runtime/src/runtime.js connectivity failed",
+                "validation_results": [
+                    {
+                        "id": "middleware-workspace-tests",
+                        "status": "failed",
+                        "summary": "apps/todo/runtime/src/runtime.js connectivity failed",
+                    }
+                ],
+            },
+        )
+
+        summary = evaluate_polish_release_validation(self.project_root, "polish-repair-routing")
+
+        diagnostic = summary["failure_diagnostics"][0]
+        self.assertEqual(diagnostic["task_id"], "middleware-obj-middleware-polish-implementation")
+        self.assertEqual(diagnostic["owner_capability"], "middleware")
+        self.assertIn("apps/todo/runtime/src/runtime.js", diagnostic["paths"])
+
+    def test_evaluate_polish_release_validation_marks_running_items_as_running(self) -> None:
+        run_dir = initialize_run(self.project_root, "polish-checklist-running", "# Goal\n\n## Objectives\n- Frontend")
+        write_json(
+            run_dir / "objective-map.json",
+            {
+                "schema": "objective-map.v1",
+                "run_id": "polish-checklist-running",
+                "objectives": [
+                    {"objective_id": "frontend-obj", "title": "Frontend", "summary": "Frontend", "status": "approved", "capabilities": ["frontend"]}
+                ],
+                "dependencies": [],
+            },
+        )
+        write_json(
+            run_dir / "tasks" / "FRONTEND-POLISH-001.json",
+            {
+                "task_id": "FRONTEND-POLISH-001",
+                "phase": "polish",
+                "objective_id": "frontend-obj",
+                "capability": "frontend",
+                "assigned_role": "objectives.frontend-obj.frontend-worker",
+                "validation": [{"id": "edit-regression", "command": "node edit-regression.js"}],
+                "depends_on": [],
+            },
+        )
+        activity_dir = run_dir / "live" / "activities"
+        activity_dir.mkdir(parents=True, exist_ok=True)
+        write_json(
+            activity_dir / "FRONTEND-POLISH-001.json",
+            {
+                "activity_id": "FRONTEND-POLISH-001",
+                "phase": "polish",
+                "status": "running",
+                "current_activity": "Running frontend polish validation.",
+            },
+        )
+
+        summary = evaluate_polish_release_validation(self.project_root, "polish-checklist-running")
+
+        self.assertEqual(summary["status"], "running")
+        self.assertEqual(summary["items"][0]["status"], "running")
+
+    def test_evaluate_polish_release_validation_classifies_environment_blockers(self) -> None:
+        run_dir = initialize_run(self.project_root, "polish-checklist-environment", "# Goal\n\n## Objectives\n- Middleware")
+        write_json(
+            run_dir / "objective-map.json",
+            {
+                "schema": "objective-map.v1",
+                "run_id": "polish-checklist-environment",
+                "objectives": [
+                    {"objective_id": "middleware-obj", "title": "Middleware", "summary": "Middleware", "status": "approved", "capabilities": ["middleware"]}
+                ],
+                "dependencies": [],
+            },
+        )
+        write_json(
+            run_dir / "tasks" / "MIDDLEWARE-POLISH-001.json",
+            {
+                "task_id": "MIDDLEWARE-POLISH-001",
+                "phase": "polish",
+                "objective_id": "middleware-obj",
+                "capability": "middleware",
+                "assigned_role": "objectives.middleware-obj.middleware-worker",
+                "validation": [{"id": "runtime-check", "command": "node runtime-check.js"}],
+                "depends_on": [],
+            },
+        )
+        write_json(
+            run_dir / "reports" / "MIDDLEWARE-POLISH-001.json",
+            {
+                "status": "blocked",
+                "summary": "mktemp: read-only file system",
+                "validation_results": [{"id": "runtime-check", "status": "blocked", "summary": "mktemp: read-only file system"}],
+            },
+        )
+
+        summary = evaluate_polish_release_validation(self.project_root, "polish-checklist-environment")
+
+        self.assertEqual(summary["status"], "failed")
+        self.assertEqual(summary["failure_diagnostics"][0]["category"], "environment_blocker")
+        self.assertFalse(summary["failure_diagnostics"][0]["repairable"])
 
     def test_run_phase_attempts_targeted_polish_release_repair(self) -> None:
         run_dir = initialize_run(self.project_root, "polish-release-repair", "# Goal\n\n## Objectives\n- Frontend\n- Backend")
@@ -4764,7 +6969,7 @@ url = "https://example.com/mcp"
             "schema": "phase-report.v1",
             "run_id": "polish-release-repair",
             "phase": "polish",
-            "summary": "Polish release validation failed.",
+            "summary": "Polish validation checklist failed.",
             "objective_outcomes": [
                 {"objective_id": "frontend-obj", "status": "accepted", "accepted_bundles": []},
                 {"objective_id": "backend-obj", "status": "accepted", "accepted_bundles": []},
@@ -4805,26 +7010,27 @@ url = "https://example.com/mcp"
             "recovery_summary": {"interrupted_activities": 0, "recovered_activities": 0, "abandoned_attempts": 0, "incidents": []},
             "release_validation_summary": {
                 "status": "failed",
-                "command": "npm run validate:release-readiness",
-                "working_directory": "worktrees/integration",
                 "report_path": "runs/polish-release-repair/phase-reports/polish-release-validation.json",
-                "stdout_path": "runs/polish-release-repair/phase-reports/polish-release-validation.stdout.log",
-                "stderr_path": "runs/polish-release-repair/phase-reports/polish-release-validation.stderr.log",
+                "attempt": 1,
+                "evaluation_mode": "task_validation_checklist",
                 "summary": "Frontend and backend polish validations failed.",
+                "items": [],
                 "failure_diagnostics": [
                     {
-                        "category": "module_resolution",
+                        "category": "polish_validation_failure",
                         "owner_capability": "frontend",
                         "owner_objective_id": "frontend-obj",
+                        "task_id": "FRONTEND-POLISH-001",
                         "source_test": "apps/todo/frontend/test/app.editing.test.js",
                         "paths": ["apps/todo/frontend/src/index.js"],
                         "excerpt": "Frontend import failed.",
                         "repairable": True,
                     },
                     {
-                        "category": "backend_contract",
+                        "category": "polish_validation_failure",
                         "owner_capability": "backend",
                         "owner_objective_id": "backend-obj",
+                        "task_id": "BACKEND-POLISH-001",
                         "source_test": "crud-contract + no-op-update",
                         "paths": ["apps/todo/backend/src/server.js"],
                         "excerpt": "Backend contract drifted.",
@@ -4838,12 +7044,12 @@ url = "https://example.com/mcp"
         }
         passed_report = {
             **failed_report,
-            "summary": "Polish release validation passed.",
+            "summary": "Polish validation checklist passed.",
             "unresolved_risks": [],
             "release_validation_summary": {
                 **failed_report["release_validation_summary"],
                 "status": "passed",
-                "summary": "Integrated release-readiness validation passed.",
+                "summary": "Polish validation checklist passed.",
                 "failure_diagnostics": [],
             },
             "recommendation": "advance",
@@ -4851,17 +7057,22 @@ url = "https://example.com/mcp"
         with (
             patch(
                 "company_orchestrator.management.generate_phase_report",
-                side_effect=[
-                    (failed_report, run_dir / "phase-reports" / "polish.json"),
-                    (passed_report, run_dir / "phase-reports" / "polish.json"),
-                ],
+                return_value=(failed_report, run_dir / "phase-reports" / "polish.json"),
+            ),
+            patch(
+                "company_orchestrator.management.attempt_polish_task_repairs",
+                return_value={
+                    "status": "completed",
+                    "objective_ids": ["frontend-obj", "backend-obj"],
+                    "objective_summaries": {},
+                    "post_repair_report_path": "runs/polish-release-repair/phase-reports/polish.json",
+                    "post_repair_report": passed_report,
+                    "repair_mode": "task_first",
+                },
             ),
             patch(
                 "company_orchestrator.management.plan_objective",
-                side_effect=lambda *args, **kwargs: {
-                    "objective_id": args[2],
-                    "recovery_action": "polish_release_repair",
-                },
+                side_effect=AssertionError("Objective replanning should not be needed for task-owned checklist failures."),
             ) as plan_objective_mock,
             patch(
                 "company_orchestrator.management.schedule_tasks",
@@ -4877,14 +7088,239 @@ url = "https://example.com/mcp"
         self.assertEqual(summary["recommendation"], "advance")
         self.assertIn("release_repair", summary)
         self.assertEqual(summary["release_repair"]["status"], "completed")
-        self.assertEqual(plan_objective_mock.call_count, 2)
-        call_contexts = [call.kwargs["repair_context"] for call in plan_objective_mock.call_args_list]
-        self.assertEqual({context["source"] for context in call_contexts}, {"polish_release_validation"})
-        self.assertTrue(all(context["compact_prompt"] for context in call_contexts))
-        self.assertTrue(all(context["rejection_reasons"] for context in call_contexts))
+        self.assertEqual(plan_objective_mock.call_count, 0)
         events = read_json_lines(run_dir / "live" / "events.jsonl")
         self.assertIn("phase.release_repair_requested", {event["event_type"] for event in events})
         self.assertIn("phase.release_repair_completed", {event["event_type"] for event in events})
+
+    def test_run_phase_short_circuits_exhausted_polish_hold(self) -> None:
+        scaffold_smoke_test(self.project_root, "polish-hold-exhausted")
+        run_dir = self.project_root / "runs" / "polish-hold-exhausted"
+        phase_plan = read_json(run_dir / "phase-plan.json")
+        phase_plan["current_phase"] = "polish"
+        for index, item in enumerate(phase_plan["phases"]):
+            if item["phase"] == "polish":
+                item["status"] = "active"
+            elif index < 3:
+                item["status"] = "complete"
+                item["human_approved"] = True
+        write_json(run_dir / "phase-plan.json", phase_plan)
+        write_json(
+            run_dir / "phase-reports" / "polish.json",
+            {
+                "schema": "phase-report.v1",
+                "run_id": "polish-hold-exhausted",
+                "phase": "polish",
+                "summary": "Polish is blocked.",
+                "objective_outcomes": [],
+                "accepted_bundles": [],
+                "unresolved_risks": ["blocked_validation"],
+                "parallelism_summary": {
+                    "total_tasks_considered": 0,
+                    "tasks_run_in_parallel": 0,
+                    "tasks_serialized_by_policy": 0,
+                    "tasks_serialized_by_runtime_conflict": 0,
+                    "incidents": [],
+                },
+                "collaboration_summary": {
+                    "total_handoffs": 0,
+                    "blocking_handoffs": 0,
+                    "satisfied_handoffs": 0,
+                    "pending_handoffs": 0,
+                    "blocked_handoffs": 0,
+                    "handoffs_by_objective": [],
+                    "incidents": [],
+                },
+                "observability_summary": {
+                    "total_calls": 0,
+                    "completed_calls": 0,
+                    "failed_calls": 0,
+                    "timed_out_calls": 0,
+                    "retry_scheduled_calls": 0,
+                    "total_input_tokens": 0,
+                    "total_cached_input_tokens": 0,
+                    "total_output_tokens": 0,
+                    "total_prompt_chars": 0,
+                    "total_prompt_lines": 0,
+                    "average_latency_ms": 0,
+                    "max_latency_ms": 0,
+                    "average_queue_wait_ms": 0,
+                },
+                "recovery_summary": {
+                    "interrupted_activities": 0,
+                    "recovered_activities": 0,
+                    "abandoned_attempts": 0,
+                    "incidents": [],
+                },
+                "release_validation_summary": {
+                    "status": "failed",
+                    "report_path": "runs/polish-hold-exhausted/phase-reports/polish-release-validation.json",
+                    "attempt": 2,
+                    "evaluation_mode": "task_validation_checklist",
+                    "summary": "Polish validation still fails.",
+                    "items": [],
+                    "failure_diagnostics": [],
+                },
+                "proposed_role_changes": [],
+                "recommendation": "hold",
+                "human_approved": False,
+            },
+        )
+        record_event(
+            self.project_root,
+            "polish-hold-exhausted",
+            phase="polish",
+            activity_id=None,
+            event_type="phase.release_repair_exhausted",
+            message="Polish validation checklist still fails and the repair budget is exhausted.",
+        )
+
+        with patch(
+            "company_orchestrator.management.schedule_tasks",
+            side_effect=AssertionError("schedule_tasks should not run for exhausted polish hold."),
+        ):
+            summary = run_phase(self.project_root, "polish-hold-exhausted")
+
+        self.assertEqual(summary["phase"], "polish")
+        self.assertEqual(summary["recommendation"], "hold")
+        self.assertIsNone(summary["recommended_next_command"])
+        self.assertIn("repair budget is exhausted", summary["run_status_reason"])
+
+    def test_refresh_feedback_resolution_requires_passed_validation_evidence(self) -> None:
+        run_dir = initialize_run(self.project_root, "feedback-validation-evidence", "# Goal\n\n## Objectives\n- Frontend")
+        write_json(
+            run_dir / "objective-map.json",
+            {
+                "schema": "objective-map.v1",
+                "run_id": "feedback-validation-evidence",
+                "objectives": [
+                    {
+                        "objective_id": "frontend-obj",
+                        "title": "Frontend",
+                        "summary": "Frontend",
+                        "status": "approved",
+                        "capabilities": ["frontend"],
+                    }
+                ],
+                "dependencies": [],
+            },
+        )
+        feedback = submit_feedback(
+            self.project_root,
+            "feedback-validation-evidence",
+            summary="Editing a todo input is broken.",
+            expected_behavior="Typing should preserve the draft.",
+            observed_behavior="Each keystroke replaces the whole title.",
+            repro_steps=["Open edit mode", "Type more than one character"],
+        )
+        feedback_path = run_dir / "feedback" / f"{feedback['feedback_id']}.json"
+        payload = read_json(feedback_path)
+        payload["status"] = "in_progress"
+        payload["replacement_plan_revision"] = "feedback:design:1"
+        payload["triage"]["required_reentry_phase"] = "design"
+        write_json(feedback_path, payload)
+        write_json(
+            run_dir / "phase-reports" / "design.json",
+            {
+                "schema": "phase-report.v1",
+                "run_id": "feedback-validation-evidence",
+                "phase": "design",
+                "summary": "Design advanced.",
+                "objective_outcomes": [
+                    {"objective_id": "frontend-obj", "status": "accepted", "accepted_bundles": []}
+                ],
+                "accepted_bundles": [],
+                "unresolved_risks": [],
+                "parallelism_summary": {
+                    "total_tasks_considered": 0,
+                    "tasks_run_in_parallel": 0,
+                    "tasks_serialized_by_policy": 0,
+                    "tasks_serialized_by_runtime_conflict": 0,
+                    "incidents": [],
+                },
+                "collaboration_summary": {
+                    "total_handoffs": 0,
+                    "blocking_handoffs": 0,
+                    "satisfied_handoffs": 0,
+                    "pending_handoffs": 0,
+                    "blocked_handoffs": 0,
+                    "handoffs_by_objective": [],
+                    "incidents": [],
+                },
+                "observability_summary": {
+                    "total_calls": 0,
+                    "completed_calls": 0,
+                    "failed_calls": 0,
+                    "timed_out_calls": 0,
+                    "retry_scheduled_calls": 0,
+                    "total_input_tokens": 0,
+                    "total_cached_input_tokens": 0,
+                    "total_output_tokens": 0,
+                    "total_prompt_chars": 0,
+                    "total_prompt_lines": 0,
+                    "average_latency_ms": 0,
+                    "max_latency_ms": 0,
+                    "average_queue_wait_ms": 0,
+                },
+                "recovery_summary": {
+                    "interrupted_activities": 0,
+                    "recovered_activities": 0,
+                    "abandoned_attempts": 0,
+                    "incidents": [],
+                },
+                "release_validation_summary": None,
+                "proposed_role_changes": [],
+                "recommendation": "advance",
+                "human_approved": False,
+            },
+        )
+        write_json(
+            run_dir / "reports" / "frontend-design-package.json",
+            {
+                "schema": "completion-report.v1",
+                "run_id": "feedback-validation-evidence",
+                "phase": "design",
+                "objective_id": "frontend-obj",
+                "task_id": "frontend-design-package",
+                "agent_role": "objectives.frontend-obj.frontend-worker",
+                "status": "ready_for_bundle_review",
+                "summary": "Frontend package updated.",
+                "artifacts": [],
+                "validation_results": [],
+                "legacy_dependency_notes": [],
+                "open_issues": [],
+                "legacy_follow_ups": [],
+            },
+        )
+
+        refresh_feedback_resolution_state(self.project_root, "feedback-validation-evidence")
+        unresolved = read_json(feedback_path)
+        self.assertNotEqual(unresolved["status"], "resolved")
+
+        write_json(
+            run_dir / "reports" / "frontend-design-package.json",
+            {
+                "schema": "completion-report.v1",
+                "run_id": "feedback-validation-evidence",
+                "phase": "design",
+                "objective_id": "frontend-obj",
+                "task_id": "frontend-design-package",
+                "agent_role": "objectives.frontend-obj.frontend-worker",
+                "status": "ready_for_bundle_review",
+                "summary": "Frontend package updated.",
+                "artifacts": [],
+                "validation_results": [
+                    {"id": "frontend-editing-regression", "status": "passed", "evidence": "Regression test passed."}
+                ],
+                "legacy_dependency_notes": [],
+                "open_issues": [],
+                "legacy_follow_ups": [],
+            },
+        )
+
+        refresh_feedback_resolution_state(self.project_root, "feedback-validation-evidence")
+        resolved = read_json(feedback_path)
+        self.assertEqual(resolved["status"], "resolved")
 
     def test_run_phase_accepts_objective_with_no_phase_work(self) -> None:
         scaffold_planning_run(self.project_root, "no-phase-work-run", ["backend"])
@@ -5048,6 +7484,74 @@ url = "https://example.com/mcp"
         self.assertTrue(autonomy_state["auto_approve"])
         report = read_json(run_dir / "phase-reports" / "polish.json")
         self.assertTrue(report["human_approved"])
+        history = read_json_lines(run_dir / "live" / "autonomy-history.jsonl")
+        self.assertTrue(any(entry["event_type"] == "autonomy.completed" for entry in history))
+        self.assertFalse(any(entry["event_type"] == "autonomy.advanced_phase" for entry in history))
+        self.assertFalse(any(entry.get("reason") == "Advanced from polish to polish." for entry in history))
+
+    def test_run_autonomous_skips_review_gate_and_completes_final_phase_without_self_transition(self) -> None:
+        scaffold_smoke_test(self.project_root, "auto-final-no-review")
+        run_dir = self.project_root / "runs" / "auto-final-no-review"
+        phase_plan = read_json(run_dir / "phase-plan.json")
+        phase_plan["current_phase"] = "polish"
+        for index, phase_state in enumerate(phase_plan["phases"]):
+            if index < 3:
+                phase_state["status"] = "complete"
+                phase_state["human_approved"] = True
+            else:
+                phase_state["status"] = "active"
+                phase_state["human_approved"] = False
+        write_json(run_dir / "phase-plan.json", phase_plan)
+        for task_path in sorted((run_dir / "tasks").glob("*.json")):
+            task = read_json(task_path)
+            task["phase"] = "polish"
+            write_json(task_path, task)
+
+        final_payload = {
+            "summary": "Finished the smoke task.",
+            "status": "ready_for_bundle_review",
+            "artifacts": [],
+            "validation_results": [{"id": "context-echo", "status": "passed", "evidence": "returned expected context"}],
+            "open_issues": [],
+            "change_requests": [],
+            "produced_outputs": [
+                {
+                    "kind": "assertion",
+                    "output_id": "smoke.context-echo",
+                    "path": None,
+                    "asset_id": None,
+                    "description": "Smoke task echoed the assigned role, objective id, phase, and prompt layers.",
+                    "evidence": {
+                        "validation_ids": [],
+                        "artifact_paths": [],
+                    },
+                }
+            ],
+            "context_echo": None,
+            "collaboration_request": None,
+        }
+        stdout = "\n".join(
+            [
+                '{"type":"thread.started","thread_id":"thread-auto-no-review-final"}',
+                '{"type":"turn.started"}',
+                json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(final_payload)}),
+                '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
+            ]
+        )
+        completed = completed_process(stdout=stdout, stderr="", returncode=0)
+        with patch("company_orchestrator.executor.run_codex_command", return_value=completed):
+            result = run_autonomous(self.project_root, "auto-final-no-review", max_concurrency=2, approval_scope="none")
+
+        self.assertEqual(result["status"], "completed")
+        updated_phase_plan = read_json(run_dir / "phase-plan.json")
+        self.assertTrue(all(item["status"] == "complete" for item in updated_phase_plan["phases"]))
+        autonomy_state = read_json(run_dir / "autonomy.json")
+        self.assertEqual(autonomy_state["status"], "completed")
+        history = read_json_lines(run_dir / "live" / "autonomy-history.jsonl")
+        self.assertTrue(any(entry["event_type"] == "autonomy.skipped_review_gate" for entry in history))
+        self.assertTrue(any(entry["event_type"] == "autonomy.completed" for entry in history))
+        self.assertFalse(any(entry["event_type"] == "autonomy.advanced_phase" for entry in history))
+        self.assertFalse(any(entry.get("reason") == "Advanced from polish to polish." for entry in history))
 
     def test_run_autonomous_stops_on_hold_report(self) -> None:
         run_dir = initialize_run(self.project_root, "auto-hold", "# Goal\n\n## Objectives\n- App A")
@@ -5115,34 +7619,27 @@ url = "https://example.com/mcp"
         )
 
     def test_run_autonomous_respects_stop_before_phase_policy(self) -> None:
-        scaffold_smoke_test(self.project_root, "auto-stop-phase")
-        final_payload = {
-            "summary": "Finished the smoke task.",
-            "status": "ready_for_bundle_review",
-            "artifacts": [],
-            "validation_results": [],
-            "legacy_dependency_notes": [],
-            "open_issues": [],
-            "legacy_follow_ups": [],
-            "context_echo": None,
-            "collaboration_request": None,
-        }
-        stdout = "\n".join(
-            [
-                '{"type":"thread.started","thread_id":"thread-auto-stop"}',
-                '{"type":"turn.started"}',
-                json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(final_payload)}),
-                '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
-            ]
+        run_dir = initialize_run(self.project_root, "auto-stop-phase", "# Goal\n\n## Objectives\n- App A")
+        phase_plan = read_json(run_dir / "phase-plan.json")
+        phase_plan["current_phase"] = "design"
+        for phase_state in phase_plan["phases"]:
+            if phase_state["phase"] == "discovery":
+                phase_state["status"] = "complete"
+                phase_state["human_approved"] = True
+            elif phase_state["phase"] == "design":
+                phase_state["status"] = "active"
+                phase_state["human_approved"] = False
+            else:
+                phase_state["status"] = "pending"
+                phase_state["human_approved"] = False
+        write_json(run_dir / "phase-plan.json", phase_plan)
+
+        result = run_autonomous(
+            self.project_root,
+            "auto-stop-phase",
+            max_concurrency=2,
+            stop_before_phases=["design"],
         )
-        completed = completed_process(stdout=stdout, stderr="", returncode=0)
-        with patch("company_orchestrator.executor.run_codex_command", return_value=completed):
-            result = run_autonomous(
-                self.project_root,
-                "auto-stop-phase",
-                max_concurrency=2,
-                stop_before_phases=["design"],
-            )
 
         self.assertEqual(result["status"], "stopped")
         self.assertEqual(result["stop_condition"], "policy_stop_phase")
@@ -5151,8 +7648,6 @@ url = "https://example.com/mcp"
         self.assertEqual(autonomy_state["approval_scope"], "all")
         self.assertEqual(autonomy_state["stop_before_phases"], ["design"])
         history = read_json_lines(self.project_root / "runs" / "auto-stop-phase" / "live" / "autonomy-history.jsonl")
-        self.assertTrue(any(entry["event_type"] == "autonomy.auto_approved_phase" for entry in history))
-        self.assertTrue(any(entry["event_type"] == "autonomy.advanced_phase" for entry in history))
         self.assertTrue(any(entry["event_type"] == "autonomy.stopped" and entry["reason"] == "Autonomy policy is configured to stop before phase design." for entry in history))
 
     def test_run_autonomous_respects_planning_only_approval_scope(self) -> None:
@@ -5223,12 +7718,222 @@ url = "https://example.com/mcp"
 
         result = run_autonomous(self.project_root, "auto-scope", approval_scope="planning-only")
 
-        self.assertEqual(result["status"], "stopped")
+        self.assertEqual(result["status"], "waiting_for_approval")
         self.assertEqual(result["stop_condition"], "review_gate_policy")
         autonomy_state = read_json(run_dir / "autonomy.json")
         self.assertEqual(autonomy_state["approval_scope"], "planning-only")
+        self.assertEqual(autonomy_state["status"], "waiting_for_approval")
         history = read_json_lines(run_dir / "live" / "autonomy-history.jsonl")
-        self.assertTrue(any(entry["event_type"] == "autonomy.stopped" for entry in history))
+        self.assertTrue(any(entry["event_type"] == "autonomy.waiting_for_approval" for entry in history))
+
+    def test_run_autonomous_skips_review_gate_when_approval_scope_is_none(self) -> None:
+        run_dir = initialize_run(self.project_root, "auto-no-review", "# Goal\n\n## Objectives\n- App A")
+        phase_plan = read_json(run_dir / "phase-plan.json")
+        phase_plan["current_phase"] = "design"
+        for phase_state in phase_plan["phases"]:
+            if phase_state["phase"] == "discovery":
+                phase_state["status"] = "complete"
+                phase_state["human_approved"] = True
+            elif phase_state["phase"] == "design":
+                phase_state["status"] = "active"
+                phase_state["human_approved"] = False
+            elif phase_state["phase"] == "mvp-build":
+                phase_state["status"] = "locked"
+                phase_state["human_approved"] = False
+            else:
+                phase_state["status"] = "pending"
+                phase_state["human_approved"] = False
+        write_json(run_dir / "phase-plan.json", phase_plan)
+        phase_report = {
+            "schema": "phase-report.v1",
+            "run_id": "auto-no-review",
+            "phase": "design",
+            "summary": "Design is ready to advance.",
+            "objective_outcomes": [{"objective_id": "app-a", "status": "accepted", "accepted_bundles": []}],
+            "accepted_bundles": [],
+            "unresolved_risks": [],
+            "parallelism_summary": {
+                "total_tasks_considered": 0,
+                "tasks_run_in_parallel": 0,
+                "tasks_serialized_by_policy": 0,
+                "tasks_serialized_by_runtime_conflict": 0,
+                "incidents": [],
+            },
+            "collaboration_summary": {
+                "total_handoffs": 0,
+                "blocking_handoffs": 0,
+                "satisfied_handoffs": 0,
+                "pending_handoffs": 0,
+                "blocked_handoffs": 0,
+                "handoffs_by_objective": [],
+                "incidents": [],
+            },
+            "observability_summary": {
+                "total_calls": 0,
+                "completed_calls": 0,
+                "failed_calls": 0,
+                "timed_out_calls": 0,
+                "retry_scheduled_calls": 0,
+                "total_input_tokens": 0,
+                "total_cached_input_tokens": 0,
+                "total_output_tokens": 0,
+                "total_prompt_chars": 0,
+                "total_prompt_lines": 0,
+                "average_latency_ms": 0,
+                "max_latency_ms": 0,
+                "average_queue_wait_ms": 0,
+            },
+            "recovery_summary": {
+                "interrupted_activities": 0,
+                "recovered_activities": 0,
+                "abandoned_attempts": 0,
+                "incidents": [],
+            },
+            "proposed_role_changes": [],
+            "recommendation": "advance",
+            "human_approved": False,
+        }
+        write_json(run_dir / "phase-reports" / "design.json", phase_report)
+
+        result = run_autonomous(
+            self.project_root,
+            "auto-no-review",
+            approval_scope="none",
+            stop_before_phases=["mvp-build"],
+        )
+
+        self.assertEqual(result["status"], "stopped")
+        self.assertEqual(result["stop_condition"], "policy_stop_phase")
+        self.assertEqual(result["active_phase"], "mvp-build")
+        updated_phase_plan = read_json(run_dir / "phase-plan.json")
+        self.assertEqual(updated_phase_plan["current_phase"], "mvp-build")
+        self.assertFalse(next(item for item in updated_phase_plan["phases"] if item["phase"] == "design")["human_approved"])
+        history = read_json_lines(run_dir / "live" / "autonomy-history.jsonl")
+        self.assertTrue(any(entry["event_type"] == "autonomy.skipped_review_gate" for entry in history))
+        self.assertTrue(any(entry["event_type"] == "autonomy.advanced_phase" for entry in history))
+        self.assertFalse(any(entry["event_type"] == "autonomy.auto_approved_phase" for entry in history))
+
+    def test_run_autonomous_does_not_bypass_hold_when_approval_scope_is_none(self) -> None:
+        run_dir = initialize_run(self.project_root, "auto-no-review-hold", "# Goal\n\n## Objectives\n- App A")
+        phase_plan = read_json(run_dir / "phase-plan.json")
+        phase_plan["current_phase"] = "design"
+        for phase_state in phase_plan["phases"]:
+            if phase_state["phase"] == "discovery":
+                phase_state["status"] = "complete"
+                phase_state["human_approved"] = True
+            elif phase_state["phase"] == "design":
+                phase_state["status"] = "active"
+                phase_state["human_approved"] = False
+            else:
+                phase_state["status"] = "pending"
+                phase_state["human_approved"] = False
+        write_json(run_dir / "phase-plan.json", phase_plan)
+        phase_report = {
+            "schema": "phase-report.v1",
+            "run_id": "auto-no-review-hold",
+            "phase": "design",
+            "summary": "Design needs human review.",
+            "objective_outcomes": [{"objective_id": "app-a", "status": "pending", "accepted_bundles": []}],
+            "accepted_bundles": [],
+            "unresolved_risks": ["needs-review"],
+            "parallelism_summary": {
+                "total_tasks_considered": 0,
+                "tasks_run_in_parallel": 0,
+                "tasks_serialized_by_policy": 0,
+                "tasks_serialized_by_runtime_conflict": 0,
+                "incidents": [],
+            },
+            "collaboration_summary": {
+                "total_handoffs": 0,
+                "blocking_handoffs": 0,
+                "satisfied_handoffs": 0,
+                "pending_handoffs": 0,
+                "blocked_handoffs": 0,
+                "handoffs_by_objective": [],
+                "incidents": [],
+            },
+            "observability_summary": {
+                "total_calls": 0,
+                "completed_calls": 0,
+                "failed_calls": 0,
+                "timed_out_calls": 0,
+                "retry_scheduled_calls": 0,
+                "total_input_tokens": 0,
+                "total_cached_input_tokens": 0,
+                "total_output_tokens": 0,
+                "total_prompt_chars": 0,
+                "total_prompt_lines": 0,
+                "average_latency_ms": 0,
+                "max_latency_ms": 0,
+                "average_queue_wait_ms": 0,
+            },
+            "recovery_summary": {
+                "interrupted_activities": 0,
+                "recovered_activities": 0,
+                "abandoned_attempts": 0,
+                "incidents": [],
+            },
+            "proposed_role_changes": [],
+            "recommendation": "hold",
+            "human_approved": False,
+        }
+        write_json(run_dir / "phase-reports" / "design.json", phase_report)
+
+        result = run_autonomous(
+            self.project_root,
+            "auto-no-review-hold",
+            approval_scope="none",
+        )
+
+        self.assertEqual(result["status"], "waiting_for_approval")
+        autonomy_state = read_json(run_dir / "autonomy.json")
+        self.assertEqual(autonomy_state["status"], "waiting_for_approval")
+        self.assertIn("paused for human review", autonomy_state["stop_reason"])
+
+    def test_classify_autonomy_stop_does_not_detach_when_live_work_is_active(self) -> None:
+        scaffold_smoke_test(self.project_root, "autonomy-live-work")
+        ensure_activity(
+            self.project_root,
+            "autonomy-live-work",
+            activity_id="APP-A-SMOKE-001",
+            kind="task_execution",
+            entity_id="APP-A-SMOKE-001",
+            phase="discovery",
+            objective_id="app-a",
+            display_name="App A smoke",
+            assigned_role="objectives.app-a.frontend-worker",
+            status="running",
+            progress_stage="running",
+            current_activity="Working.",
+        )
+        state = default_autonomy_state("autonomy-live-work")
+        state.update(
+            {
+                "enabled": True,
+                "status": "running",
+                "active_phase": "discovery",
+                "started_at": "2026-03-16T00:00:00Z",
+            }
+        )
+        guidance = {
+            "run_status": "working",
+            "run_status_reason": "1 active activities, 0 queued, 0 blocked in discovery.",
+            "next_action_command": None,
+            "next_action_reason": "Monitor the run. No manual action is required while work is active.",
+            "review_doc_path": None,
+            "phase_report_path": None,
+            "phase_recommendation": None,
+        }
+
+        stop = classify_autonomy_stop(
+            self.project_root,
+            "autonomy-live-work",
+            guidance,
+            phase="discovery",
+            state=state,
+        )
+
+        self.assertIsNone(stop)
 
     def test_run_autonomous_records_tuning_decision_from_observability(self) -> None:
         scaffold_smoke_test(self.project_root, "auto-tuned")
@@ -5523,7 +8228,7 @@ url = "https://example.com/mcp"
         self.assertEqual(guidance["run_status"], "working")
         self.assertIsNone(guidance["next_action_command"])
 
-    def test_run_guidance_recommends_resume_after_partial_execution_hold(self) -> None:
+    def test_run_guidance_requires_review_after_partial_execution_hold(self) -> None:
         scaffold_smoke_test(self.project_root, "recoverable-hold")
         run_dir = self.project_root / "runs" / "recoverable-hold"
         phase_report = {
@@ -5607,13 +8312,11 @@ url = "https://example.com/mcp"
 
         guidance = run_guidance(self.project_root, "recoverable-hold")
 
-        self.assertEqual(guidance["run_status"], "recoverable")
-        self.assertEqual(
-            guidance["next_action_command"],
-            "python3 -m company_orchestrator resume-phase recoverable-hold --sandbox read-only --max-concurrency 2 --timeout-seconds 600 --watch",
-        )
+        self.assertEqual(guidance["run_status"], "ready_for_review")
+        self.assertIsNone(guidance["next_action_command"])
+        self.assertIn("needs human review", guidance["run_status_reason"])
 
-    def test_run_guidance_recommends_resume_when_only_queued_work_remains(self) -> None:
+    def test_run_guidance_requires_review_when_only_queued_work_remains_after_hold_report(self) -> None:
         scaffold_smoke_test(self.project_root, "queued-recoverable")
         run_dir = self.project_root / "runs" / "queued-recoverable"
         phase_report = {
@@ -5696,13 +8399,131 @@ url = "https://example.com/mcp"
 
         guidance = run_guidance(self.project_root, "queued-recoverable")
 
+        self.assertEqual(guidance["run_status"], "ready_for_review")
+        self.assertIsNone(guidance["next_action_command"])
+        self.assertIn("needs human review", guidance["run_status_reason"])
+
+    def test_run_guidance_recommends_replan_after_interrupted_planning(self) -> None:
+        scaffold_planning_run(self.project_root, "planning-interrupted-guidance", ["frontend"])
+        ensure_activity(
+            self.project_root,
+            "planning-interrupted-guidance",
+            activity_id="plan:discovery:app-a",
+            kind="objective_plan",
+            entity_id="app-a",
+            phase="discovery",
+            objective_id="app-a",
+            display_name="Plan app-a",
+            assigned_role="objectives.app-a.objective-manager",
+            status="interrupted",
+            progress_stage="interrupted",
+            current_activity="Planning manager exited unexpectedly.",
+            prompt_path="runs/planning-interrupted-guidance/manager-plans/discovery-app-a.prompt.md",
+            stdout_path="runs/planning-interrupted-guidance/manager-plans/discovery-app-a.stdout.jsonl",
+            stderr_path="runs/planning-interrupted-guidance/manager-plans/discovery-app-a.stderr.log",
+            output_path="runs/planning-interrupted-guidance/manager-plans/discovery-app-a.json",
+            dependency_blockers=[],
+            status_reason="Process missing with no valid final artifact.",
+        )
+
+        guidance = run_guidance(self.project_root, "planning-interrupted-guidance")
+
         self.assertEqual(guidance["run_status"], "recoverable")
         self.assertEqual(
             guidance["next_action_command"],
-            "python3 -m company_orchestrator resume-phase queued-recoverable --sandbox read-only --max-concurrency 2 --timeout-seconds 600 --watch",
+            "python3 -m company_orchestrator plan-phase planning-interrupted-guidance --replace --sandbox read-only --max-concurrency 2 --timeout-seconds 600 --watch",
+        )
+        self.assertIn("interrupted work", guidance["run_status_reason"])
+
+    def test_run_guidance_does_not_resume_exhausted_polish_hold(self) -> None:
+        scaffold_smoke_test(self.project_root, "polish-guidance-hold")
+        run_dir = self.project_root / "runs" / "polish-guidance-hold"
+        phase_plan = read_json(run_dir / "phase-plan.json")
+        phase_plan["current_phase"] = "polish"
+        for index, item in enumerate(phase_plan["phases"]):
+            if item["phase"] == "polish":
+                item["status"] = "active"
+            elif index < 3:
+                item["status"] = "complete"
+                item["human_approved"] = True
+        write_json(run_dir / "phase-plan.json", phase_plan)
+        write_json(
+            run_dir / "phase-reports" / "polish.json",
+            {
+                "schema": "phase-report.v1",
+                "run_id": "polish-guidance-hold",
+                "phase": "polish",
+                "summary": "Polish remains blocked.",
+                "objective_outcomes": [],
+                "accepted_bundles": [],
+                "unresolved_risks": ["blocked_validation"],
+                "parallelism_summary": {
+                    "total_tasks_considered": 0,
+                    "tasks_run_in_parallel": 0,
+                    "tasks_serialized_by_policy": 0,
+                    "tasks_serialized_by_runtime_conflict": 0,
+                    "incidents": [],
+                },
+                "collaboration_summary": {
+                    "total_handoffs": 0,
+                    "blocking_handoffs": 0,
+                    "satisfied_handoffs": 0,
+                    "pending_handoffs": 0,
+                    "blocked_handoffs": 0,
+                    "handoffs_by_objective": [],
+                    "incidents": [],
+                },
+                "observability_summary": {
+                    "total_calls": 0,
+                    "completed_calls": 0,
+                    "failed_calls": 0,
+                    "timed_out_calls": 0,
+                    "retry_scheduled_calls": 0,
+                    "total_input_tokens": 0,
+                    "total_cached_input_tokens": 0,
+                    "total_output_tokens": 0,
+                    "total_prompt_chars": 0,
+                    "total_prompt_lines": 0,
+                    "average_latency_ms": 0,
+                    "max_latency_ms": 0,
+                    "average_queue_wait_ms": 0,
+                },
+                "recovery_summary": {
+                    "interrupted_activities": 0,
+                    "recovered_activities": 0,
+                    "abandoned_attempts": 0,
+                    "incidents": [],
+                },
+                "release_validation_summary": {
+                    "status": "failed",
+                    "report_path": "runs/polish-guidance-hold/phase-reports/polish-release-validation.json",
+                    "attempt": 2,
+                    "evaluation_mode": "task_validation_checklist",
+                    "summary": "Polish validation still fails.",
+                    "items": [],
+                    "failure_diagnostics": [],
+                },
+                "proposed_role_changes": [],
+                "recommendation": "hold",
+                "human_approved": False,
+            },
+        )
+        record_event(
+            self.project_root,
+            "polish-guidance-hold",
+            phase="polish",
+            activity_id=None,
+            event_type="phase.release_repair_exhausted",
+            message="Polish validation checklist still fails and the repair budget is exhausted.",
         )
 
-    def test_run_autonomous_uses_recovery_path_for_hold_report(self) -> None:
+        guidance = run_guidance(self.project_root, "polish-guidance-hold")
+
+        self.assertEqual(guidance["run_status"], "ready_for_review")
+        self.assertIsNone(guidance["next_action_command"])
+        self.assertIn("repair budget is exhausted", guidance["run_status_reason"])
+
+    def test_run_autonomous_waits_for_review_on_hold_report_instead_of_resuming(self) -> None:
         scaffold_smoke_test(self.project_root, "auto-recoverable-hold")
         run_dir = self.project_root / "runs" / "auto-recoverable-hold"
         phase_report = {
@@ -5784,20 +8605,14 @@ url = "https://example.com/mcp"
             dependency_blockers=["APP-A-SMOKE-001"],
         )
 
-        captured: dict[str, object] = {}
-
-        def fake_run_phase(project_root: Path, run_id: str, **kwargs: object) -> dict[str, object]:
-            captured.update(kwargs)
-            return {"run_id": run_id, "phase": "discovery", "recommendation": "hold"}
-
-        with patch("company_orchestrator.autonomy.run_phase", side_effect=fake_run_phase):
+        with patch("company_orchestrator.autonomy.run_phase") as run_phase_mock:
             result = run_autonomous(self.project_root, "auto-recoverable-hold", max_iterations=1)
 
-        self.assertEqual(result["status"], "stopped")
-        self.assertEqual(result["stop_condition"], "iteration_limit")
-        self.assertEqual(captured["max_concurrency"], 3)
+        self.assertEqual(result["status"], "waiting_for_approval")
+        self.assertEqual(result["stop_condition"], "review_gate")
+        run_phase_mock.assert_not_called()
         history = read_json_lines(run_dir / "live" / "autonomy-history.jsonl")
-        self.assertTrue(any(entry["event_type"] == "autonomy.action_completed" and entry["action"] == "resume-phase" for entry in history))
+        self.assertTrue(any(entry["event_type"] == "autonomy.waiting_for_approval" for entry in history))
 
     def test_cli_result_guidance_adds_review_paths(self) -> None:
         scaffold_smoke_test(self.project_root, "guided")
@@ -5856,6 +8671,61 @@ url = "https://example.com/mcp"
             "objectives.app-a.frontend-manager",
         )
         self.assertEqual(normalized["collaboration_edges"][0]["to_capability"], "acceptance")
+
+    def test_normalize_objective_outline_backfills_identity_and_manager_roles(self) -> None:
+        payload = {
+            "summary": "Outline without planner-managed identity fields.",
+            "capability_lanes": [
+                {
+                    "capability": "frontend",
+                    "objective": "Plan frontend work.",
+                    "inputs": [],
+                    "expected_outputs": [],
+                    "done_when": [],
+                    "depends_on": [],
+                    "planning_notes": [],
+                    "collaboration_rules": [],
+                }
+            ],
+            "dependency_notes": [],
+            "collaboration_edges": [],
+        }
+        normalized, adjustments = normalize_objective_outline(
+            self.project_root,
+            payload,
+            run_id="outline-backfill",
+            phase="design",
+            objective={"objective_id": "app-a", "capabilities": ["frontend"]},
+        )
+        self.assertEqual(normalized["run_id"], "outline-backfill")
+        self.assertEqual(normalized["phase"], "design")
+        self.assertEqual(normalized["objective_id"], "app-a")
+        self.assertEqual(
+            normalized["capability_lanes"][0]["assigned_manager_role"],
+            "objectives.app-a.frontend-manager",
+        )
+        self.assertEqual(adjustments["run_id"]["to"], "outline-backfill")
+        self.assertEqual(adjustments["phase"]["to"], "design")
+        self.assertEqual(adjustments["objective_id"]["to"], "app-a")
+
+    def test_render_capability_planning_prompt_omits_assigned_manager_role_from_prompt_context(self) -> None:
+        scaffold_planning_run(self.project_root, "capability-prompt-role-omission", ["frontend"])
+        outline = objective_outline_for_objective(
+            "capability-prompt-role-omission",
+            "app-a",
+            ["frontend"],
+        )
+
+        metadata = render_capability_planning_prompt(
+            self.project_root,
+            "capability-prompt-role-omission",
+            "app-a",
+            "frontend",
+            outline,
+        )
+        prompt_text = (self.project_root / metadata["prompt_path"]).read_text(encoding="utf-8")
+
+        self.assertNotIn("assigned_manager_role", prompt_text)
 
     def test_normalize_objective_outline_allows_objective_management_target_edge(self) -> None:
         payload = {
@@ -7501,7 +10371,45 @@ url = "https://example.com/mcp"
                 default_sandbox_mode="workspace-write",
             )
 
-        self.assertIn("writes_existing_paths referenced a missing file", str(ctx.exception))
+        self.assertIn("writes_existing_paths referenced missing files", str(ctx.exception))
+        self.assertIn("apps/todo/frontend/src/missing.js", str(ctx.exception))
+
+    def test_normalize_task_execution_metadata_reports_all_missing_writes_existing_paths(self) -> None:
+        scaffold_planning_run(self.project_root, "missing-existing-write-multiple", ["middleware"])
+        payload = {
+            "phase": "polish",
+            "tasks": [
+                {
+                    "task_id": "APP-A-POLISH-EXPLICIT-003",
+                    "objective": "Update missing shared runtime scripts.",
+                    "expected_outputs": [],
+                    "writes_existing_paths": [
+                        "apps/todo/runtime/scripts/start-runtime.mjs",
+                        "apps/todo/scripts/validate-todo-release-readiness.mjs",
+                    ],
+                    "owned_paths": [],
+                    "shared_asset_ids": [],
+                    "depends_on": [],
+                    "validation": [],
+                    "collaboration_rules": [],
+                    "inputs": [],
+                    "execution_mode": "isolated_write",
+                }
+            ],
+        }
+
+        with self.assertRaises(ExecutorError) as ctx:
+            normalize_task_execution_metadata(
+                self.project_root,
+                "app-a",
+                "middleware",
+                payload,
+                default_sandbox_mode="workspace-write",
+            )
+
+        self.assertIn("writes_existing_paths referenced missing files", str(ctx.exception))
+        self.assertIn("apps/todo/runtime/scripts/start-runtime.mjs", str(ctx.exception))
+        self.assertIn("apps/todo/scripts/validate-todo-release-readiness.mjs", str(ctx.exception))
 
     def test_normalize_task_execution_metadata_rejects_existing_required_output_without_writes_existing_path(self) -> None:
         scaffold_planning_run(self.project_root, "missing-existing-required-output-write", ["frontend"])
@@ -8409,6 +11317,284 @@ url = "https://example.com/mcp"
         summary = reconcile_for_command(self.project_root, "reconcile-landed-bundle", apply=True)
         self.assertEqual(summary["blocked"], [])
 
+    def test_commit_task_workspace_discards_incidental_changes_outside_declared_surface(self) -> None:
+        init_git_repo(self.project_root)
+        scaffold_planning_run(self.project_root, "sanitize-commit", ["frontend"])
+        workspace = ensure_task_workspace(self.project_root, "sanitize-commit", "WRITE-001")
+        (workspace.workspace_path / "docs").mkdir(parents=True, exist_ok=True)
+        (workspace.workspace_path / "docs" / "owned.md").write_text("owned\n", encoding="utf-8")
+        (workspace.workspace_path / ".codex-tmp").mkdir(parents=True, exist_ok=True)
+        (workspace.workspace_path / ".codex-tmp" / "cache.bin").write_text("cache\n", encoding="utf-8")
+        (workspace.workspace_path / "apps" / "todo" / "backend" / "data").mkdir(parents=True, exist_ok=True)
+        (workspace.workspace_path / "apps" / "todo" / "backend" / "data" / "todos.json").write_text(
+            "{\"todos\":[]}\n",
+            encoding="utf-8",
+        )
+
+        commit_result = commit_task_workspace(workspace, "WRITE-001", allowed_paths=["docs/owned.md"])
+
+        self.assertTrue(commit_result["committed"])
+        self.assertEqual(
+            sorted(commit_result["discarded_paths"]),
+            [".codex-tmp/cache.bin", "apps/todo/backend/data/todos.json"],
+        )
+        show = subprocess.run(
+            ["git", "show", "--name-only", "--pretty=format:", "HEAD"],
+            cwd=workspace.workspace_path,
+            capture_output=True,
+            check=True,
+            text=True,
+        ).stdout.splitlines()
+        self.assertIn("docs/owned.md", show)
+        self.assertNotIn(".codex-tmp/cache.bin", show)
+        self.assertNotIn("apps/todo/backend/data/todos.json", show)
+        self.assertFalse((workspace.workspace_path / ".codex-tmp" / "cache.bin").exists())
+        self.assertFalse((workspace.workspace_path / "apps" / "todo" / "backend" / "data" / "todos.json").exists())
+
+    def test_commit_task_workspace_discards_large_incidental_file_sets_outside_declared_surface(self) -> None:
+        init_git_repo(self.project_root)
+        scaffold_planning_run(self.project_root, "sanitize-commit-bulk", ["frontend"])
+        workspace = ensure_task_workspace(self.project_root, "sanitize-commit-bulk", "WRITE-001")
+        (workspace.workspace_path / "docs").mkdir(parents=True, exist_ok=True)
+        (workspace.workspace_path / "docs" / "owned.md").write_text("owned\n", encoding="utf-8")
+        cache_root = workspace.workspace_path / ".codex-tmp" / "node-compile-cache"
+        cache_root.mkdir(parents=True, exist_ok=True)
+        incidental_paths: list[str] = []
+        for index in range(250):
+            relative_path = f".codex-tmp/node-compile-cache/cache-{index:03d}.bin"
+            incidental_paths.append(relative_path)
+            target = workspace.workspace_path / relative_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(f"cache-{index}\n", encoding="utf-8")
+
+        commit_result = commit_task_workspace(workspace, "WRITE-001", allowed_paths=["docs/owned.md"])
+
+        self.assertTrue(commit_result["committed"])
+        self.assertEqual(sorted(commit_result["discarded_paths"]), incidental_paths)
+        show = subprocess.run(
+            ["git", "show", "--name-only", "--pretty=format:", "HEAD"],
+            cwd=workspace.workspace_path,
+            capture_output=True,
+            check=True,
+            text=True,
+        ).stdout.splitlines()
+        self.assertIn("docs/owned.md", show)
+        for relative_path in incidental_paths:
+            self.assertNotIn(relative_path, show)
+            self.assertFalse((workspace.workspace_path / relative_path).exists())
+
+    def test_land_accepted_bundle_sanitizes_branch_paths_outside_task_surface(self) -> None:
+        init_git_repo(self.project_root)
+        scaffold_planning_run(self.project_root, "sanitize-landing", ["frontend"])
+        run_dir = self.project_root / "runs" / "sanitize-landing"
+        write_json(
+            run_dir / "tasks" / "WRITE-001.json",
+            {
+                "schema": "task-assignment.v1",
+                "run_id": "sanitize-landing",
+                "phase": "mvp-build",
+                "objective_id": "app-a",
+                "capability": "frontend",
+                "working_directory": None,
+                "sandbox_mode": "workspace-write",
+                "additional_directories": [],
+                "execution_mode": "isolated_write",
+                "parallel_policy": "serialize",
+                "owned_paths": ["docs/owned.md"],
+                "writes_existing_paths": [],
+                "shared_asset_ids": [],
+                "task_id": "WRITE-001",
+                "assigned_role": "objectives.app-a.frontend-worker",
+                "manager_role": "objectives.app-a.frontend-manager",
+                "acceptance_role": "objectives.app-a.acceptance-manager",
+                "objective": "Write and land a simple artifact.",
+                "inputs": [],
+                "expected_outputs": ["docs/owned.md"],
+                "done_when": ["artifact exists"],
+                "depends_on": [],
+                "validation": [],
+                "collaboration_rules": [],
+            },
+        )
+        bundle = {
+            "schema": "review-bundle.v1",
+            "run_id": "sanitize-landing",
+            "phase": "mvp-build",
+            "objective_id": "app-a",
+            "bundle_id": "sanitize-landing-bundle",
+            "assembled_by": "objectives.app-a.frontend-manager",
+            "reviewed_by": "objectives.app-a.acceptance-manager",
+            "included_tasks": ["WRITE-001"],
+            "status": "accepted",
+            "required_checks": [],
+            "rejection_reasons": [],
+        }
+        write_json(run_dir / "bundles" / "sanitize-landing-bundle.json", bundle)
+
+        integration = ensure_run_integration_workspace(self.project_root, "sanitize-landing")
+        task_workspace = ensure_task_workspace(self.project_root, "sanitize-landing", "WRITE-001")
+
+        (integration.workspace_path / ".codex-tmp").mkdir(parents=True, exist_ok=True)
+        (integration.workspace_path / ".codex-tmp" / "cache.bin").write_text("integration-cache\n", encoding="utf-8")
+        (integration.workspace_path / "apps" / "todo" / "backend" / "data").mkdir(parents=True, exist_ok=True)
+        (integration.workspace_path / "apps" / "todo" / "backend" / "data" / "todos.json").write_text(
+            "{\"source\":\"integration\"}\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "-A"], cwd=integration.workspace_path, capture_output=True, check=True, text=True)
+        subprocess.run(
+            ["git", "commit", "-m", "integration incidental state"],
+            cwd=integration.workspace_path,
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+
+        (task_workspace.workspace_path / "docs").mkdir(parents=True, exist_ok=True)
+        (task_workspace.workspace_path / "docs" / "owned.md").write_text("owned\n", encoding="utf-8")
+        (task_workspace.workspace_path / ".codex-tmp").mkdir(parents=True, exist_ok=True)
+        (task_workspace.workspace_path / ".codex-tmp" / "cache.bin").write_text("task-cache\n", encoding="utf-8")
+        (task_workspace.workspace_path / "apps" / "todo" / "backend" / "data").mkdir(parents=True, exist_ok=True)
+        (task_workspace.workspace_path / "apps" / "todo" / "backend" / "data" / "todos.json").write_text(
+            "{\"source\":\"task\"}\n",
+            encoding="utf-8",
+        )
+        commit_result = commit_task_workspace(task_workspace, "WRITE-001")
+        self.assertTrue(commit_result["committed"])
+
+        landing = land_accepted_bundle(self.project_root, "sanitize-landing", bundle)
+
+        self.assertEqual(landing["status"], "accepted")
+        self.assertEqual((integration.workspace_path / "docs" / "owned.md").read_text(encoding="utf-8"), "owned\n")
+        self.assertEqual(
+            (integration.workspace_path / ".codex-tmp" / "cache.bin").read_text(encoding="utf-8"),
+            "integration-cache\n",
+        )
+        self.assertEqual(
+            (integration.workspace_path / "apps" / "todo" / "backend" / "data" / "todos.json").read_text(
+                encoding="utf-8"
+            ),
+            "{\"source\":\"integration\"}\n",
+        )
+        self.assertEqual(
+            landing["landing_results"][0]["discarded_paths"],
+            [".codex-tmp/cache.bin", "apps/todo/backend/data/todos.json"],
+        )
+
+    def test_land_accepted_bundle_removes_untracked_integration_files_that_overlap_task_outputs(self) -> None:
+        init_git_repo(self.project_root)
+        scaffold_planning_run(self.project_root, "sanitize-landing-untracked-overlap", ["frontend"])
+        run_dir = self.project_root / "runs" / "sanitize-landing-untracked-overlap"
+        write_json(
+            run_dir / "tasks" / "FRONTEND-001.json",
+            {
+                "schema": "task-assignment.v1",
+                "run_id": "sanitize-landing-untracked-overlap",
+                "phase": "mvp-build",
+                "objective_id": "app-a",
+                "capability": "frontend",
+                "working_directory": None,
+                "sandbox_mode": "workspace-write",
+                "additional_directories": [],
+                "execution_mode": "isolated_write",
+                "parallel_policy": "serialize",
+                "owned_paths": [
+                    "apps/todo/frontend/src/todos/TodoApp.js",
+                    "apps/todo/frontend/src/todos/todoApi.js",
+                    "apps/todo/frontend/test/todo-crud.test.js",
+                ],
+                "writes_existing_paths": [],
+                "shared_asset_ids": [],
+                "task_id": "FRONTEND-001",
+                "assigned_role": "objectives.app-a.frontend-worker",
+                "manager_role": "objectives.app-a.frontend-manager",
+                "acceptance_role": "objectives.app-a.acceptance-manager",
+                "objective": "Create frontend MVP files.",
+                "inputs": [],
+                "expected_outputs": [
+                    "apps/todo/frontend/src/todos/TodoApp.js",
+                    "apps/todo/frontend/src/todos/todoApi.js",
+                    "apps/todo/frontend/test/todo-crud.test.js",
+                ],
+                "done_when": ["frontend files exist"],
+                "depends_on": [],
+                "validation": [],
+                "collaboration_rules": [],
+            },
+        )
+        bundle = {
+            "schema": "review-bundle.v1",
+            "run_id": "sanitize-landing-untracked-overlap",
+            "phase": "mvp-build",
+            "objective_id": "app-a",
+            "bundle_id": "frontend-bundle",
+            "assembled_by": "objectives.app-a.frontend-manager",
+            "reviewed_by": "objectives.app-a.acceptance-manager",
+            "included_tasks": ["FRONTEND-001"],
+            "status": "accepted",
+            "required_checks": [],
+            "rejection_reasons": [],
+        }
+        write_json(run_dir / "bundles" / "frontend-bundle.json", bundle)
+
+        integration = ensure_run_integration_workspace(self.project_root, "sanitize-landing-untracked-overlap")
+        task_workspace = ensure_task_workspace(self.project_root, "sanitize-landing-untracked-overlap", "FRONTEND-001")
+
+        for relative_path, text in {
+            "apps/todo/frontend/src/todos/TodoApp.js": "task todo app\n",
+            "apps/todo/frontend/src/todos/todoApi.js": "task todo api\n",
+            "apps/todo/frontend/test/todo-crud.test.js": "task crud test\n",
+        }.items():
+            target = task_workspace.workspace_path / relative_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text, encoding="utf-8")
+        commit_result = commit_task_workspace(
+            task_workspace,
+            "FRONTEND-001",
+            allowed_paths=[
+                "apps/todo/frontend/src/todos/TodoApp.js",
+                "apps/todo/frontend/src/todos/todoApi.js",
+                "apps/todo/frontend/test/todo-crud.test.js",
+            ],
+        )
+        self.assertTrue(commit_result["committed"])
+
+        for relative_path, text in {
+            "apps/todo/frontend/src/todos/TodoApp.js": "stale untracked todo app\n",
+            "apps/todo/frontend/src/todos/todoApi.js": "stale untracked todo api\n",
+            "apps/todo/frontend/test/todo-crud.test.js": "stale untracked crud test\n",
+        }.items():
+            target = integration.workspace_path / relative_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text, encoding="utf-8")
+
+        landing = land_accepted_bundle(self.project_root, "sanitize-landing-untracked-overlap", bundle)
+
+        self.assertEqual(landing["status"], "accepted")
+        self.assertEqual(
+            sorted(landing["landing_results"][0]["integration_sanitized_paths"]),
+            [
+                "apps/todo/frontend/src/todos/TodoApp.js",
+                "apps/todo/frontend/src/todos/todoApi.js",
+                "apps/todo/frontend/test/todo-crud.test.js",
+            ],
+        )
+        self.assertEqual(
+            (integration.workspace_path / "apps/todo/frontend/src/todos/TodoApp.js").read_text(encoding="utf-8"),
+            "task todo app\n",
+        )
+        self.assertEqual(
+            (integration.workspace_path / "apps/todo/frontend/src/todos/todoApi.js").read_text(encoding="utf-8"),
+            "task todo api\n",
+        )
+        self.assertEqual(
+            (integration.workspace_path / "apps/todo/frontend/test/todo-crud.test.js").read_text(encoding="utf-8"),
+            "task crud test\n",
+        )
+        events = read_json_lines(run_dir / "live" / "events.jsonl")
+        sanitized_events = [event for event in events if event["event_type"] == "bundle.workspace_sanitized"]
+        self.assertEqual(len(sanitized_events), 1)
+
     def test_plan_objective_materializes_tasks_from_manager_plan(self) -> None:
         scaffold_planning_run(self.project_root, "planned", ["frontend"])
         capability_plan = {
@@ -8609,6 +11795,10 @@ url = "https://example.com/mcp"
         self.assertFalse((run_dir / "executions" / "APP-A-STALE-001.json").exists())
         self.assertFalse((run_dir / "bundles" / "app-a-stale-bundle.json").exists())
         self.assertTrue((run_dir / "tasks" / "APP-A-NEW-001.json").exists())
+        active_graph = load_objective_task_graph_manifest(run_dir, "discovery", "app-a")
+        self.assertIsNotNone(active_graph)
+        self.assertEqual(active_graph["task_ids"], ["APP-A-NEW-001"])
+        self.assertEqual(active_graph["bundle_ids"], ["app-a-new-frontend-bundle"])
         archive_root = run_dir / "archive" / "objective-replans" / "discovery" / "app-a"
         self.assertTrue(any(archive_root.glob("*/live/activities/APP-A-OLD-001.json")))
         self.assertTrue(any(archive_root.glob("*/live/activities/APP-A-STALE-001.json")))
@@ -8617,10 +11807,107 @@ url = "https://example.com/mcp"
         self.assertIn("APP-A-OLD-001", cleaned_ids)
         self.assertIn("APP-A-STALE-001", cleaned_ids)
 
+    def test_phase_tasks_filters_stale_task_files_outside_active_objective_graph(self) -> None:
+        scaffold_planning_run(self.project_root, "active-task-graph", ["frontend"])
+        run_dir = self.project_root / "runs" / "active-task-graph"
+        active_task = {
+            "schema": "task-assignment.v1",
+            "run_id": "active-task-graph",
+            "phase": "discovery",
+            "objective_id": "app-a",
+            "capability": "frontend",
+            "working_directory": None,
+            "sandbox_mode": "read-only",
+            "additional_directories": [],
+            "task_id": "APP-A-ACTIVE-001",
+            "assigned_role": "objectives.app-a.frontend-worker",
+            "manager_role": "objectives.app-a.frontend-manager",
+            "acceptance_role": "objectives.app-a.acceptance-manager",
+            "execution_mode": "read_only",
+            "parallel_policy": "allow",
+            "owned_paths": [],
+            "writes_existing_paths": [],
+            "shared_asset_ids": [],
+            "handoff_dependencies": [],
+            "objective": "Read active frontend artifact.",
+            "inputs": [],
+            "expected_outputs": [
+                {
+                    "kind": "assertion",
+                    "output_id": "frontend-active-check",
+                    "path": None,
+                    "asset_id": None,
+                    "description": None,
+                    "evidence": None,
+                }
+            ],
+            "done_when": ["done"],
+            "depends_on": [],
+            "validation": [],
+            "collaboration_rules": [],
+        }
+        stale_task = dict(active_task)
+        stale_task["task_id"] = "APP-A-STALE-001"
+        write_json(run_dir / "tasks" / "APP-A-ACTIVE-001.json", active_task)
+        write_json(run_dir / "tasks" / "APP-A-STALE-001.json", stale_task)
+        write_json(
+            run_dir / "manager-plans" / "discovery-app-a.active.json",
+            {
+                "run_id": "active-task-graph",
+                "phase": "discovery",
+                "objective_id": "app-a",
+                "task_ids": ["APP-A-ACTIVE-001"],
+                "bundle_ids": [],
+                "handoff_ids": [],
+                "updated_at": "2026-04-07T00:00:00Z",
+            },
+        )
+
+        tasks = phase_tasks(run_dir, "discovery")
+
+        self.assertEqual([task["task_id"] for task in tasks], ["APP-A-ACTIVE-001"])
+
+    def test_run_phase_rejects_orphan_live_task_activity_outside_active_objective_graph(self) -> None:
+        scaffold_smoke_test(self.project_root, "orphan-graph")
+        run_dir = self.project_root / "runs" / "orphan-graph"
+        write_json(
+            run_dir / "manager-plans" / "discovery-app-a.active.json",
+            {
+                "run_id": "orphan-graph",
+                "phase": "discovery",
+                "objective_id": "app-a",
+                "task_ids": ["APP-A-SMOKE-001"],
+                "bundle_ids": [],
+                "handoff_ids": [],
+                "updated_at": "2026-04-07T00:00:00Z",
+            },
+        )
+        ensure_activity(
+            self.project_root,
+            "orphan-graph",
+            activity_id="APP-A-ORPHAN-001",
+            kind="task_execution",
+            entity_id="APP-A-ORPHAN-001",
+            phase="discovery",
+            objective_id="app-a",
+            display_name="APP-A-ORPHAN-001",
+            assigned_role="objectives.app-a.frontend-worker",
+            status="queued",
+            current_activity="Orphaned execution still queued.",
+        )
+
+        with self.assertRaises(ExecutorError) as ctx:
+            run_phase(self.project_root, "orphan-graph")
+
+        self.assertIn("task graph is inconsistent with the active objective manifests", str(ctx.exception))
+
     def test_plan_objective_streams_live_activity_updates_and_events(self) -> None:
-        scaffold_planning_run(self.project_root, "planned-live", ["frontend"])
-        objective_outline = objective_outline_for_objective("planned-live", "app-a", ["frontend"])
+        scaffold_planning_run(self.project_root, "planned-live", ["frontend", "backend"])
+        objective_outline = objective_outline_for_objective("planned-live", "app-a", ["frontend", "backend"])
         capability_plan = capability_plan_for_objective("planned-live", "app-a", "frontend")
+        backend_plan = capability_plan_for_objective("planned-live", "app-a", "backend")
+        capability_plan["tasks"][0].pop("assigned_role", None)
+        backend_plan["tasks"][0].pop("assigned_role", None)
         objective_lines = [
             '{"type":"thread.started","thread_id":"plan-thread-live"}',
             '{"type":"turn.started"}',
@@ -8639,6 +11926,14 @@ url = "https://example.com/mcp"
                 '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
             ]
         )
+        backend_stdout = "\n".join(
+            [
+                '{"type":"thread.started","thread_id":"backend-thread-live"}',
+                '{"type":"turn.started"}',
+                json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(backend_plan)}),
+                '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
+            ]
+        )
         call_count = {"value": 0}
 
         def side_effect(*_: object, **kwargs: object):
@@ -8649,7 +11944,9 @@ url = "https://example.com/mcp"
                 for line in objective_lines:
                     callback(line)
                 return completed_process(stdout="\n".join(objective_lines), stderr="", returncode=0)
-            return completed_process(stdout=capability_stdout, stderr="", returncode=0)
+            if index == 1:
+                return completed_process(stdout=capability_stdout, stderr="", returncode=0)
+            return completed_process(stdout=backend_stdout, stderr="", returncode=0)
 
         with patch("company_orchestrator.objective_planner.run_codex_command", side_effect=side_effect):
             plan_objective(self.project_root, "planned-live", "app-a")
@@ -8659,6 +11956,8 @@ url = "https://example.com/mcp"
         )
         self.assertEqual(activity["status"], "completed")
         self.assertEqual(activity["kind"], "objective_plan")
+        self.assertEqual(activity["stdout_path"], "runs/planned-live/manager-plans/discovery-app-a.stdout.jsonl")
+        self.assertEqual(activity["stderr_path"], "runs/planned-live/manager-plans/discovery-app-a.stderr.log")
         events = (
             self.project_root / "runs" / "planned-live" / "live" / "events.jsonl"
         ).read_text(encoding="utf-8")
@@ -8770,8 +12069,8 @@ url = "https://example.com/mcp"
         self.assertEqual(lane_capabilities, ["frontend", "backend"])
         self.assertEqual(len(payload["required_outbound_handoffs"]), 1)
         self.assertEqual(
-            payload["required_outbound_handoffs"][0]["deliverables"],
-            ["Frontend delivers a booking contract summary."],
+            payload["required_outbound_handoffs"][0]["deliverables"][0]["description"],
+            "Frontend delivers a booking contract summary.",
         )
         self.assertEqual(payload["required_inbound_handoffs"], [])
 
@@ -8934,17 +12233,83 @@ url = "https://example.com/mcp"
         )
         prompt_text = (self.project_root / metadata["prompt_path"]).read_text(encoding="utf-8")
 
-        self.assertIn("# Exact Output Contract", prompt_text)
-        self.assertIn("Your plan must cover exactly the final lane outputs listed in `Allowed Final Outputs`.", prompt_text)
+        self.assertIn("# Assignment", prompt_text)
+        self.assertIn("You are creating the planning artifact for one capability-owned part of a project objective.", prompt_text)
+        self.assertIn("# Lane Contract", prompt_text)
+        self.assertIn("# Field Semantics", prompt_text)
+        self.assertIn("# Addressable Task Inputs", prompt_text)
+        self.assertIn("# Output Shape Reference", prompt_text)
         self.assertIn("`frontend-app-shell` (artifact) -> path `apps/app-a/frontend/src/App.tsx`", prompt_text)
-        self.assertIn("## Existing Required Paths", prompt_text)
-        self.assertIn("`frontend-app-shell` -> existing file `apps/app-a/frontend/src/App.tsx`", prompt_text)
-        self.assertIn("`edge-fe-be` -> `backend` via `objectives.app-a.backend-manager`", prompt_text)
-        self.assertIn("deliverable_output_ids: `frontend-review-bundle`", prompt_text)
-        self.assertIn("If a file does not already exist and your task will create it, declare it in `expected_outputs`, not `writes_existing_paths`.", prompt_text)
-        self.assertIn("If a same-phase dependency comes from another task in this capability lane, reference it as `Output of <task-id>`", prompt_text)
-        self.assertIn("If a same-phase dependency comes from an inbound handoff deliverable, reference it with the exact `Planning Inputs.required_inbound_handoffs[...]` path", prompt_text)
-        self.assertIn("Do not place nonexistent future repo paths from same-phase work into task inputs.", prompt_text)
+        self.assertIn("Required existing files that must be handled", prompt_text)
+        self.assertIn("`frontend-app-shell` -> `apps/app-a/frontend/src/App.tsx`", prompt_text)
+        self.assertIn("edge-fe-be: backend via objectives.app-a.backend-manager", prompt_text)
+        self.assertIn("Objective id: `app-a`", prompt_text)
+        self.assertIn("What This Capability Should Plan:", prompt_text)
+        self.assertIn("Plan the frontend-owned user flows, UI states, and client-side rules for this phase.", prompt_text)
+        self.assertIn("`task.inputs`", prompt_text)
+        self.assertIn("`expected_outputs`", prompt_text)
+        self.assertIn("Do not include `assigned_role` in task objects.", prompt_text)
+        self.assertNotIn("available_roles", prompt_text)
+        self.assertNotIn("worker_roles", prompt_text)
+
+    def test_render_capability_prompt_uses_compact_semantic_sections(self) -> None:
+        scaffold_planning_run(self.project_root, "compact-capability-prompt", ["frontend", "backend", "general"])
+        outline = objective_outline_for_objective(
+            "compact-capability-prompt",
+            "app-a",
+            ["frontend", "backend", "general"],
+        )
+
+        metadata = render_capability_planning_prompt(
+            self.project_root,
+            "compact-capability-prompt",
+            "app-a",
+            "frontend",
+            outline,
+        )
+        prompt_text = (self.project_root / metadata["prompt_path"]).read_text(encoding="utf-8")
+
+        self.assertIn("# Planning Rules", prompt_text)
+        self.assertNotIn("# How To Use The Context Below", prompt_text)
+        self.assertNotIn("Current status: empty", prompt_text)
+        self.assertIn("Objective id: `app-a`", prompt_text)
+        self.assertIn("What This Capability Should Plan:", prompt_text)
+        self.assertLess(metadata["prompt_char_count"], 7000)
+        self.assertLess(metadata["prompt_line_count"], 200)
+
+    def test_render_capability_prompt_separates_objective_meaning_from_lane_intent(self) -> None:
+        scaffold_planning_run(self.project_root, "capability-objective-separation", ["frontend"])
+        outline = objective_outline_for_objective(
+            "capability-objective-separation",
+            "app-a",
+            ["frontend"],
+        )
+
+        metadata = render_capability_planning_prompt(
+            self.project_root,
+            "capability-objective-separation",
+            "app-a",
+            "frontend",
+            outline,
+        )
+        prompt_text = (self.project_root / metadata["prompt_path"]).read_text(encoding="utf-8")
+
+        objective_section_start = prompt_text.index("This objective is trying to achieve:")
+        capability_section_start = prompt_text.index("What This Capability Should Plan:")
+        objective_section = prompt_text[objective_section_start:capability_section_start]
+        capability_section = prompt_text[capability_section_start:]
+
+        self.assertIn("Objective id: `app-a`", objective_section)
+        self.assertIn(
+            "Use this handle to match related roles, reports, artifacts, and prior planning context for the same objective.",
+            objective_section,
+        )
+        self.assertNotIn("Plan frontend discovery work for app-a", objective_section)
+        self.assertNotIn("Plan frontend discovery work for app-a", capability_section)
+        self.assertIn(
+            "Plan the frontend-owned user flows, UI states, and client-side rules for this phase.",
+            capability_section,
+        )
 
     def test_build_capability_planning_payload_surfaces_existing_required_output_paths(self) -> None:
         scaffold_planning_run(self.project_root, "existing-required-outputs", ["frontend"])
@@ -8977,6 +12342,189 @@ url = "https://example.com/mcp"
             [{"output_id": "frontend-entrypoint", "path": "apps/todo/frontend/src/index.js"}],
         )
 
+    def test_build_capability_planning_payload_normalizes_backend_contract_outputs_into_run_file_graph(self) -> None:
+        scaffold_planning_run(self.project_root, "backend-contract-graph", ["backend"])
+        generic_root = self.project_root / "orchestrator" / "roles" / "objectives" / "app-a"
+        app_role_root = self.project_root / "apps" / "todo" / "orchestrator" / "roles" / "objectives" / "app-a"
+        app_role_root.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(generic_root, app_role_root)
+        shutil.rmtree(generic_root)
+        backend_root = self.project_root / "apps" / "todo" / "backend"
+        (backend_root / "src" / "server.js").parent.mkdir(parents=True, exist_ok=True)
+        (backend_root / "src" / "server.js").write_text("module.exports = {};\n", encoding="utf-8")
+
+        outline = objective_outline_for_objective("backend-contract-graph", "app-a", ["backend"])
+        outline["phase"] = "mvp-build"
+        outline["capability_lanes"][0]["expected_outputs"] = [
+            {
+                "kind": "artifact",
+                "output_id": "backend_api_entrypoint",
+                "path": "apps/todo/backend/src/server.ts",
+                "asset_id": None,
+                "description": None,
+                "evidence": None,
+            },
+            {
+                "kind": "artifact",
+                "output_id": "backend_todo_routes",
+                "path": "apps/todo/backend/src/routes/todos.ts",
+                "asset_id": None,
+                "description": None,
+                "evidence": None,
+            },
+            {
+                "kind": "artifact",
+                "output_id": "backend_todo_persistence_layer",
+                "path": "apps/todo/backend/src/persistence/todoStore.ts",
+                "asset_id": None,
+                "description": None,
+                "evidence": None,
+            },
+        ]
+
+        payload = build_capability_planning_payload(
+            self.project_root,
+            "backend-contract-graph",
+            "app-a",
+            "backend",
+            outline,
+        )
+
+        output_paths = [item["path"] for item in payload["allowed_final_outputs_exact"]]
+        self.assertEqual(
+            output_paths,
+            [
+                "apps/todo/backend/src/server.js",
+                "apps/todo/backend/src/routes/todos.js",
+                "apps/todo/backend/src/persistence/todoStore.js",
+            ],
+        )
+        self.assertEqual(
+            [item["path"] for item in payload["capability_lane"]["expected_outputs"]],
+            output_paths,
+        )
+        graph = load_run_file_graph(self.project_root / "runs" / "backend-contract-graph")
+        self.assertIsNotNone(graph)
+        capability_state = graph["phases"]["mvp-build"]["objectives"]["app-a"]["capabilities"]["backend"]
+        self.assertEqual(capability_state["workspace_language"], "javascript")
+        self.assertEqual(
+            capability_state["path_mapping"]["apps/todo/backend/src/server.ts"],
+            "apps/todo/backend/src/server.js",
+        )
+
+    def test_render_capability_planning_prompt_uses_normalized_backend_contract_paths(self) -> None:
+        scaffold_planning_run(self.project_root, "backend-contract-prompt", ["backend"])
+        generic_root = self.project_root / "orchestrator" / "roles" / "objectives" / "app-a"
+        app_role_root = self.project_root / "apps" / "todo" / "orchestrator" / "roles" / "objectives" / "app-a"
+        app_role_root.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(generic_root, app_role_root)
+        shutil.rmtree(generic_root)
+        backend_root = self.project_root / "apps" / "todo" / "backend"
+        (backend_root / "src" / "server.js").parent.mkdir(parents=True, exist_ok=True)
+        (backend_root / "src" / "server.js").write_text("module.exports = {};\n", encoding="utf-8")
+
+        outline = objective_outline_for_objective("backend-contract-prompt", "app-a", ["backend"])
+        outline["phase"] = "mvp-build"
+        outline["capability_lanes"][0]["expected_outputs"] = [
+            {
+                "kind": "artifact",
+                "output_id": "backend_api_entrypoint",
+                "path": "apps/todo/backend/src/server.ts",
+                "asset_id": None,
+                "description": None,
+                "evidence": None,
+            }
+        ]
+
+        metadata = render_capability_planning_prompt(
+            self.project_root,
+            "backend-contract-prompt",
+            "app-a",
+            "backend",
+            outline,
+        )
+        prompt_text = (self.project_root / metadata["prompt_path"]).read_text(encoding="utf-8")
+
+        self.assertIn("apps/todo/backend/src/server.js", prompt_text)
+        self.assertNotIn("apps/todo/backend/src/server.ts", prompt_text)
+
+    def test_update_run_file_graph_capability_plan_records_task_runtime_requirements(self) -> None:
+        plan = {
+            "schema": "capability-plan.v1",
+            "run_id": "graph-runtime-reqs",
+            "phase": "discovery",
+            "objective_id": "app-a",
+            "capability": "backend",
+            "tasks": [
+                {
+                    "task_id": "backend-discovery-reconciliation",
+                    "execution_mode": "read_only",
+                    "expected_outputs": [
+                        {
+                            "kind": "assertion",
+                            "output_id": "backend_discovery_scope_assertion",
+                            "path": None,
+                            "asset_id": None,
+                            "description": "Discovery scope assertion",
+                            "evidence": {
+                                "validation_ids": ["validate-backend-bootstrap"],
+                                "artifact_paths": [],
+                            },
+                        }
+                    ],
+                    "writes_existing_paths": [],
+                    "owned_paths": [],
+                    "validation": [
+                        {
+                            "id": "validate-backend-bootstrap",
+                            "command": "npm run validate:todo-backend-bootstrap",
+                        }
+                    ],
+                }
+            ],
+        }
+        run_dir = self.project_root / "runs" / "graph-runtime-reqs"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        update_run_file_graph_capability_plan(
+            run_dir,
+            phase="discovery",
+            objective_id="app-a",
+            capability="backend",
+            plan=plan,
+        )
+
+        graph = load_run_file_graph(run_dir)
+        task_state = graph["phases"]["discovery"]["objectives"]["app-a"]["capabilities"]["backend"][
+            "accepted_plan_task_files"
+        ]["backend-discovery-reconciliation"]
+        self.assertEqual(task_state["execution_mode"], "read_only")
+        self.assertEqual(
+            task_state["runtime_requirements"],
+            {
+                "declares_concrete_file_outputs": False,
+                "requires_writable_temp": True,
+                "requires_writable_workspace": False,
+            },
+        )
+
+    def test_infer_task_runtime_requirements_marks_node_test_validation_as_temp_writable(self) -> None:
+        requirements = infer_task_runtime_requirements(
+            {
+                "expected_outputs": [],
+                "writes_existing_paths": [],
+                "validation": [
+                    {
+                        "id": "validate-foo",
+                        "command": "CI=1 node --no-warnings --test apps/todo/backend/test/bootstrap.test.js",
+                    }
+                ],
+            }
+        )
+
+        self.assertTrue(requirements["requires_writable_temp"])
+        self.assertFalse(requirements["requires_writable_workspace"])
+        self.assertFalse(requirements["declares_concrete_file_outputs"])
+
     def test_note_activity_stream_updates_inflight_observability_summary(self) -> None:
         scaffold_smoke_test(self.project_root, "stream-observability")
         ensure_activity(
@@ -9008,6 +12556,70 @@ url = "https://example.com/mcp"
         self.assertEqual(summary["active_processes"], 1)
         self.assertEqual(summary["active_stream_stdout_bytes"], 12)
         self.assertEqual(summary["active_stream_stderr_bytes"], 4)
+
+    def test_handle_codex_event_line_records_debug_timestamps(self) -> None:
+        scaffold_smoke_test(self.project_root, "debug-timestamps")
+        ensure_activity(
+            self.project_root,
+            "debug-timestamps",
+            activity_id="APP-A-SMOKE-001",
+            kind="task_execution",
+            entity_id="APP-A-SMOKE-001",
+            phase="discovery",
+            objective_id="app-a",
+            display_name="APP-A-SMOKE-001",
+            assigned_role="objectives.app-a.frontend-worker",
+            status="prompt_rendered",
+            progress_stage="prompt_rendered",
+            current_activity="Rendered task prompt.",
+            prompt_path="runs/debug-timestamps/prompt-logs/APP-A-SMOKE-001.prompt.md",
+            stdout_path="runs/debug-timestamps/executions/APP-A-SMOKE-001.stdout.jsonl",
+            stderr_path="runs/debug-timestamps/executions/APP-A-SMOKE-001.stderr.log",
+            output_path="runs/debug-timestamps/reports/APP-A-SMOKE-001.json",
+            dependency_blockers=[],
+            observability={"prompt_char_count": 100, "prompt_line_count": 10, "prompt_bytes": 100},
+        )
+        update_activity(
+            self.project_root,
+            "debug-timestamps",
+            "APP-A-SMOKE-001",
+            status="launching",
+            progress_stage="launching",
+            current_activity="Launching worker.",
+        )
+        handle_codex_event_line(
+            self.project_root,
+            "debug-timestamps",
+            "discovery",
+            "APP-A-SMOKE-001",
+            '{"type":"thread.started","thread_id":"thread-debug"}',
+        )
+        handle_codex_event_line(
+            self.project_root,
+            "debug-timestamps",
+            "discovery",
+            "APP-A-SMOKE-001",
+            '{"type":"turn.started"}',
+        )
+        handle_codex_event_line(
+            self.project_root,
+            "debug-timestamps",
+            "discovery",
+            "APP-A-SMOKE-001",
+            '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":5}}',
+        )
+
+        activity = read_activity(self.project_root, "debug-timestamps", "APP-A-SMOKE-001")
+        observability = activity["observability"]
+        self.assertIsNotNone(observability["submitted_at"])
+        self.assertIsNotNone(observability["launched_at"])
+        self.assertIsNotNone(observability["thread_started_at"])
+        self.assertIsNotNone(observability["turn_started_at"])
+        self.assertIsNotNone(observability["first_stream_at"])
+        self.assertIsNotNone(observability["turn_completed_at"])
+        self.assertGreaterEqual(observability["wall_clock_ms"], 0)
+        self.assertGreaterEqual(observability["processing_ms"], 0)
+        self.assertGreaterEqual(observability["time_to_first_stream_ms"], 0)
 
     def test_recovery_ignores_prompt_metadata_when_scanning_capability_plans(self) -> None:
         scaffold_planning_run(self.project_root, "recover-prompt-json", ["frontend"])
@@ -9104,6 +12716,83 @@ url = "https://example.com/mcp"
         self.assertEqual(summary["bundle_ids"], ["app-a-bundle-discovery-core"])
         manager_plan = read_json(self.project_root / "runs" / "planned-bundles" / "manager-plans" / "discovery-app-a.json")
         self.assertEqual(manager_plan["bundle_plan"][0]["bundle_id"], "app-a-bundle-discovery-core")
+
+    def test_execute_planning_activity_strips_assigned_role_from_persisted_last_message(self) -> None:
+        scaffold_planning_run(self.project_root, "planned-last-message-strip", ["frontend"])
+        raw_payload = {
+            "schema": "capability-plan.v1",
+            "run_id": "planned-last-message-strip",
+            "phase": "discovery",
+            "objective_id": "app-a",
+            "capability": "frontend",
+            "summary": "summary",
+            "tasks": [
+                {
+                    "task_id": "APP-A-FRONTEND-001",
+                    "capability": "frontend",
+                    "assigned_role": "frontend-worker",
+                    "execution_mode": "isolated_write",
+                    "parallel_policy": "serialize",
+                    "owned_paths": ["apps/todo/frontend/docs/discovery.md"],
+                    "writes_existing_paths": [],
+                    "shared_asset_ids": [],
+                    "objective": "Write the discovery summary.",
+                    "inputs": ["Planning Inputs.goal_context"],
+                    "expected_outputs": [],
+                    "done_when": ["done"],
+                    "depends_on": [],
+                    "validation": [],
+                    "collaboration_rules": [],
+                    "working_directory": None,
+                    "additional_directories": [],
+                }
+            ],
+            "bundle_plan": [],
+            "dependency_notes": [],
+            "collaboration_handoffs": [],
+        }
+        stdout = "\n".join(
+            [
+                '{"type":"thread.started","thread_id":"capability-thread-strip"}',
+                '{"type":"turn.started"}',
+                json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(raw_payload)}),
+                '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
+            ]
+        )
+
+        with patch(
+            "company_orchestrator.objective_planner.run_codex_command",
+            return_value=completed_process(stdout=stdout, stderr="", returncode=0),
+        ):
+            result = execute_planning_activity(
+                self.project_root,
+                "planned-last-message-strip",
+                phase="discovery",
+                activity_id="plan:discovery:app-a:frontend",
+                kind="capability_plan",
+                entity_id="app-a:frontend",
+                display_name="Frontend discovery planning",
+                assigned_role="objectives.app-a.frontend-manager",
+                prompt_metadata={"prompt_path": "runs/planned-last-message-strip/manager-plans/discovery-app-a-frontend.prompt.md"},
+                execution_prompt="prompt",
+                output_schema_name="capability-plan.v1",
+                output_prefix="discovery-app-a-frontend",
+                failure_label="frontend planning",
+                sandbox_mode="read-only",
+                codex_path="codex",
+                timeout_seconds=30,
+                planning_limiter=PlanningLimiter(max_concurrency=1),
+            )
+
+        self.assertNotIn("assigned_role", json.dumps(result["payload"], sort_keys=True))
+        last_message = read_json(
+            self.project_root
+            / "runs"
+            / "planned-last-message-strip"
+            / "manager-plans"
+            / "discovery-app-a-frontend.last-message.json"
+        )
+        self.assertNotIn("assigned_role", json.dumps(last_message, sort_keys=True))
 
     def test_plan_objective_aggregates_capability_manager_plans(self) -> None:
         scaffold_planning_run(self.project_root, "planned-capability", ["frontend", "backend"])
@@ -9972,7 +13661,7 @@ url = "https://example.com/mcp"
     def test_plan_objective_timeout_preserves_partial_logs(self) -> None:
         import subprocess
 
-        scaffold_planning_run(self.project_root, "planned-timeout", ["frontend"])
+        scaffold_planning_run(self.project_root, "planned-timeout", ["frontend", "backend"])
         timeout_error = subprocess.TimeoutExpired(
             cmd=["codex", "exec"],
             timeout=7,
@@ -10025,9 +13714,12 @@ url = "https://example.com/mcp"
     def test_plan_objective_retries_timeout_when_using_policy_defaults(self) -> None:
         import subprocess
 
-        scaffold_planning_run(self.project_root, "planned-timeout-retry", ["frontend"])
-        outline = objective_outline_for_objective("planned-timeout-retry", "app-a", ["frontend"])
+        scaffold_planning_run(self.project_root, "planned-timeout-retry", ["frontend", "backend"])
+        outline = objective_outline_for_objective("planned-timeout-retry", "app-a", ["frontend", "backend"])
         capability_plan = capability_plan_for_objective("planned-timeout-retry", "app-a", "frontend")
+        backend_plan = capability_plan_for_objective("planned-timeout-retry", "app-a", "backend")
+        capability_plan["tasks"][0].pop("assigned_role", None)
+        backend_plan["tasks"][0].pop("assigned_role", None)
         timeout_error = subprocess.TimeoutExpired(
             cmd=["codex", "exec"],
             timeout=600,
@@ -10058,13 +13750,54 @@ url = "https://example.com/mcp"
             stderr="",
             returncode=0,
         )
-        with patch("company_orchestrator.objective_planner.run_codex_command", side_effect=[timeout_error, objective_completed, capability_completed]):
+        backend_completed = completed_process(
+            stdout="\n".join(
+                [
+                    '{"type":"thread.started","thread_id":"backend-timeout-retry"}',
+                    '{"type":"turn.started"}',
+                    json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(backend_plan)}),
+                    '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}',
+                ]
+            ),
+            stderr="",
+            returncode=0,
+        )
+        with patch(
+            "company_orchestrator.objective_planner.run_codex_command",
+            side_effect=[timeout_error, objective_completed, capability_completed, backend_completed],
+        ):
             summary = plan_objective(self.project_root, "planned-timeout-retry", "app-a", timeout_seconds=None)
         self.assertIn(summary["recovery_action"], {"timeout_retry", "planning_repair"})
         activity = read_activity(self.project_root, "planned-timeout-retry", "plan:discovery:app-a")
         self.assertEqual(activity["status"], "recovered")
         events = read_json_lines(self.project_root / "runs" / "planned-timeout-retry" / "live" / "events.jsonl")
         self.assertIn("planning.timeout_retry_scheduled", {event["event_type"] for event in events})
+        attempt_one_stdout = (
+            self.project_root / "runs" / "planned-timeout-retry" / "manager-plans" / "discovery-app-a.stdout.jsonl"
+        )
+        attempt_one_stderr = (
+            self.project_root / "runs" / "planned-timeout-retry" / "manager-plans" / "discovery-app-a.stderr.log"
+        )
+        attempt_two_stdout = (
+            self.project_root / "runs" / "planned-timeout-retry" / "manager-plans" / "discovery-app-a.attempt-2.stdout.jsonl"
+        )
+        attempt_two_stderr = (
+            self.project_root / "runs" / "planned-timeout-retry" / "manager-plans" / "discovery-app-a.attempt-2.stderr.log"
+        )
+        self.assertTrue(attempt_one_stdout.exists())
+        self.assertTrue(attempt_one_stderr.exists())
+        self.assertTrue(attempt_two_stdout.exists())
+        self.assertTrue(attempt_two_stderr.exists())
+        self.assertIn("plan-timeout-retry", attempt_one_stdout.read_text(encoding="utf-8"))
+        self.assertIn("manager still reasoning", attempt_one_stderr.read_text(encoding="utf-8"))
+        self.assertEqual(
+            activity["stdout_path"],
+            "runs/planned-timeout-retry/manager-plans/discovery-app-a.attempt-2.stdout.jsonl",
+        )
+        self.assertEqual(
+            activity["stderr_path"],
+            "runs/planned-timeout-retry/manager-plans/discovery-app-a.attempt-2.stderr.log",
+        )
 
     def test_plan_objective_retries_missing_final_agent_message_once(self) -> None:
         scaffold_planning_run(self.project_root, "planned-missing-final-message", ["frontend"])
@@ -10353,6 +14086,207 @@ url = "https://example.com/mcp"
         self.assertIn("planning.repair_requested", {event["event_type"] for event in events})
         self.assertIn("planning.repair_completed", {event["event_type"] for event in events})
 
+    def test_normalize_capability_plan_canonicalizes_assertion_output_paths(self) -> None:
+        scaffold_planning_run(self.project_root, "planned-capability-assertion-sanitized", ["frontend"])
+        outline = objective_outline_for_objective("planned-capability-assertion-sanitized", "app-a", ["frontend"])
+        outline["phase"] = "design"
+        outline["capability_lanes"][0]["expected_outputs"] = [
+            {
+                "kind": "assertion",
+                "output_id": "frontend_design_scope_reconciled",
+                "path": None,
+                "asset_id": None,
+                "description": "Frontend design scope was reconciled.",
+                "evidence": {"validation_ids": ["manager-check"], "artifact_paths": []},
+            }
+        ]
+        capability_plan = capability_plan_for_objective(
+            "planned-capability-assertion-sanitized",
+            "app-a",
+            "frontend",
+        )
+        capability_plan["phase"] = "design"
+        capability_plan["tasks"][0]["inputs"] = []
+        capability_plan["tasks"][0]["expected_outputs"] = [
+            {
+                "kind": "assertion",
+                "output_id": "frontend_design_scope_reconciled",
+                "path": "apps/todo/frontend/design/scope.md",
+                "asset_id": None,
+                "description": "Frontend design scope was reconciled.",
+                "evidence": {"validation_ids": ["manager-check"], "artifact_paths": []},
+            }
+        ]
+
+        normalized, _ = normalize_capability_plan(
+            self.project_root,
+            capability_plan,
+            run_id="planned-capability-assertion-sanitized",
+            phase="design",
+            objective_id="app-a",
+            capability="frontend",
+            objective_outline=outline,
+            default_sandbox_mode="read-only",
+        )
+
+        self.assertEqual(normalized["tasks"][0]["expected_outputs"][0]["kind"], "assertion")
+        self.assertIsNone(normalized["tasks"][0]["expected_outputs"][0]["path"])
+
+    def test_normalize_capability_plan_backfills_identity_and_task_metadata(self) -> None:
+        scaffold_planning_run(self.project_root, "planned-capability-backfill", ["frontend"])
+        outline = objective_outline_for_objective("planned-capability-backfill", "app-a", ["frontend"])
+        outline["phase"] = "design"
+        outline["capability_lanes"][0]["expected_outputs"] = [
+            {
+                "kind": "assertion",
+                "output_id": "frontend_design_scope_reconciled",
+                "path": None,
+                "asset_id": None,
+                "description": "Frontend design scope was reconciled.",
+                "evidence": {"validation_ids": ["manager-check"], "artifact_paths": []},
+            }
+        ]
+        capability_plan = {
+            "schema": "capability-plan.v1",
+            "summary": "frontend capability plan",
+            "tasks": [
+                {
+                    "task_id": "APP-A-FRONTEND-001",
+                    "execution_mode": "read_only",
+                    "parallel_policy": "allow",
+                    "writes_existing_paths": [],
+                    "owned_paths": [],
+                    "shared_asset_ids": [],
+                    "objective": "Validate frontend design scope.",
+                    "inputs": [],
+                    "expected_outputs": [
+                        {
+                            "kind": "assertion",
+                            "output_id": "frontend_design_scope_reconciled",
+                            "path": None,
+                            "asset_id": None,
+                            "description": "Frontend design scope was reconciled.",
+                            "evidence": {"validation_ids": ["manager-check"], "artifact_paths": []},
+                        }
+                    ],
+                    "done_when": ["frontend scope is reconciled"],
+                    "depends_on": [],
+                    "validation": [{"id": "manager-check", "command": "true"}],
+                    "collaboration_rules": [],
+                    "working_directory": None,
+                    "additional_directories": [],
+                    "sandbox_mode": "read-only",
+                }
+            ],
+            "bundle_plan": [],
+            "dependency_notes": [],
+            "collaboration_handoffs": [],
+        }
+
+        normalized, adjustments = normalize_capability_plan(
+            self.project_root,
+            capability_plan,
+            run_id="planned-capability-backfill",
+            phase="design",
+            objective_id="app-a",
+            capability="frontend",
+            objective_outline=outline,
+            default_sandbox_mode="read-only",
+        )
+
+        self.assertEqual(normalized["run_id"], "planned-capability-backfill")
+        self.assertEqual(normalized["phase"], "design")
+        self.assertEqual(normalized["objective_id"], "app-a")
+        self.assertEqual(normalized["capability"], "frontend")
+        self.assertEqual(normalized["tasks"][0]["capability"], "frontend")
+        self.assertEqual(normalized["tasks"][0]["assigned_role"], "objectives.app-a.frontend-worker")
+        self.assertEqual(adjustments["capability"]["to"], "frontend")
+
+    def test_normalize_task_execution_metadata_canonicalizes_assertion_output_paths(self) -> None:
+        payload = {
+            "schema": "capability-plan.v1",
+            "run_id": "task-exec-assertion-sanitized",
+            "phase": "design",
+            "objective_id": "app-a",
+            "capability": "frontend",
+            "summary": "frontend capability plan",
+            "tasks": [
+                {
+                    "task_id": "APP-A-FRONTEND-001",
+                    "capability": "frontend",
+                    "assigned_role": "objectives.app-a.frontend-worker",
+                    "execution_mode": "read_only",
+                    "parallel_policy": "allow",
+                    "writes_existing_paths": [],
+                    "owned_paths": [],
+                    "shared_asset_ids": [],
+                    "objective": "Validate frontend design scope.",
+                    "inputs": [],
+                    "expected_outputs": [
+                        {
+                            "kind": "assertion",
+                            "output_id": "frontend_design_scope_reconciled",
+                            "path": "apps/todo/frontend/design/scope.md",
+                            "asset_id": None,
+                            "description": "Frontend design scope was reconciled.",
+                            "evidence": {"validation_ids": ["manager-check"], "artifact_paths": []},
+                        }
+                    ],
+                    "done_when": ["frontend scope is reconciled"],
+                    "depends_on": [],
+                    "validation": [{"id": "manager-check", "command": "true"}],
+                    "collaboration_rules": [],
+                    "working_directory": None,
+                    "additional_directories": [],
+                    "sandbox_mode": "read-only",
+                }
+            ],
+            "bundle_plan": [],
+            "dependency_notes": [],
+            "collaboration_handoffs": [],
+        }
+
+        normalize_task_execution_metadata(
+            self.project_root,
+            "app-a",
+            "frontend",
+            payload,
+            run_id="task-exec-assertion-sanitized",
+            default_sandbox_mode="read-only",
+        )
+
+        self.assertIsNone(payload["tasks"][0]["expected_outputs"][0]["path"])
+
+    def test_normalize_objective_outline_canonicalizes_assertion_output_paths(self) -> None:
+        scaffold_planning_run(self.project_root, "planned-outline-assertion-sanitized", ["frontend"])
+        outline = objective_outline_for_objective("planned-outline-assertion-sanitized", "app-a", ["frontend"])
+        outline["phase"] = "design"
+        outline["capability_lanes"][0]["expected_outputs"] = [
+            {
+                "kind": "assertion",
+                "output_id": "frontend_design_scope_reconciled",
+                "path": "apps/todo/frontend/design/scope.md",
+                "asset_id": None,
+                "description": "Frontend design scope was reconciled.",
+                "evidence": {"validation_ids": ["manager-check"], "artifact_paths": []},
+            }
+        ]
+
+        normalized, _ = normalize_objective_outline(
+            self.project_root,
+            outline,
+            run_id="planned-outline-assertion-sanitized",
+            phase="design",
+            objective={
+                "objective_id": "app-a",
+                "capabilities": ["frontend"],
+            },
+        )
+
+        lane_output = normalized["capability_lanes"][0]["expected_outputs"][0]
+        self.assertEqual(lane_output["kind"], "assertion")
+        self.assertIsNone(lane_output["path"])
+
     def test_render_capability_planning_prompt_includes_manager_repair_context(self) -> None:
         scaffold_planning_run(self.project_root, "bundle-repair-prompt", ["frontend"])
         objective_outline = objective_outline_for_objective("bundle-repair-prompt", "app-a", ["frontend"])
@@ -10371,9 +14305,39 @@ url = "https://example.com/mcp"
             },
         )
         prompt_text = (self.project_root / metadata["prompt_path"]).read_text(encoding="utf-8")
-        self.assertIn("# Manager Repair Context", prompt_text)
-        self.assertIn("frontend-review-bundle", prompt_text)
+        self.assertIn("# Repair Issue", prompt_text)
+        self.assertIn("Repair the plan after bundle rejection.", prompt_text)
         self.assertIn("validation smoke did not pass", prompt_text)
+
+    def test_planning_repair_payload_slice_strips_assigned_role(self) -> None:
+        previous_payload = {
+            "schema": "capability-plan.v1",
+            "run_id": "run-a",
+            "phase": "discovery",
+            "objective_id": "app-a",
+            "capability": "frontend",
+            "summary": "summary",
+            "tasks": [
+                {
+                    "task_id": "APP-A-FRONTEND-001",
+                    "capability": "frontend",
+                    "assigned_role": "frontend-worker",
+                    "inputs": ["Planning Inputs.goal_context"],
+                    "expected_outputs": [],
+                    "depends_on": [],
+                }
+            ],
+            "bundle_plan": [{"bundle_id": "bundle-a", "task_ids": ["APP-A-FRONTEND-001"], "summary": "bundle"}],
+            "collaboration_handoffs": [],
+            "dependency_notes": [],
+        }
+
+        sliced = planning_repair_payload_slice(
+            previous_payload,
+            validation_error="Capability plan assigned unknown worker role frontend-worker",
+        )
+
+        self.assertNotIn("assigned_role", json.dumps(sliced, sort_keys=True))
 
     def test_render_capability_planning_prompt_compacts_polish_release_repair_context(self) -> None:
         scaffold_planning_run(self.project_root, "compact-release-repair-prompt", ["middleware"])
@@ -10458,9 +14422,8 @@ url = "https://example.com/mcp"
         repair_prompt = (self.project_root / repair_metadata["prompt_path"]).read_text(encoding="utf-8")
         self.assertLess(repair_metadata["prompt_char_count"], normal_metadata["prompt_char_count"])
         self.assertIn("apps/todo/runtime/src/frontend-server.js", repair_prompt)
-        self.assertIn('"phase_report_paths": []', repair_prompt)
-        self.assertIn("# Canonical Release Repair Inputs", repair_prompt)
-        self.assertIn("Planning Inputs.release_repair_inputs", repair_prompt)
+        self.assertIn('"approved_scope_overrides": []', repair_prompt)
+        self.assertIn("Release repair evidence", repair_prompt)
 
     def test_plan_capability_retries_stalled_polish_release_repair_with_compact_prompt(self) -> None:
         scaffold_planning_run(self.project_root, "compact-release-repair-retry", ["middleware"])
@@ -10627,6 +14590,103 @@ url = "https://example.com/mcp"
         events = read_json_lines(run_dir / "live" / "events.jsonl")
         self.assertIn("planning.reuse_outline", {event["event_type"] for event in events})
 
+    def test_normalize_capability_plan_rewrites_run_relative_task_paths_to_active_run(self) -> None:
+        scaffold_planning_run(self.project_root, "rewrite-capability-run-paths", ["frontend"])
+        run_dir = self.project_root / "runs" / "rewrite-capability-run-paths"
+        phase_plan = read_json(run_dir / "phase-plan.json")
+        phase_plan["current_phase"] = "polish"
+        for item in phase_plan["phases"]:
+            item["status"] = "complete" if item["phase"] != "polish" else "active"
+        write_json(run_dir / "phase-plan.json", phase_plan)
+
+        objective_outline = objective_outline_for_objective("rewrite-capability-run-paths", "app-a", ["frontend"])
+        objective_outline["phase"] = "polish"
+        objective_outline["capability_lanes"][0]["expected_outputs"] = [
+            {
+                "kind": "artifact",
+                "output_id": "frontend-polish-release-readiness",
+                "path": "runs/phase5-todo-full-018/reports/frontend-polish-release-readiness.json",
+                "asset_id": None,
+                "description": None,
+                "evidence": None,
+            }
+        ]
+        write_json(
+            run_dir / "reports" / "frontend-polish-client-hardening.json",
+            {
+                "schema": "completion-report.v1",
+                "run_id": "rewrite-capability-run-paths",
+                "phase": "polish",
+                "objective_id": "app-a",
+                "task_id": "frontend-polish-client-hardening",
+                "agent_role": "objectives.app-a.frontend-worker",
+                "status": "ready_for_bundle_review",
+                "summary": "Frontend polish hardening report.",
+                "artifacts": [],
+                "validation_results": [],
+                "open_issues": [],
+                "change_requests": [],
+            },
+        )
+
+        payload = capability_plan_for_objective("phase5-todo-full-018", "app-a", "frontend")
+        payload["phase"] = "polish"
+        payload["summary"] = "Frontend polish repair plan."
+        payload["tasks"][0]["task_id"] = "frontend-polish-release-readiness"
+        payload["tasks"][0]["inputs"] = [
+            "runs/phase5-todo-full-018/reports/frontend-polish-client-hardening.json",
+        ]
+        payload["tasks"][0]["expected_outputs"] = [
+            {
+                "kind": "artifact",
+                "output_id": "frontend-polish-release-readiness",
+                "path": "runs/phase5-todo-full-018/reports/frontend-polish-release-readiness.json",
+                "asset_id": None,
+                "description": None,
+                "evidence": None,
+            }
+        ]
+        payload["tasks"][0]["owned_paths"] = [
+            "runs/phase5-todo-full-018/reports/frontend-polish-release-readiness.json",
+        ]
+        payload["tasks"][0]["validation"] = [
+            {
+                "id": "validate-release",
+                "command": "node -e \"require('fs').mkdirSync('runs/phase5-todo-full-018/reports',{recursive:true})\"",
+            }
+        ]
+        payload["bundle_plan"] = []
+
+        normalized, adjustments = normalize_capability_plan(
+            self.project_root,
+            payload,
+            run_id="rewrite-capability-run-paths",
+            phase="polish",
+            objective_id="app-a",
+            capability="frontend",
+            objective_outline=objective_outline,
+            default_sandbox_mode="read-only",
+        )
+
+        self.assertEqual(adjustments["run_id"], {"from": "phase5-todo-full-018", "to": "rewrite-capability-run-paths"})
+        task = normalized["tasks"][0]
+        self.assertEqual(
+            task["inputs"],
+            ["runs/rewrite-capability-run-paths/reports/frontend-polish-client-hardening.json"],
+        )
+        self.assertEqual(
+            task["expected_outputs"][0]["path"],
+            "runs/rewrite-capability-run-paths/reports/frontend-polish-release-readiness.json",
+        )
+        self.assertEqual(
+            task["owned_paths"],
+            ["runs/rewrite-capability-run-paths/reports/frontend-polish-release-readiness.json"],
+        )
+        self.assertIn(
+            "runs/rewrite-capability-run-paths/reports",
+            task["validation"][0]["command"],
+        )
+
     def test_finalize_objective_bundle_repairs_rejected_bundle_once(self) -> None:
         scaffold_planning_run(self.project_root, "bundle-repair", ["frontend"])
         run_dir = self.project_root / "runs" / "bundle-repair"
@@ -10737,6 +14797,506 @@ url = "https://example.com/mcp"
         self.assertIn("bundle.repair_requested", {event["event_type"] for event in events})
         self.assertIn("bundle.repair_completed", {event["event_type"] for event in events})
 
+    def test_attempt_bundle_repair_prefers_task_repair_for_validation_scope_blockers(self) -> None:
+        scaffold_planning_run(self.project_root, "bundle-task-repair", ["frontend"])
+        run_dir = self.project_root / "runs" / "bundle-task-repair"
+        task = {
+            "schema": "task-assignment.v1",
+            "run_id": "bundle-task-repair",
+            "phase": "mvp-build",
+            "objective_id": "app-a",
+            "capability": "frontend",
+            "task_id": "frontend_crud_tests",
+            "assigned_role": "objectives.app-a.frontend-worker",
+            "manager_role": "objectives.app-a.objective-manager",
+            "acceptance_role": "objectives.app-a.acceptance-manager",
+            "objective": "Create CRUD coverage.",
+            "inputs": ["Planning Inputs.goal_markdown"],
+            "expected_outputs": [{"output_id": "crud-tests", "path": "apps/todo/frontend/test/todos-crud.test.js"}],
+            "done_when": ["crud coverage exists"],
+            "depends_on": [],
+            "execution_mode": "read_only",
+            "parallel_policy": "allow",
+            "owned_paths": ["apps/todo/frontend/test/todos-crud.test.js"],
+            "writes_existing_paths": [],
+            "shared_asset_ids": [],
+            "validation": [{"id": "run_frontend_crud_tests", "command": "npm test -- --runTestsByPath apps/todo/frontend/test/todos-crud.test.js"}],
+            "collaboration_rules": [],
+            "working_directory": None,
+            "additional_directories": [],
+            "sandbox_mode": "read-only",
+        }
+        write_json(run_dir / "tasks" / "frontend_crud_tests.json", task)
+        report = {
+            "schema": "completion-report.v1",
+            "run_id": "bundle-task-repair",
+            "phase": "mvp-build",
+            "objective_id": "app-a",
+            "task_id": "frontend_crud_tests",
+            "agent_role": "objectives.app-a.frontend-worker",
+            "status": "blocked",
+            "summary": "Owned test passes in isolation but required validation is over-broad.",
+            "artifacts": [{"path": "apps/todo/frontend/test/todos-crud.test.js", "status": "created"}],
+            "validation_results": [
+                {"id": "run_frontend_crud_tests", "status": "failed", "evidence": "Repo test script ran unrelated tests."}
+            ],
+            "open_issues": [],
+            "blockers": [
+                {
+                    "kind": "validation_command_scope",
+                    "summary": "Validation command ran unrelated tests.",
+                    "details": "Repo-root npm test script ignored path narrowing.",
+                    "related_paths": ["apps/todo/frontend/test/todos-crud.test.js", "package.json"],
+                    "related_validation_ids": ["run_frontend_crud_tests"],
+                    "suggested_owner_capability": None,
+                }
+            ],
+        }
+        write_json(run_dir / "reports" / "frontend_crud_tests.json", report)
+        bundle = {
+            "bundle_id": "frontend-mvp-bundle",
+            "phase": "mvp-build",
+            "objective_id": "app-a",
+            "included_tasks": ["frontend_crud_tests"],
+            "status": "rejected",
+            "rejection_reasons": [
+                "frontend_crud_tests: status is blocked",
+                "frontend_crud_tests: validation run_frontend_crud_tests did not pass",
+            ],
+        }
+
+        with (
+            patch(
+                "company_orchestrator.management.schedule_tasks",
+                return_value={"phase": "mvp-build", "executed": ["frontend_crud_tests"], "failures": []},
+            ) as schedule_mock,
+            patch(
+                "company_orchestrator.management.finalize_objective_bundle",
+                return_value={"objective_id": "app-a", "status": "accepted", "bundle_ids": ["frontend-mvp-bundle"]},
+            ) as finalize_mock,
+            patch("company_orchestrator.management.plan_objective") as plan_mock,
+        ):
+            summary = attempt_bundle_repair(
+                self.project_root,
+                "bundle-task-repair",
+                phase="mvp-build",
+                objective_id="app-a",
+                bundle=bundle,
+                sandbox_mode="read-only",
+                codex_path="codex",
+                timeout_seconds=600,
+                max_concurrency=2,
+            )
+
+        self.assertEqual(summary["status"], "accepted")
+        plan_mock.assert_not_called()
+        schedule_mock.assert_called_once()
+        finalize_mock.assert_called_once()
+        events = read_json_lines(run_dir / "live" / "events.jsonl")
+        repair_request = next(event for event in events if event["event_type"] == "bundle.repair_requested")
+        self.assertEqual(repair_request["payload"]["repair_strategy"], "task_repair")
+
+    def test_choose_bundle_repair_strategy_prefers_run_state_repair_for_ownership_boundary(self) -> None:
+        scaffold_planning_run(self.project_root, "bundle-run-state-repair", ["frontend"])
+        run_dir = self.project_root / "runs" / "bundle-run-state-repair"
+        write_json(
+            run_dir / "reports" / "frontend_todo_crud_verification.json",
+            {
+                "schema": "completion-report.v1",
+                "run_id": "bundle-run-state-repair",
+                "phase": "mvp-build",
+                "objective_id": "app-a",
+                "task_id": "frontend_todo_crud_verification",
+                "agent_role": "objectives.app-a.frontend-worker",
+                "status": "blocked",
+                "summary": "Run-local frontend state is stale.",
+                "artifacts": [{"path": "apps/todo/frontend/test/todos-crud.test.js", "status": "created"}],
+                "validation_results": [
+                    {"id": "validate_todo_frontend_flows", "status": "failed", "evidence": "index export mismatch"}
+                ],
+                "blockers": [
+                    {
+                        "kind": "ownership_boundary",
+                        "summary": "Needed upstream frontend file is outside task ownership.",
+                        "details": "The retry workspace needs a repaired frontend entrypoint before this verification task can finish.",
+                        "related_paths": [
+                            "apps/todo/frontend/src/index.js",
+                            "apps/todo/frontend/test/todos-crud.test.js",
+                        ],
+                    }
+                ],
+            },
+        )
+
+        strategy = choose_bundle_repair_strategy(
+            self.project_root,
+            "bundle-run-state-repair",
+            bundle={"included_tasks": ["frontend_todo_crud_verification"]},
+        )
+
+        self.assertEqual(strategy["strategy"], "run_state_repair")
+        self.assertEqual(strategy["task_ids"], ["frontend_todo_crud_verification"])
+
+    def test_attempt_bundle_repair_prefers_run_state_repair_for_ownership_boundary(self) -> None:
+        scaffold_planning_run(self.project_root, "bundle-run-state-repair-exec", ["frontend"])
+        run_dir = self.project_root / "runs" / "bundle-run-state-repair-exec"
+        task = {
+            "schema": "task-assignment.v1",
+            "run_id": "bundle-run-state-repair-exec",
+            "phase": "mvp-build",
+            "objective_id": "app-a",
+            "capability": "frontend",
+            "task_id": "frontend_todo_crud_verification",
+            "assigned_role": "objectives.app-a.frontend-worker",
+            "manager_role": "objectives.app-a.objective-manager",
+            "acceptance_role": "objectives.app-a.acceptance-manager",
+            "objective": "Verify frontend CRUD flows.",
+            "inputs": ["Planning Inputs.goal_markdown"],
+            "expected_outputs": [{"output_id": "crud-tests", "path": "apps/todo/frontend/test/todos-crud.test.js"}],
+            "done_when": ["frontend CRUD validation passes"],
+            "depends_on": [],
+            "execution_mode": "read_only",
+            "parallel_policy": "allow",
+            "owned_paths": ["apps/todo/frontend/test/todos-crud.test.js"],
+            "writes_existing_paths": [],
+            "shared_asset_ids": [],
+            "validation": [{"id": "validate_todo_frontend_flows", "command": "npm run validate:todo-frontend-flows"}],
+            "collaboration_rules": [],
+            "working_directory": None,
+            "additional_directories": [],
+            "sandbox_mode": "read-only",
+        }
+        write_json(run_dir / "tasks" / "frontend_todo_crud_verification.json", task)
+        write_json(
+            run_dir / "reports" / "frontend_todo_crud_verification.json",
+            {
+                "schema": "completion-report.v1",
+                "run_id": "bundle-run-state-repair-exec",
+                "phase": "mvp-build",
+                "objective_id": "app-a",
+                "task_id": "frontend_todo_crud_verification",
+                "agent_role": "objectives.app-a.frontend-worker",
+                "status": "blocked",
+                "summary": "Run-local frontend state is stale.",
+                "artifacts": [{"path": "apps/todo/frontend/test/todos-crud.test.js", "status": "created"}],
+                "validation_results": [
+                    {"id": "validate_todo_frontend_flows", "status": "failed", "evidence": "index export mismatch"}
+                ],
+                "blockers": [
+                    {
+                        "kind": "ownership_boundary",
+                        "summary": "Needed upstream frontend file is outside task ownership.",
+                        "details": "The retry workspace needs a repaired frontend entrypoint before this verification task can finish.",
+                        "related_paths": [
+                            "apps/todo/frontend/src/index.js",
+                            "apps/todo/frontend/test/todos-crud.test.js",
+                        ],
+                    }
+                ],
+            },
+        )
+        bundle = {
+            "bundle_id": "frontend-crud-bundle",
+            "phase": "mvp-build",
+            "objective_id": "app-a",
+            "included_tasks": ["frontend_todo_crud_verification"],
+            "status": "rejected",
+            "rejection_reasons": ["frontend_todo_crud_verification: status is blocked"],
+        }
+
+        with (
+            patch(
+                "company_orchestrator.management.schedule_tasks",
+                return_value={"phase": "mvp-build", "executed": ["frontend_todo_crud_verification"], "failures": []},
+            ) as schedule_mock,
+            patch(
+                "company_orchestrator.management.finalize_objective_bundle",
+                return_value={"objective_id": "app-a", "status": "accepted", "bundle_ids": ["frontend-crud-bundle"]},
+            ) as finalize_mock,
+            patch("company_orchestrator.management.plan_objective") as plan_mock,
+        ):
+            summary = attempt_bundle_repair(
+                self.project_root,
+                "bundle-run-state-repair-exec",
+                phase="mvp-build",
+                objective_id="app-a",
+                bundle=bundle,
+                sandbox_mode="read-only",
+                codex_path="codex",
+                timeout_seconds=600,
+                max_concurrency=2,
+            )
+
+        self.assertEqual(summary["status"], "accepted")
+        plan_mock.assert_not_called()
+        schedule_mock.assert_called_once()
+        finalize_mock.assert_called_once()
+        events = read_json_lines(run_dir / "live" / "events.jsonl")
+        repair_request = next(event for event in events if event["event_type"] == "bundle.repair_requested")
+        self.assertEqual(repair_request["payload"]["repair_strategy"], "run_state_repair")
+        repair_completed = next(event for event in events if event["event_type"] == "bundle.repair_completed")
+        self.assertEqual(repair_completed["payload"]["repair_mode"], "run_state_first")
+
+    def test_choose_bundle_repair_strategy_uses_broad_task_retry_for_structural_failure(self) -> None:
+        scaffold_planning_run(self.project_root, "bundle-broad-retry-strategy", ["frontend"])
+        run_dir = self.project_root / "runs" / "bundle-broad-retry-strategy"
+        write_json(
+            run_dir / "reports" / "frontend_polish_fixup.json",
+            {
+                "schema": "completion-report.v1",
+                "run_id": "bundle-broad-retry-strategy",
+                "phase": "polish",
+                "objective_id": "app-a",
+                "task_id": "frontend_polish_fixup",
+                "agent_role": "objectives.app-a.frontend-worker",
+                "status": "blocked",
+                "summary": "Frontend polish hit a backend contract mismatch.",
+                "artifacts": [{"path": "apps/todo/frontend/src/index.js", "status": "updated"}],
+                "validation_results": [
+                    {"id": "validate_todo_frontend_client_errors", "status": "failed", "evidence": "backend createTodo missing"}
+                ],
+                "blockers": [
+                    {
+                        "kind": "contract_conflict",
+                        "summary": "Backend runtime contract does not match frontend expectation.",
+                        "details": "The retry should attempt a direct fix before the system replans.",
+                        "related_paths": [
+                            "apps/todo/backend/src/routes/todos.js",
+                            "apps/todo/backend/src/server.js",
+                            "apps/todo/frontend/src/index.js",
+                        ],
+                    }
+                ],
+            },
+        )
+
+        strategy = choose_bundle_repair_strategy(
+            self.project_root,
+            "bundle-broad-retry-strategy",
+            bundle={"included_tasks": ["frontend_polish_fixup"]},
+        )
+
+        self.assertEqual(strategy["strategy"], "broad_task_repair")
+        self.assertEqual(strategy["task_ids"], ["frontend_polish_fixup"])
+
+    def test_attempt_bundle_repair_runs_broad_task_retry_before_replan(self) -> None:
+        scaffold_planning_run(self.project_root, "bundle-broad-retry-exec", ["frontend"])
+        run_dir = self.project_root / "runs" / "bundle-broad-retry-exec"
+        task = {
+            "schema": "task-assignment.v1",
+            "run_id": "bundle-broad-retry-exec",
+            "phase": "polish",
+            "objective_id": "app-a",
+            "capability": "frontend",
+            "task_id": "frontend_polish_fixup",
+            "assigned_role": "objectives.app-a.frontend-worker",
+            "manager_role": "objectives.app-a.objective-manager",
+            "acceptance_role": "objectives.app-a.acceptance-manager",
+            "objective": "Fix the final frontend validation failure.",
+            "inputs": ["Planning Inputs.goal_markdown"],
+            "expected_outputs": [{"output_id": "frontend_entry", "path": "apps/todo/frontend/src/index.js"}],
+            "done_when": ["frontend polish validation passes"],
+            "depends_on": [],
+            "execution_mode": "read_only",
+            "parallel_policy": "allow",
+            "owned_paths": ["apps/todo/frontend/src/index.js"],
+            "writes_existing_paths": [],
+            "shared_asset_ids": [],
+            "validation": [{"id": "validate_todo_frontend_client_errors", "command": "npm run validate:todo-frontend-client-errors"}],
+            "collaboration_rules": [],
+            "working_directory": None,
+            "additional_directories": [],
+            "sandbox_mode": "read-only",
+        }
+        write_json(run_dir / "tasks" / "frontend_polish_fixup.json", task)
+        write_json(
+            run_dir / "reports" / "frontend_polish_fixup.json",
+            {
+                "schema": "completion-report.v1",
+                "run_id": "bundle-broad-retry-exec",
+                "phase": "polish",
+                "objective_id": "app-a",
+                "task_id": "frontend_polish_fixup",
+                "agent_role": "objectives.app-a.frontend-worker",
+                "status": "blocked",
+                "summary": "Frontend polish hit a backend contract mismatch.",
+                "artifacts": [{"path": "apps/todo/frontend/src/index.js", "status": "updated"}],
+                "validation_results": [
+                    {"id": "validate_todo_frontend_client_errors", "status": "failed", "evidence": "backend createTodo missing"}
+                ],
+                "blockers": [
+                    {
+                        "kind": "contract_conflict",
+                        "summary": "Backend runtime contract does not match frontend expectation.",
+                        "details": "The retry should attempt a direct fix before the system replans.",
+                        "related_paths": [
+                            "apps/todo/backend/src/routes/todos.js",
+                            "apps/todo/backend/src/server.js",
+                            "apps/todo/frontend/src/index.js",
+                        ],
+                    }
+                ],
+            },
+        )
+        bundle = {
+            "bundle_id": "frontend-polish-bundle",
+            "phase": "polish",
+            "objective_id": "app-a",
+            "included_tasks": ["frontend_polish_fixup"],
+            "status": "rejected",
+            "rejection_reasons": ["frontend_polish_fixup: status is blocked"],
+        }
+
+        with (
+            patch(
+                "company_orchestrator.management.schedule_tasks",
+                return_value={"phase": "polish", "executed": ["frontend_polish_fixup"], "failures": []},
+            ) as schedule_mock,
+            patch(
+                "company_orchestrator.management.finalize_objective_bundle",
+                return_value={"objective_id": "app-a", "status": "accepted", "bundle_ids": ["frontend-polish-bundle"]},
+            ) as finalize_mock,
+            patch("company_orchestrator.management.plan_objective") as plan_mock,
+        ):
+            summary = attempt_bundle_repair(
+                self.project_root,
+                "bundle-broad-retry-exec",
+                phase="polish",
+                objective_id="app-a",
+                bundle=bundle,
+                sandbox_mode="read-only",
+                codex_path="codex",
+                timeout_seconds=600,
+                max_concurrency=2,
+            )
+
+        self.assertEqual(summary["status"], "accepted")
+        plan_mock.assert_not_called()
+        schedule_mock.assert_called_once()
+        finalize_mock.assert_called_once()
+        events = read_json_lines(run_dir / "live" / "events.jsonl")
+        repair_request = next(event for event in events if event["event_type"] == "bundle.repair_requested")
+        self.assertEqual(repair_request["payload"]["repair_strategy"], "broad_task_repair")
+        repair_completed = next(event for event in events if event["event_type"] == "bundle.repair_completed")
+        self.assertEqual(repair_completed["payload"]["repair_mode"], "broad_task_first")
+
+    def test_apply_repair_context_to_task_widens_broad_retry_surface(self) -> None:
+        task = {
+            "task_id": "frontend_polish_fixup",
+            "owned_paths": ["apps/todo/frontend/src/index.js"],
+            "writes_existing_paths": [],
+            "expected_outputs": [{"output_id": "frontend_entry", "path": "apps/todo/frontend/src/index.js"}],
+        }
+        repair_context = build_bundle_broad_retry_context(
+            bundle={"bundle_id": "frontend-polish-bundle"},
+            report={
+                "task_id": "frontend_polish_fixup",
+                "objective_id": "app-a",
+                "blockers": [
+                    {
+                        "kind": "contract_conflict",
+                        "summary": "Backend runtime contract does not match frontend expectation.",
+                        "details": "The retry should attempt a direct fix before replanning.",
+                        "related_paths": ["apps/todo/backend/src/routes/todos.js"],
+                    }
+                ],
+                "validation_results": [],
+                "artifacts": [],
+            },
+            task=task,
+        )
+
+        adjusted = apply_repair_context_to_task(task, repair_context)
+
+        self.assertIn("apps/todo/backend/src/routes/todos.js", adjusted["writes_existing_paths"])
+        self.assertIn("apps/todo/backend/src/routes/todos.js", adjusted["owned_paths"])
+
+    def test_build_execution_repair_section_marks_broad_retry(self) -> None:
+        section = build_execution_repair_section(
+            {
+                "source": "bundle_broad_retry",
+                "summary": "Mandatory first retry for this rejected bundle.",
+                "allow_broadening_scope": True,
+                "failures": [
+                    {
+                        "source_test": "validate_todo_frontend_client_errors",
+                        "excerpt": "backend createTodo missing",
+                        "paths": ["apps/todo/backend/src/server.js"],
+                    }
+                ],
+            }
+        )
+
+        self.assertIn("mandatory first broad retry", section)
+        self.assertIn("upstream or adjacent files", section)
+
+    def test_apply_repair_context_to_task_widens_run_state_repair_surface(self) -> None:
+        task = {
+            "task_id": "frontend_todo_crud_verification",
+            "owned_paths": ["apps/todo/frontend/test/todos-crud.test.js"],
+            "writes_existing_paths": [],
+            "expected_outputs": [{"output_id": "crud-tests", "path": "apps/todo/frontend/test/todos-crud.test.js"}],
+        }
+        repair_context = build_bundle_run_state_repair_context(
+            bundle={"bundle_id": "frontend-crud-bundle"},
+            report={
+                "task_id": "frontend_todo_crud_verification",
+                "objective_id": "app-a",
+                "blockers": [
+                    {
+                        "kind": "ownership_boundary",
+                        "summary": "Needed upstream file is outside task ownership.",
+                        "details": "Repair upstream stale state first.",
+                        "related_paths": ["apps/todo/frontend/src/index.js"],
+                    }
+                ],
+                "validation_results": [],
+                "artifacts": [],
+            },
+        )
+
+        adjusted = apply_repair_context_to_task(task, repair_context)
+
+        self.assertIn("apps/todo/frontend/src/index.js", adjusted["writes_existing_paths"])
+        self.assertIn("apps/todo/frontend/src/index.js", adjusted["owned_paths"])
+
+    def test_apply_run_state_repair_preflight_syncs_repo_files_into_run_workspaces(self) -> None:
+        write_text(
+            self.project_root / "apps" / "todo" / "frontend" / "src" / "index.js",
+            "export const createTodoApiClient = () => 'repo';\n",
+        )
+        integration_root = self.project_root / ".orchestrator-worktrees" / "repair-run" / "integration"
+        task_root = self.project_root / ".orchestrator-worktrees" / "repair-run" / "tasks" / "frontend_todo_crud_verification"
+        write_text(
+            integration_root / "apps" / "todo" / "frontend" / "src" / "index.js",
+            "export const createTodosApi = () => 'stale';\n",
+        )
+        write_text(
+            task_root / "apps" / "todo" / "frontend" / "src" / "index.js",
+            "export const createTodosApi = () => 'stale';\n",
+        )
+
+        repaired = apply_run_state_repair_preflight(
+            self.project_root,
+            "repair-run",
+            {"task_id": "frontend_todo_crud_verification"},
+            TaskExecutionRuntime(workspace_path=str(task_root)),
+            {
+                "source": "run_state_repair",
+                "focus_paths": ["apps/todo/frontend/src/index.js"],
+            },
+        )
+
+        self.assertEqual(repaired, ["apps/todo/frontend/src/index.js"])
+        self.assertEqual(
+            read_text(integration_root / "apps" / "todo" / "frontend" / "src" / "index.js"),
+            "export const createTodoApiClient = () => 'repo';\n",
+        )
+        self.assertEqual(
+            read_text(task_root / "apps" / "todo" / "frontend" / "src" / "index.js"),
+            "export const createTodoApiClient = () => 'repo';\n",
+        )
+
     def test_finalize_objective_bundle_stops_after_single_bundle_repair_attempt(self) -> None:
         scaffold_planning_run(self.project_root, "bundle-repair-fail", ["frontend"])
         run_dir = self.project_root / "runs" / "bundle-repair-fail"
@@ -10827,6 +15387,118 @@ url = "https://example.com/mcp"
             sum(1 for event in events if event["event_type"] == "bundle.repair_requested"),
         )
         self.assertIn("bundle.repair_failed", {event["event_type"] for event in events})
+
+    def test_finalize_objective_bundle_reuses_existing_landed_bundle_for_skipped_tasks(self) -> None:
+        scaffold_planning_run(self.project_root, "bundle-reuse", ["backend"])
+        run_dir = self.project_root / "runs" / "bundle-reuse"
+        task = {
+            "schema": "task-assignment.v1",
+            "run_id": "bundle-reuse",
+            "phase": "design",
+            "objective_id": "app-a",
+            "capability": "backend",
+            "task_id": "APP-A-BACKEND-001",
+            "assigned_role": "objectives.app-a.backend-worker",
+            "manager_role": "objectives.app-a.objective-manager",
+            "acceptance_role": "objectives.app-a.acceptance-manager",
+            "objective": "Produce backend design package.",
+            "inputs": [],
+            "expected_outputs": [
+                {
+                    "kind": "artifact",
+                    "output_id": "backend-design",
+                    "path": "apps/todo/backend/design/api-contract.md",
+                    "asset_id": None,
+                    "description": None,
+                    "evidence": None,
+                }
+            ],
+            "done_when": ["backend design package is complete"],
+            "depends_on": [],
+            "execution_mode": "isolated_write",
+            "parallel_policy": "allow",
+            "owned_paths": ["apps/todo/backend/design/api-contract.md"],
+            "writes_existing_paths": [],
+            "shared_asset_ids": [],
+            "validation": [],
+            "collaboration_rules": [],
+            "working_directory": None,
+            "additional_directories": [],
+            "sandbox_mode": "read-only",
+        }
+        write_json(run_dir / "tasks" / "APP-A-BACKEND-001.json", task)
+        write_json(
+            run_dir / "reports" / "APP-A-BACKEND-001.json",
+            {
+                "schema": "completion-report.v1",
+                "run_id": "bundle-reuse",
+                "phase": "design",
+                "objective_id": "app-a",
+                "task_id": "APP-A-BACKEND-001",
+                "agent_role": "objectives.app-a.backend-worker",
+                "status": "ready_for_bundle_review",
+                "summary": "Existing backend design package.",
+                "artifacts": [],
+                "validation_results": [],
+                "open_issues": [],
+                "change_requests": [],
+            },
+        )
+        write_json(
+            run_dir / "bundles" / "backend-review-bundle.json",
+            {
+                "schema": "review-bundle.v1",
+                "run_id": "bundle-reuse",
+                "phase": "design",
+                "objective_id": "app-a",
+                "bundle_id": "backend-review-bundle",
+                "assembled_by": "objectives.app-a.objective-manager",
+                "reviewed_by": "objectives.app-a.acceptance-manager",
+                "included_tasks": ["APP-A-BACKEND-001"],
+                "status": "accepted",
+                "rejection_reasons": [],
+                "landing_results": [
+                    {
+                        "task_id": "APP-A-BACKEND-001",
+                        "status": "merged",
+                        "branch_name": "codex/task-bundle-reuse-app-a-backend-001",
+                        "workspace_path": ".orchestrator-worktrees/bundle-reuse/integration",
+                        "conflict_summary_path": None,
+                        "discarded_paths": [],
+                        "sanitized_commit_sha": None,
+                    }
+                ],
+            },
+        )
+
+        with (
+            patch("company_orchestrator.management.objective_plan_has_no_phase_work", return_value=False),
+            patch(
+                "company_orchestrator.management.objective_bundle_specs",
+                return_value=[{"bundle_id": "backend-review-bundle", "task_ids": ["APP-A-BACKEND-001"], "summary": "bundle"}],
+            ),
+            patch("company_orchestrator.management.assemble_review_bundle") as assemble_mock,
+            patch("company_orchestrator.management.review_bundle") as review_mock,
+            patch("company_orchestrator.management.land_accepted_bundle") as landing_mock,
+        ):
+            summary = finalize_objective_bundle(
+                self.project_root,
+                "bundle-reuse",
+                "design",
+                "app-a",
+                sandbox_mode="read-only",
+                codex_path="codex",
+                timeout_seconds=600,
+                max_concurrency=2,
+                scheduler_summary={"executed": [], "skipped_existing": ["APP-A-BACKEND-001"]},
+            )
+
+        self.assertEqual(summary["status"], "accepted")
+        assemble_mock.assert_not_called()
+        review_mock.assert_not_called()
+        landing_mock.assert_not_called()
+        events = read_json_lines(run_dir / "live" / "events.jsonl")
+        self.assertIn("bundle.reused_existing", {event["event_type"] for event in events})
 
     def test_run_phase_uses_manager_generated_bundle_plan(self) -> None:
         scaffold_planning_run(self.project_root, "planned-phase", ["frontend"])
@@ -10964,11 +15636,23 @@ url = "https://example.com/mcp"
         }
         stale_bundle = dict(required_bundle)
         stale_bundle["bundle_id"] = "stale-old-bundle"
+        stale_blocked_bundle = dict(required_bundle)
+        stale_blocked_bundle["bundle_id"] = "stale-blocked-bundle"
+        stale_blocked_bundle["status"] = "blocked"
+        stale_blocked_bundle["rejection_reasons"] = ["stale blocked bundle"]
+        stale_rejected_bundle = dict(required_bundle)
+        stale_rejected_bundle["bundle_id"] = "stale-rejected-bundle"
+        stale_rejected_bundle["status"] = "rejected"
+        stale_rejected_bundle["rejection_reasons"] = ["stale rejected bundle"]
         write_json(self.project_root / "runs" / "stale-bundles" / "bundles" / "app-a-required-bundle.json", required_bundle)
         write_json(self.project_root / "runs" / "stale-bundles" / "bundles" / "stale-old-bundle.json", stale_bundle)
+        write_json(self.project_root / "runs" / "stale-bundles" / "bundles" / "stale-blocked-bundle.json", stale_blocked_bundle)
+        write_json(self.project_root / "runs" / "stale-bundles" / "bundles" / "stale-rejected-bundle.json", stale_rejected_bundle)
         report, _ = generate_phase_report(self.project_root, "stale-bundles")
         self.assertEqual(report["objective_outcomes"][0]["accepted_bundles"], ["app-a-required-bundle"])
+        self.assertEqual(report["objective_outcomes"][0]["status"], "accepted")
         self.assertEqual(report["accepted_bundles"], ["app-a-required-bundle"])
+        self.assertEqual(report["unresolved_risks"], [])
 
     def test_plan_phase_runs_all_objective_managers(self) -> None:
         scaffold_dual_planning_run(self.project_root, "plan-phase")
@@ -11034,18 +15718,72 @@ url = "https://example.com/mcp"
         self.assertEqual(planner.call_count, 2)
         self.assertGreaterEqual(max_active, 2)
 
+    def test_plan_phase_pre_registers_queued_objective_activities(self) -> None:
+        scaffold_dual_planning_run(self.project_root, "plan-phase-queued")
+        started = threading.Event()
+        release = threading.Event()
+
+        def fake_plan_objective(
+            project_root: Path,
+            run_id: str,
+            objective_id: str,
+            **kwargs: object,
+        ) -> dict[str, object]:
+            started.set()
+            release.wait(timeout=2)
+            return {
+                "run_id": run_id,
+                "phase": "discovery",
+                "objective_id": objective_id,
+                "plan_path": f"runs/{run_id}/manager-plans/discovery-{objective_id}.json",
+                "task_ids": [],
+                "bundle_ids": [],
+                "handoff_ids": [],
+            }
+
+        result_holder: dict[str, object] = {}
+        error_holder: dict[str, BaseException] = {}
+
+        def worker() -> None:
+            try:
+                result_holder["summary"] = plan_phase(self.project_root, "plan-phase-queued", max_concurrency=1)
+            except BaseException as exc:  # pragma: no cover
+                error_holder["error"] = exc
+
+        with (
+            patch("company_orchestrator.objective_planner.plan_objective", side_effect=fake_plan_objective),
+            patch(
+                "company_orchestrator.objective_planner.write_phase_plan_summary",
+                return_value={"phase": "discovery", "planned_objectives": [], "max_concurrency": 1},
+            ),
+        ):
+            thread = threading.Thread(target=worker)
+            thread.start()
+            started.wait(timeout=1)
+
+            first = read_activity(self.project_root, "plan-phase-queued", "plan:discovery:app-a")
+            second = read_activity(self.project_root, "plan-phase-queued", "plan:discovery:app-b")
+
+            self.assertEqual(first["status"], "running")
+            self.assertEqual(second["status"], "queued")
+            self.assertEqual(second["queue_position"], 1)
+
+            release.set()
+            thread.join(timeout=2)
+
+        self.assertNotIn("error", error_holder)
+        self.assertIn("summary", result_holder)
+
     def test_monitoring_renderers_show_sections_and_prompt_details(self) -> None:
         scaffold_smoke_test(self.project_root, "monitor")
         final_payload = {
             "summary": "Finished the smoke task.",
             "status": "ready_for_bundle_review",
             "artifacts": [],
-            "validation_results": [],
-            "legacy_dependency_notes": [],
+            "validation_results": [{"id": "context-echo", "status": "passed", "evidence": "mock-runtime"}],
             "open_issues": [],
-            "legacy_follow_ups": [],
-            "context_echo": None,
-            "collaboration_request": None,
+            "blockers": [],
+            "produced_output_ids": ["smoke.context-echo"],
         }
         stdout = "\n".join(
             [
@@ -11082,11 +15820,79 @@ url = "https://example.com/mcp"
         console.print(build_activity_detail(self.project_root, "monitor", "APP-A-SMOKE-001", events=10))
         detail_output = console.export_text()
         self.assertIn("Prompt", detail_output)
-        self.assertIn("Task Assignment", detail_output)
+        self.assertIn("# Assignment", detail_output)
         self.assertIn("Latest Events", detail_output)
         self.assertIn("Display ID", detail_output)
         self.assertIn("Elapsed:", detail_output)
         self.assertIn("Last event age:", detail_output)
+        self.assertIn("Prompt size:", detail_output)
+        self.assertIn("Submitted:", detail_output)
+        self.assertIn("Latency:", detail_output)
+
+    def test_debug_prompt_view_shows_prompt_metadata_and_body(self) -> None:
+        scaffold_smoke_test(self.project_root, "debug-prompt-view")
+        final_payload = {
+            "summary": "Finished the smoke task.",
+            "status": "ready_for_bundle_review",
+            "artifacts": [],
+            "validation_results": [{"id": "context-echo", "status": "passed", "evidence": "mock-runtime"}],
+            "open_issues": [],
+            "blockers": [],
+            "produced_output_ids": ["smoke.context-echo"],
+        }
+        stdout = "\n".join(
+            [
+                '{"type":"thread.started","thread_id":"thread-debug-prompt"}',
+                '{"type":"turn.started"}',
+                json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(final_payload)}),
+                '{"type":"turn.completed","usage":{"input_tokens":11,"cached_input_tokens":3,"output_tokens":7}}',
+            ]
+        )
+        completed = completed_process(stdout=stdout, stderr="", returncode=0)
+        with patch("company_orchestrator.executor.run_codex_command", return_value=completed):
+            execute_task(self.project_root, "debug-prompt-view", "APP-A-SMOKE-001")
+
+        console = Console(record=True, width=160)
+        console.print(build_prompt_debug_detail(self.project_root, "debug-prompt-view", "APP-A-SMOKE-001", events=10, show_body=True))
+        output = console.export_text()
+        self.assertIn("Prompt Debug", output)
+        self.assertIn("Prompt size:", output)
+        self.assertIn("Queue wait:", output)
+        self.assertIn("Time to first stream:", output)
+        self.assertIn("Wall clock:", output)
+        self.assertIn("Tokens: in=", output)
+        self.assertIn("Prompt Body", output)
+        self.assertIn("# Assignment", output)
+
+    def test_debug_prompt_view_hides_prompt_body_when_requested(self) -> None:
+        scaffold_smoke_test(self.project_root, "debug-prompt-cli")
+        final_payload = {
+            "summary": "Finished the smoke task.",
+            "status": "ready_for_bundle_review",
+            "artifacts": [],
+            "validation_results": [{"id": "context-echo", "status": "passed", "evidence": "mock-runtime"}],
+            "open_issues": [],
+            "blockers": [],
+            "produced_output_ids": ["smoke.context-echo"],
+        }
+        stdout = "\n".join(
+            [
+                '{"type":"thread.started","thread_id":"thread-debug-cli"}',
+                '{"type":"turn.started"}',
+                json_line_event("item.completed", {"id": "item_0", "type": "agent_message", "text": json.dumps(final_payload)}),
+                '{"type":"turn.completed","usage":{"input_tokens":9,"cached_input_tokens":1,"output_tokens":4}}',
+            ]
+        )
+        completed = completed_process(stdout=stdout, stderr="", returncode=0)
+        with patch("company_orchestrator.executor.run_codex_command", return_value=completed):
+            execute_task(self.project_root, "debug-prompt-cli", "APP-A-SMOKE-001")
+
+        console = Console(record=True, width=160)
+        console.print(build_prompt_debug_detail(self.project_root, "debug-prompt-cli", "APP-A-SMOKE-001", events=10, show_body=False))
+        rendered = console.export_text()
+        self.assertIn("Prompt Debug", rendered)
+        self.assertIn("Prompt size:", rendered)
+        self.assertNotIn("Prompt Body", rendered)
 
     def test_inspect_activity_reports_missing_activity_cleanly(self) -> None:
         scaffold_smoke_test(self.project_root, "missing-activity")
@@ -11142,6 +15948,25 @@ url = "https://example.com/mcp"
         self.assertEqual(print_result_mock.call_args.kwargs["run_id"], "watch-cli-json")
         self.assertTrue(print_result_mock.call_args.kwargs["leading_blank_line"])
         self.assertTrue(print_result_mock.call_args.kwargs["json_output"])
+
+    def test_cli_run_autonomous_no_review_gates_maps_to_none(self) -> None:
+        scaffold_smoke_test(self.project_root, "watch-auto-none")
+        argv = [
+            "company-orchestrator",
+            "--project-root",
+            str(self.project_root),
+            "run-autonomous",
+            "watch-auto-none",
+            "--no-review-gates",
+        ]
+        with (
+            patch.object(sys, "argv", argv),
+            patch("company_orchestrator.cli.run_autonomous", return_value={"status": "running"}) as run_auto_mock,
+            patch("company_orchestrator.cli.run_maybe_watched", side_effect=lambda *_args: _args[-1]()),
+            patch("company_orchestrator.cli.print_result"),
+        ):
+            cli_main()
+        self.assertEqual(run_auto_mock.call_args.kwargs["approval_scope"], "none")
 
     def test_bootstrap_run_initializes_run_and_invokes_first_plan(self) -> None:
         goal_path = REPO_ROOT / "apps" / "todo" / "goal-draft.md"
@@ -11419,6 +16244,74 @@ url = "https://example.com/mcp"
         self.assertIn("Process missing", activity["status_reason"])
         self.assertEqual(summary["activities"][0]["status"], "interrupted")
 
+    def test_reconcile_run_marks_stale_objective_plan_interrupted_when_process_is_missing(self) -> None:
+        scaffold_planning_run(self.project_root, "recover-plan-stale", ["frontend"])
+        ensure_activity(
+            self.project_root,
+            "recover-plan-stale",
+            activity_id="plan:discovery:app-a",
+            kind="objective_plan",
+            entity_id="app-a",
+            phase="discovery",
+            objective_id="app-a",
+            display_name="Plan app-a",
+            assigned_role="objectives.app-a.objective-manager",
+            status="running",
+            progress_stage="running",
+            current_activity="Planning objective.",
+            prompt_path="runs/recover-plan-stale/manager-plans/discovery-app-a.prompt.md",
+            stdout_path="runs/recover-plan-stale/manager-plans/discovery-app-a.stdout.jsonl",
+            stderr_path="runs/recover-plan-stale/manager-plans/discovery-app-a.stderr.log",
+            output_path="runs/recover-plan-stale/manager-plans/discovery-app-a.json",
+            dependency_blockers=[],
+            process_metadata={"pid": 999999, "started_at": "2026-03-10T00:00:00Z", "command": "codex exec", "cwd": str(self.project_root)},
+        )
+
+        summary = reconcile_run(self.project_root, "recover-plan-stale", apply=True)
+
+        activity = read_activity(self.project_root, "recover-plan-stale", "plan:discovery:app-a")
+        run_state = read_json(self.project_root / "runs" / "recover-plan-stale" / "live" / "run-state.json")
+        self.assertEqual(activity["status"], "interrupted")
+        self.assertIn("Process missing", activity["status_reason"])
+        self.assertEqual(summary["activities"][0]["status"], "interrupted")
+        self.assertEqual(run_state["active_activity_ids"], [])
+
+    def test_reconcile_run_marks_stale_objective_plan_recovered_from_valid_plan(self) -> None:
+        scaffold_planning_run(self.project_root, "recover-plan-report", ["frontend"])
+        write_json(
+            self.project_root / "runs" / "recover-plan-report" / "manager-plans" / "discovery-app-a.json",
+            planned_payload_for_objective("recover-plan-report", "app-a"),
+        )
+        ensure_activity(
+            self.project_root,
+            "recover-plan-report",
+            activity_id="plan:discovery:app-a",
+            kind="objective_plan",
+            entity_id="app-a",
+            phase="discovery",
+            objective_id="app-a",
+            display_name="Plan app-a",
+            assigned_role="objectives.app-a.objective-manager",
+            status="running",
+            progress_stage="running",
+            current_activity="Planning objective.",
+            prompt_path="runs/recover-plan-report/manager-plans/discovery-app-a.prompt.md",
+            stdout_path="runs/recover-plan-report/manager-plans/discovery-app-a.stdout.jsonl",
+            stderr_path="runs/recover-plan-report/manager-plans/discovery-app-a.stderr.log",
+            output_path="runs/recover-plan-report/manager-plans/discovery-app-a.json",
+            dependency_blockers=[],
+            process_metadata={"pid": 999999, "started_at": "2026-03-10T00:00:00Z", "command": "codex exec", "cwd": str(self.project_root)},
+        )
+
+        reconcile_run(self.project_root, "recover-plan-report", apply=True)
+
+        activity = read_activity(self.project_root, "recover-plan-report", "plan:discovery:app-a")
+        run_state = read_json(self.project_root / "runs" / "recover-plan-report" / "live" / "run-state.json")
+        self.assertEqual(activity["status"], "recovered")
+        self.assertIsNotNone(activity["recovered_at"])
+        self.assertEqual(activity["recovery_action"], "validated_artifact")
+        self.assertEqual(run_state["active_activity_ids"], [])
+
     def test_reconcile_run_marks_stale_task_recovered_from_existing_report(self) -> None:
         scaffold_smoke_test(self.project_root, "recover-report")
         write_managed_report(
@@ -11453,6 +16346,275 @@ url = "https://example.com/mcp"
         self.assertEqual(activity["status"], "ready_for_bundle_review")
         self.assertIsNotNone(activity["recovered_at"])
         self.assertEqual(activity["recovery_action"], "validated_artifact")
+
+    def test_reconcile_run_stops_stale_active_autonomy_on_hold_without_live_work(self) -> None:
+        scaffold_smoke_test(self.project_root, "recover-autonomy-hold")
+        run_dir = self.project_root / "runs" / "recover-autonomy-hold"
+        phase_plan = read_json(run_dir / "phase-plan.json")
+        phase_plan["current_phase"] = "polish"
+        for index, item in enumerate(phase_plan["phases"]):
+            if item["phase"] == "polish":
+                item["status"] = "active"
+            elif index < 3:
+                item["status"] = "complete"
+                item["human_approved"] = True
+        write_json(run_dir / "phase-plan.json", phase_plan)
+        write_json(
+            run_dir / "phase-reports" / "polish.json",
+            {
+                "schema": "phase-report.v1",
+                "run_id": "recover-autonomy-hold",
+                "phase": "polish",
+                "summary": "Polish is on hold.",
+                "objective_outcomes": [],
+                "accepted_bundles": [],
+                "unresolved_risks": ["blocked_validation"],
+                "parallelism_summary": {
+                    "total_tasks_considered": 0,
+                    "tasks_run_in_parallel": 0,
+                    "tasks_serialized_by_policy": 0,
+                    "tasks_serialized_by_runtime_conflict": 0,
+                    "incidents": [],
+                },
+                "collaboration_summary": {
+                    "total_handoffs": 0,
+                    "blocking_handoffs": 0,
+                    "satisfied_handoffs": 0,
+                    "pending_handoffs": 0,
+                    "blocked_handoffs": 0,
+                    "handoffs_by_objective": [],
+                    "incidents": [],
+                },
+                "observability_summary": {
+                    "total_calls": 0,
+                    "completed_calls": 0,
+                    "failed_calls": 0,
+                    "timed_out_calls": 0,
+                    "retry_scheduled_calls": 0,
+                    "total_input_tokens": 0,
+                    "total_cached_input_tokens": 0,
+                    "total_output_tokens": 0,
+                    "total_prompt_chars": 0,
+                    "total_prompt_lines": 0,
+                    "average_latency_ms": 0,
+                    "max_latency_ms": 0,
+                    "average_queue_wait_ms": 0,
+                },
+                "recovery_summary": {
+                    "interrupted_activities": 0,
+                    "recovered_activities": 0,
+                    "abandoned_attempts": 0,
+                    "incidents": [],
+                },
+                "release_validation_summary": {
+                    "status": "failed",
+                    "report_path": "runs/recover-autonomy-hold/phase-reports/polish-release-validation.json",
+                    "attempt": 2,
+                    "evaluation_mode": "task_validation_checklist",
+                    "summary": "Polish validation still fails.",
+                    "items": [],
+                    "failure_diagnostics": [],
+                },
+                "proposed_role_changes": [],
+                "recommendation": "hold",
+                "human_approved": False,
+            },
+        )
+        state = default_autonomy_state("recover-autonomy-hold")
+        state.update(
+            {
+                "enabled": True,
+                "status": "active",
+                "active_phase": "polish",
+                "started_at": "2026-04-05T00:00:00Z",
+            }
+        )
+        write_json(run_dir / "autonomy.json", state)
+
+        reconcile_run(self.project_root, "recover-autonomy-hold", apply=True)
+
+        autonomy_state = read_json(run_dir / "autonomy.json")
+        self.assertEqual(autonomy_state["status"], "stopped")
+        self.assertEqual(autonomy_state["stop_phase"], "polish")
+        self.assertEqual(autonomy_state["stop_reason"], "Phase is on hold and no live work remains.")
+
+    def test_reconcile_run_keeps_autonomy_running_when_hold_report_exists_but_lease_is_fresh(self) -> None:
+        scaffold_smoke_test(self.project_root, "recover-autonomy-fresh-lease")
+        run_dir = self.project_root / "runs" / "recover-autonomy-fresh-lease"
+        phase_plan = read_json(run_dir / "phase-plan.json")
+        phase_plan["current_phase"] = "design"
+        for index, item in enumerate(phase_plan["phases"]):
+            if item["phase"] == "design":
+                item["status"] = "active"
+            elif index < 1:
+                item["status"] = "complete"
+                item["human_approved"] = True
+        write_json(run_dir / "phase-plan.json", phase_plan)
+        write_json(
+            run_dir / "phase-reports" / "design.json",
+            {
+                "schema": "phase-report.v1",
+                "run_id": "recover-autonomy-fresh-lease",
+                "phase": "design",
+                "summary": "Design is temporarily on hold.",
+                "objective_outcomes": [],
+                "accepted_bundles": [],
+                "unresolved_risks": [],
+                "parallelism_summary": {
+                    "total_tasks_considered": 0,
+                    "tasks_run_in_parallel": 0,
+                    "tasks_serialized_by_policy": 0,
+                    "tasks_serialized_by_runtime_conflict": 0,
+                    "incidents": [],
+                },
+                "collaboration_summary": {
+                    "total_handoffs": 0,
+                    "blocking_handoffs": 0,
+                    "satisfied_handoffs": 0,
+                    "pending_handoffs": 0,
+                    "blocked_handoffs": 0,
+                    "handoffs_by_objective": [],
+                    "incidents": [],
+                },
+                "observability_summary": {
+                    "total_calls": 0,
+                    "completed_calls": 0,
+                    "failed_calls": 0,
+                    "timed_out_calls": 0,
+                    "retry_scheduled_calls": 0,
+                    "total_input_tokens": 0,
+                    "total_cached_input_tokens": 0,
+                    "total_output_tokens": 0,
+                    "total_prompt_chars": 0,
+                    "total_prompt_lines": 0,
+                    "average_latency_ms": 0,
+                    "max_latency_ms": 0,
+                    "average_queue_wait_ms": 0,
+                },
+                "recovery_summary": {
+                    "interrupted_activities": 0,
+                    "recovered_activities": 0,
+                    "abandoned_attempts": 0,
+                    "incidents": [],
+                },
+                "release_validation_summary": None,
+                "proposed_role_changes": [],
+                "recommendation": "hold",
+                "human_approved": False,
+            },
+        )
+        state = default_autonomy_state("recover-autonomy-fresh-lease")
+        state.update(
+            {
+                "enabled": True,
+                "status": "running",
+                "active_phase": "design",
+                "started_at": "2026-04-05T00:00:00Z",
+                "lease_owner": "autonomy:recover-autonomy-fresh-lease:pid-123",
+                "lease_started_at": "2026-04-05T00:00:00Z",
+                "lease_heartbeat_at": "2999-01-01T00:00:00Z",
+                "lease_timeout_seconds": 300,
+                "lease_action_kind": "execution",
+            }
+        )
+        write_json(run_dir / "autonomy.json", state)
+
+        reconcile_run(self.project_root, "recover-autonomy-fresh-lease", apply=True)
+
+        autonomy_state = read_json(run_dir / "autonomy.json")
+        self.assertEqual(autonomy_state["status"], "running")
+        self.assertIsNone(autonomy_state["stop_reason"])
+        self.assertEqual(autonomy_state["lease_owner"], "autonomy:recover-autonomy-fresh-lease:pid-123")
+
+    def test_reconcile_run_stops_stale_active_autonomy_after_interrupted_planning_without_phase_report(self) -> None:
+        scaffold_planning_run(self.project_root, "recover-autonomy-interrupted", ["frontend"])
+        run_dir = self.project_root / "runs" / "recover-autonomy-interrupted"
+        state = default_autonomy_state("recover-autonomy-interrupted")
+        state.update(
+            {
+                "enabled": True,
+                "status": "active",
+                "active_phase": "discovery",
+                "started_at": "2026-04-05T00:00:00Z",
+            }
+        )
+        write_json(run_dir / "autonomy.json", state)
+        ensure_activity(
+            self.project_root,
+            "recover-autonomy-interrupted",
+            activity_id="plan:discovery:app-a",
+            kind="objective_plan",
+            entity_id="app-a",
+            phase="discovery",
+            objective_id="app-a",
+            display_name="Plan app-a",
+            assigned_role="objectives.app-a.objective-manager",
+            status="running",
+            progress_stage="running",
+            current_activity="Planning objective.",
+            prompt_path="runs/recover-autonomy-interrupted/manager-plans/discovery-app-a.prompt.md",
+            stdout_path="runs/recover-autonomy-interrupted/manager-plans/discovery-app-a.stdout.jsonl",
+            stderr_path="runs/recover-autonomy-interrupted/manager-plans/discovery-app-a.stderr.log",
+            output_path="runs/recover-autonomy-interrupted/manager-plans/discovery-app-a.json",
+            dependency_blockers=[],
+            process_metadata={"pid": 999999, "started_at": "2026-03-10T00:00:00Z", "command": "codex exec", "cwd": str(self.project_root)},
+        )
+
+        reconcile_run(self.project_root, "recover-autonomy-interrupted", apply=True)
+
+        autonomy_state = read_json(run_dir / "autonomy.json")
+        self.assertEqual(autonomy_state["status"], "stopped")
+        self.assertEqual(autonomy_state["stop_phase"], "discovery")
+        self.assertEqual(
+            autonomy_state["stop_reason"],
+            "Phase work was interrupted or reconciled, and no live work remains.",
+        )
+
+    def test_autonomy_lease_timeout_uses_action_specific_overrides(self) -> None:
+        state = default_autonomy_state("lease-timeout")
+        state["timeout_seconds"] = 120
+        state["lease_timeouts"]["planning"] = 45
+        state["lease_timeouts"]["monitor"] = 30
+
+        self.assertEqual(autonomy_lease_timeout_seconds(state, action_kind="planning"), 150)
+        self.assertEqual(autonomy_lease_timeout_seconds(state, action_kind="monitor"), 30)
+
+    def test_reconcile_run_keeps_autonomy_running_when_only_completed_phase_work_exists_without_report(self) -> None:
+        scaffold_smoke_test(self.project_root, "recover-autonomy-handoff")
+        run_dir = self.project_root / "runs" / "recover-autonomy-handoff"
+        state = default_autonomy_state("recover-autonomy-handoff")
+        state.update(
+            {
+                "enabled": True,
+                "status": "running",
+                "active_phase": "discovery",
+                "started_at": "2026-04-05T00:00:00Z",
+                "last_action": "plan-phase",
+                "last_action_status": "completed",
+            }
+        )
+        write_json(run_dir / "autonomy.json", state)
+        ensure_activity(
+            self.project_root,
+            "recover-autonomy-handoff",
+            activity_id="APP-A-SMOKE-001",
+            kind="task_execution",
+            entity_id="APP-A-SMOKE-001",
+            phase="discovery",
+            objective_id="app-a",
+            display_name="APP-A-SMOKE-001",
+            assigned_role="objectives.app-a.frontend-worker",
+            status="ready_for_bundle_review",
+            progress_stage="completed",
+            current_activity="Task completed and is waiting for bundle review.",
+        )
+
+        reconcile_run(self.project_root, "recover-autonomy-handoff", apply=True)
+
+        autonomy_state = read_json(run_dir / "autonomy.json")
+        self.assertEqual(autonomy_state["status"], "running")
+        self.assertIsNone(autonomy_state["stop_reason"])
+        self.assertIsNone(autonomy_state["stop_phase"])
 
     def test_reconcile_run_preserves_blocked_status_from_existing_report(self) -> None:
         scaffold_smoke_test(self.project_root, "recover-blocked")
@@ -11571,6 +16733,106 @@ url = "https://example.com/mcp"
             "reused_last_message_capability_plan",
         )
         recovered_plan = read_json(plans_dir / "discovery-app-a-frontend.json")
+        self.assertEqual(recovered_plan["schema"], "capability-plan.v1")
+
+    def test_plan_objective_repairs_invalid_capability_last_message_when_plan_json_missing(self) -> None:
+        scaffold_planning_run(self.project_root, "repair-capability-last-message", ["frontend"])
+        run_dir = self.project_root / "runs" / "repair-capability-last-message"
+        phase_plan = read_json(run_dir / "phase-plan.json")
+        phase_plan["current_phase"] = "polish"
+        for item in phase_plan["phases"]:
+            item["status"] = "complete" if item["phase"] != "polish" else "active"
+        write_json(run_dir / "phase-plan.json", phase_plan)
+
+        plans_dir = run_dir / "manager-plans"
+        outline = objective_outline_for_objective("repair-capability-last-message", "app-a", ["frontend"])
+        outline["phase"] = "polish"
+        write_json(plans_dir / "polish-app-a.outline.json", outline)
+
+        invalid_capability_plan = capability_plan_for_objective("repair-capability-last-message", "app-a", "frontend")
+        invalid_capability_plan["phase"] = "polish"
+        invalid_capability_plan["tasks"][0]["inputs"] = [
+            "runs/repair-capability-last-message/reports/frontend-mvp-build-report.json",
+        ]
+        write_json(
+            plans_dir / "polish-app-a-frontend.last-message.json",
+            invalid_capability_plan,
+        )
+
+        repaired_capability_plan = capability_plan_for_objective("repair-capability-last-message", "app-a", "frontend")
+        repaired_capability_plan["phase"] = "polish"
+
+        with patch(
+            "company_orchestrator.objective_planner.execute_planning_activity",
+            return_value={
+                "payload": repaired_capability_plan,
+                "events": [],
+                "stdout_path": "runs/repair-capability-last-message/manager-plans/polish-app-a-frontend.stdout.jsonl",
+                "stderr_path": "runs/repair-capability-last-message/manager-plans/polish-app-a-frontend.stderr.log",
+                "last_message_path": "runs/repair-capability-last-message/manager-plans/polish-app-a-frontend.repair-1.last-message.json",
+                "identity_adjustments": {},
+                "attempt": 1,
+                "recovery_action": None,
+            },
+        ) as planner:
+            summary = plan_objective(self.project_root, "repair-capability-last-message", "app-a")
+
+        planner.assert_called_once()
+        self.assertEqual(summary["capability_summaries"][0]["recovery_action"], "planning_repair")
+        recovered_plan = read_json(plans_dir / "polish-app-a-frontend.json")
+        self.assertEqual(recovered_plan["schema"], "capability-plan.v1")
+        events = read_json_lines(run_dir / "live" / "events.jsonl")
+        self.assertIn("planning.repair_requested", {event["event_type"] for event in events})
+        self.assertIn("planning.repair_completed", {event["event_type"] for event in events})
+
+    def test_plan_objective_prefers_repaired_capability_last_message_when_plan_json_missing(self) -> None:
+        scaffold_planning_run(self.project_root, "reuse-repaired-capability-last-message", ["frontend"])
+        run_dir = self.project_root / "runs" / "reuse-repaired-capability-last-message"
+        phase_plan = read_json(run_dir / "phase-plan.json")
+        phase_plan["current_phase"] = "polish"
+        for item in phase_plan["phases"]:
+            item["status"] = "complete" if item["phase"] != "polish" else "active"
+        write_json(run_dir / "phase-plan.json", phase_plan)
+
+        plans_dir = run_dir / "manager-plans"
+        outline = objective_outline_for_objective("reuse-repaired-capability-last-message", "app-a", ["frontend"])
+        outline["phase"] = "polish"
+        write_json(plans_dir / "polish-app-a.outline.json", outline)
+
+        invalid_capability_plan = capability_plan_for_objective(
+            "reuse-repaired-capability-last-message",
+            "app-a",
+            "frontend",
+        )
+        invalid_capability_plan["phase"] = "polish"
+        invalid_capability_plan["tasks"][0]["inputs"] = [
+            "runs/reuse-repaired-capability-last-message/reports/frontend-mvp-build-report.json",
+        ]
+        write_json(
+            plans_dir / "polish-app-a-frontend.last-message.json",
+            invalid_capability_plan,
+        )
+
+        repaired_capability_plan = capability_plan_for_objective(
+            "reuse-repaired-capability-last-message",
+            "app-a",
+            "frontend",
+        )
+        repaired_capability_plan["phase"] = "polish"
+        write_json(
+            plans_dir / "polish-app-a-frontend.repair-1.last-message.json",
+            repaired_capability_plan,
+        )
+
+        with patch("company_orchestrator.objective_planner.execute_planning_activity") as planner:
+            summary = plan_objective(self.project_root, "reuse-repaired-capability-last-message", "app-a")
+
+        planner.assert_not_called()
+        self.assertEqual(
+            summary["capability_summaries"][0]["recovery_action"],
+            "reused_repaired_last_message_capability_plan",
+        )
+        recovered_plan = read_json(plans_dir / "polish-app-a-frontend.json")
         self.assertEqual(recovered_plan["schema"], "capability-plan.v1")
 
     def test_execute_task_retry_refreshes_existing_isolated_worktree(self) -> None:
@@ -11794,6 +17056,111 @@ url = "https://example.com/mcp"
         self.assertTrue(mirrored_artifact.exists())
         self.assertEqual(mirrored_artifact.read_text(encoding="utf-8"), "upstream handoff\n")
 
+    def test_materialize_task_context_files_overwrites_existing_workspace_files_with_upstream_report_artifacts(self) -> None:
+        init_git_repo(self.project_root)
+        scaffold_planning_run(self.project_root, "overwrite-upstream-artifacts", ["middleware"])
+
+        integration_workspace = ensure_run_integration_workspace(self.project_root, "overwrite-upstream-artifacts")
+        baseline_runtime = integration_workspace.workspace_path / "apps" / "todo" / "runtime" / "src" / "runtime.js"
+        baseline_runtime.parent.mkdir(parents=True, exist_ok=True)
+        baseline_runtime.write_text("module.exports = 'baseline';\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "-A"],
+            cwd=integration_workspace.workspace_path,
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "integration baseline"],
+            cwd=integration_workspace.workspace_path,
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+
+        upstream_workspace = ensure_task_workspace(
+            self.project_root,
+            "overwrite-upstream-artifacts",
+            "UPSTREAM-IMPL-001",
+        )
+        upstream_runtime = upstream_workspace.workspace_path / "apps" / "todo" / "runtime" / "src" / "runtime.js"
+        upstream_runtime.parent.mkdir(parents=True, exist_ok=True)
+        upstream_runtime.write_text("module.exports = 'candidate';\n", encoding="utf-8")
+
+        write_json(
+            self.project_root / "runs" / "overwrite-upstream-artifacts" / "reports" / "UPSTREAM-IMPL-001.json",
+            {
+                "schema": "completion-report.v1",
+                "run_id": "overwrite-upstream-artifacts",
+                "phase": "polish",
+                "objective_id": "app-a",
+                "task_id": "UPSTREAM-IMPL-001",
+                "agent_role": "objectives.app-a.middleware-worker",
+                "status": "ready_for_bundle_review",
+                "summary": "Candidate runtime update ready.",
+                "artifacts": [{"path": "apps/todo/runtime/src/runtime.js", "status": "updated"}],
+                "validation_results": [],
+                "legacy_dependency_notes": [],
+                "open_issues": [],
+                "legacy_follow_ups": [],
+            },
+        )
+        write_json(
+            self.project_root / "runs" / "overwrite-upstream-artifacts" / "executions" / "UPSTREAM-IMPL-001.json",
+            {
+                "task_id": "UPSTREAM-IMPL-001",
+                "workspace_path": str(upstream_workspace.workspace_path),
+            },
+        )
+
+        downstream_task = {
+            "schema": "task-assignment.v1",
+            "run_id": "overwrite-upstream-artifacts",
+            "phase": "polish",
+            "objective_id": "app-a",
+            "capability": "middleware",
+            "working_directory": None,
+            "sandbox_mode": "read-only",
+            "additional_directories": [],
+            "execution_mode": "read_only",
+            "parallel_policy": "serialize",
+            "owned_paths": [],
+            "shared_asset_ids": [],
+            "task_id": "VALIDATE-001",
+            "assigned_role": "objectives.app-a.middleware-worker",
+            "manager_role": "objectives.app-a.middleware-manager",
+            "acceptance_role": "objectives.app-a.acceptance-manager",
+            "objective": "Validate the candidate runtime implementation.",
+            "inputs": ["Output of UPSTREAM-IMPL-001"],
+            "expected_outputs": [],
+            "done_when": ["candidate runtime is readable in the validation workspace"],
+            "depends_on": ["UPSTREAM-IMPL-001"],
+            "validation": [],
+            "collaboration_rules": [],
+            "handoff_dependencies": [],
+        }
+
+        runtime = prepare_task_runtime(
+            self.project_root,
+            "overwrite-upstream-artifacts",
+            downstream_task,
+            runtime=TaskExecutionRuntime(attempt=1),
+        )
+
+        workspace_path = Path(runtime.workspace_path or "")
+        mirrored_runtime = workspace_path / "apps" / "todo" / "runtime" / "src" / "runtime.js"
+        self.assertEqual(mirrored_runtime.read_text(encoding="utf-8"), "module.exports = 'baseline';\n")
+
+        materialize_task_context_files(
+            self.project_root,
+            "overwrite-upstream-artifacts",
+            downstream_task,
+            workspace_path,
+        )
+
+        self.assertEqual(mirrored_runtime.read_text(encoding="utf-8"), "module.exports = 'candidate';\n")
+
     def test_prepare_task_runtime_creates_read_workspace_for_explicit_file_input_task(self) -> None:
         init_git_repo(self.project_root)
         scaffold_planning_run(self.project_root, "read-explicit-inputs", ["backend"])
@@ -11968,7 +17335,16 @@ url = "https://example.com/mcp"
                 "agent_role": "objectives.app-a.middleware-worker",
                 "status": "ready_for_bundle_review",
                 "summary": "Middleware MVP delivery report.",
-                "artifacts": [],
+                "artifacts": [
+                    {
+                        "path": "runs/original-run/review-bundles/app-a-middleware-mvp-build.json",
+                        "status": "created",
+                    },
+                    {
+                        "path": "apps/todo/orchestrator/roles/objectives/app-a/approved/middleware-mvp-build-integration-contract.md",
+                        "status": "created",
+                    },
+                ],
                 "validation_results": [],
                 "open_issues": [],
                 "change_requests": [],
@@ -12007,7 +17383,7 @@ url = "https://example.com/mcp"
             "objective": "Inspect inherited polish repair inputs.",
             "inputs": [
                 "Planning Inputs.release_repair_inputs.report_middleware_mvp_delivery_package.path",
-                "Planning Inputs.release_repair_inputs.artifact_middleware_mvp_build_integration_contract.path",
+                "apps/todo/orchestrator/roles/objectives/app-a/approved/middleware-mvp-build-integration-contract.md",
                 "apps/todo/backend/design/todo-api-contract.yaml",
             ],
             "expected_outputs": [],
@@ -12027,14 +17403,21 @@ url = "https://example.com/mcp"
             f"runs/{run_id}/reports/middleware-mvp-delivery-package.json",
         )
         self.assertEqual(planning_input_payload["content"]["schema"], "completion-report.v1")
-        contract_input_payload = resolved_inputs[
-            "Planning Inputs.release_repair_inputs.artifact_middleware_mvp_build_integration_contract.path"
-        ]
         self.assertEqual(
-            contract_input_payload["path"],
-            "apps/todo/orchestrator/roles/objectives/app-a/approved/middleware-mvp-build-integration-contract.md",
+            planning_input_payload["content"]["artifacts"],
+            [
+                {
+                    "path": "apps/todo/orchestrator/roles/objectives/app-a/approved/middleware-mvp-build-integration-contract.md",
+                    "status": "created",
+                }
+            ],
         )
-        self.assertIn("# Middleware MVP Build Integration Contract", contract_input_payload["content"])
+        self.assertIn(
+            "# Middleware MVP Build Integration Contract",
+            resolved_inputs[
+                "apps/todo/orchestrator/roles/objectives/app-a/approved/middleware-mvp-build-integration-contract.md"
+            ],
+        )
         self.assertIn("openapi: 3.1.0", resolved_inputs["apps/todo/backend/design/todo-api-contract.yaml"])
 
         runtime = prepare_task_runtime(
@@ -12044,6 +17427,7 @@ url = "https://example.com/mcp"
             runtime=TaskExecutionRuntime(attempt=1),
         )
 
+        self.assertIsNotNone(runtime.workspace_path)
         workspace_path = Path(runtime.workspace_path or "")
         self.assertTrue(workspace_path.exists())
 
@@ -12066,6 +17450,15 @@ url = "https://example.com/mcp"
         self.assertTrue(mirrored_markdown_contract.exists())
         self.assertTrue(mirrored_contract.exists())
         self.assertEqual(read_json(mirrored_report)["schema"], "completion-report.v1")
+        self.assertEqual(
+            read_json(mirrored_report)["artifacts"],
+            [
+                {
+                    "path": "apps/todo/orchestrator/roles/objectives/app-a/approved/middleware-mvp-build-integration-contract.md",
+                    "status": "created",
+                }
+            ],
+        )
         self.assertIn("# Middleware MVP Build Integration Contract", mirrored_markdown_contract.read_text(encoding="utf-8"))
         self.assertIn("openapi: 3.1.0", mirrored_contract.read_text(encoding="utf-8"))
 
@@ -12276,12 +17669,21 @@ url = "https://example.com/mcp"
         mirrored_flow = workspace_path / "apps" / "todo" / "frontend" / "frontend-ui-flow.v1.json"
         self.assertTrue(mirrored_contract.exists())
         self.assertTrue(mirrored_flow.exists())
-        self.assertEqual(mirrored_contract.read_text(encoding="utf-8"), '{"artifact":"contract"}\n')
-        self.assertEqual(mirrored_flow.read_text(encoding="utf-8"), '{"artifact":"ui-flow"}\n')
+        self.assertEqual(read_json(mirrored_contract), {"artifact": "contract"})
+        self.assertEqual(read_json(mirrored_flow), {"artifact": "ui-flow"})
 
     def test_run_phase_stops_when_recovery_detects_blocked_bundle_landing(self) -> None:
         init_git_repo(self.project_root)
         scaffold_planning_run(self.project_root, "blocked-recovery", ["frontend"])
+        plan = planned_payload_for_objective("blocked-recovery", "app-a")
+        plan["bundle_plan"] = [
+            {
+                "bundle_id": "blocked-bundle",
+                "task_ids": ["WRITE-001"],
+                "summary": "Active blocked bundle",
+            }
+        ]
+        write_json(self.project_root / "runs" / "blocked-recovery" / "manager-plans" / "discovery-app-a.json", plan)
         write_json(
             self.project_root / "runs" / "blocked-recovery" / "tasks" / "WRITE-001.json",
             {
@@ -12334,14 +17736,16 @@ url = "https://example.com/mcp"
 
     def test_phase_report_recovery_summary_includes_blocked_bundle_incidents(self) -> None:
         scaffold_smoke_test(self.project_root, "recovery-report")
-        record_event(
-            self.project_root,
-            "recovery-report",
-            phase="discovery",
-            activity_id=None,
-            event_type="bundle.recovery_blocked",
-            message="Bundle landing requires recovery.",
-            payload={"bundle_id": "bundle-1", "recovery_path": "runs/recovery-report/recovery/bundle-1.json"},
+        write_json(
+            self.project_root / "runs" / "recovery-report" / "recovery" / "bundle-1.json",
+            {
+                "run_id": "recovery-report",
+                "bundle_id": "bundle-1",
+                "phase": "discovery",
+                "objective_id": "app-a",
+                "status": "interrupted",
+                "reason": "Bundle landing requires recovery.",
+            },
         )
         report, _ = generate_phase_report(self.project_root, "recovery-report")
         incidents = report["recovery_summary"]["incidents"]
@@ -12356,6 +17760,7 @@ url = "https://example.com/mcp"
         )
 
     def test_reconcile_for_command_ignores_blocked_bundles_without_landing_results(self) -> None:
+        init_git_repo(self.project_root)
         scaffold_smoke_test(self.project_root, "ignore-blocked-bundle")
         run_dir = self.project_root / "runs" / "ignore-blocked-bundle"
         write_json(
@@ -12402,10 +17807,26 @@ url = "https://example.com/mcp"
                 "rejection_reasons": ["stale blocked bundle"],
             },
         )
+        write_json(
+            run_dir / "recovery" / "blocked-bundle.json",
+            {
+                "run_id": "ignore-blocked-bundle",
+                "bundle_id": "blocked-bundle",
+                "phase": "discovery",
+                "objective_id": "app-a",
+                "status": "interrupted",
+                "reason": "Stale blocked bundle recovery incident.",
+            },
+        )
 
         summary = reconcile_for_command(self.project_root, "ignore-blocked-bundle", apply=True)
         self.assertEqual(summary["blocked"], [])
         self.assertFalse((run_dir / "recovery" / "blocked-bundle.json").exists())
+        archived = list((run_dir / "archive" / "bundle-recovery" / "discovery").glob("blocked-bundle-*.json"))
+        self.assertTrue(archived)
+        archived_payload = read_json(archived[0])
+        self.assertEqual(archived_payload["status"], "archived")
+        self.assertIn("active manager-approved bundle plan", archived_payload["archive_reason"])
 
     def test_task_assignment_accepts_structured_expected_outputs(self) -> None:
         task = {
@@ -12453,14 +17874,14 @@ url = "https://example.com/mcp"
 
         validate_document(task, "task-assignment.v1", self.project_root)
 
-    def test_materialize_executor_response_records_structured_produced_outputs(self) -> None:
-        scaffold_planning_run(self.project_root, "structured-produced-outputs", ["frontend"])
+    def test_materialize_executor_response_records_canonical_outputs_from_produced_output_ids(self) -> None:
+        scaffold_planning_run(self.project_root, "structured-produced-output-ids", ["frontend"])
         artifact_path = self.project_root / "docs" / "handoffs" / "frontend-middleware.md"
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
         artifact_path.write_text("handoff", encoding="utf-8")
         task = {
             "schema": "task-assignment.v1",
-            "run_id": "structured-produced-outputs",
+            "run_id": "structured-produced-output-ids",
             "phase": "discovery",
             "objective_id": "app-a",
             "capability": "frontend",
@@ -12503,27 +17924,7 @@ url = "https://example.com/mcp"
             "validation_results": [{"id": "handoff-check", "status": "passed", "evidence": "handoff validated"}],
             "open_issues": [],
             "change_requests": [],
-            "produced_outputs": [
-                {
-                    "kind": "artifact",
-                    "output_id": "frontend.handoff.doc",
-                    "path": "docs/handoffs/frontend-middleware.md",
-                    "asset_id": None,
-                    "description": None,
-                    "evidence": None,
-                },
-                {
-                    "kind": "assertion",
-                    "output_id": "frontend.handoff.validated",
-                    "path": None,
-                    "asset_id": None,
-                    "description": "Frontend handoff validation passed.",
-                    "evidence": {
-                        "validation_ids": ["handoff-check"],
-                        "artifact_paths": ["docs/handoffs/frontend-middleware.md"],
-                    },
-                },
-            ],
+            "produced_output_ids": ["frontend.handoff.doc", "frontend.handoff.validated"],
             "context_echo": {
                 "role_id": "objectives.app-a.frontend-worker",
                 "objective_id": "app-a",
@@ -12536,7 +17937,7 @@ url = "https://example.com/mcp"
 
         report, _, _ = materialize_executor_response(
             self.project_root,
-            "structured-produced-outputs",
+            "structured-produced-output-ids",
             task,
             parsed_response,
             runtime_warnings=[],
@@ -12544,7 +17945,7 @@ url = "https://example.com/mcp"
             runtime_observability=None,
         )
 
-        self.assertEqual(report["produced_outputs"], parsed_response["produced_outputs"])
+        self.assertEqual(report["produced_outputs"], task["expected_outputs"])
 
     def test_materialize_executor_response_persists_structured_change_requests(self) -> None:
         scaffold_planning_run(self.project_root, "structured-change-requests", ["frontend"])
@@ -12671,11 +18072,10 @@ url = "https://example.com/mcp"
                     "why_local_resolution_is_invalid": "Completing this task locally would fork the shared API contract used by sibling objectives.",
                     "blocking": True,
                     "goal_critical": True,
-                    "affected_output_ids": [],
-                    "affected_handoff_ids": [],
+                    "affected_output_ids": ["todo-api-contract"],
+                    "affected_handoff_ids": ["handoff.backend-to-frontend"],
                     "impacted_objective_ids": [],
                     "impacted_task_ids": [],
-                    "conflicting_input_refs": ["apps/todo/backend/design/api-contract.md"],
                     "required_reentry_phase": "design",
                     "impact": {
                         "goal_changed": False,
@@ -12717,6 +18117,61 @@ url = "https://example.com/mcp"
         self.assertEqual(persisted["change_category"], "interface_contract")
         self.assertEqual(persisted["affected_output_ids"], ["todo-api-contract"])
         self.assertEqual(persisted["affected_handoff_ids"], ["handoff.backend-to-frontend"])
+
+    def test_materialize_executor_response_persists_structured_blockers(self) -> None:
+        scaffold_planning_run(self.project_root, "structured-blockers", ["frontend"])
+        task = {
+            "schema": "task-assignment.v1",
+            "run_id": "structured-blockers",
+            "phase": "polish",
+            "objective_id": "app-a",
+            "capability": "frontend",
+            "task_id": "APP-A-FRONTEND-BLOCK-001",
+            "assigned_role": "objectives.app-a.frontend-worker",
+            "manager_role": "objectives.app-a.frontend-manager",
+            "acceptance_role": "objectives.app-a.acceptance-manager",
+            "objective": "Repair inline editing behavior.",
+            "inputs": [],
+            "expected_outputs": [],
+            "done_when": [],
+            "depends_on": [],
+            "validation": [],
+            "collaboration_rules": [],
+        }
+        parsed_response = {
+            "summary": "Blocked on a runtime-owned surface outside the current task.",
+            "status": "blocked",
+            "artifacts": [],
+            "validation_results": [],
+            "open_issues": [],
+            "blockers": [
+                {
+                    "kind": "contract_conflict",
+                    "summary": "The failing behavior lives in a runtime-owned module outside the approved write scope.",
+                    "details": "The task owns TodoApp.jsx but the runtime import path resolves through app.js.",
+                    "related_paths": ["apps/todo/frontend/src/todos/app.js"],
+                    "related_validation_ids": ["frontend-editing-regression"],
+                    "suggested_owner_capability": "frontend",
+                }
+            ],
+            "produced_output_ids": [],
+        }
+
+        report, collaboration_ids, change_request_ids = materialize_executor_response(
+            self.project_root,
+            "structured-blockers",
+            task,
+            parsed_response,
+            runtime_warnings=[],
+            runtime_recovery=None,
+            runtime_observability=None,
+        )
+
+        self.assertEqual(collaboration_ids, [])
+        self.assertEqual(change_request_ids, [])
+        self.assertEqual(len(report["blockers"]), 1)
+        self.assertEqual(report["blockers"][0]["kind"], "contract_conflict")
+        self.assertEqual(report["blockers"][0]["related_paths"], ["apps/todo/frontend/src/todos/app.js"])
 
     def test_materialize_executor_response_rejects_self_targeted_conflicting_input_refs(self) -> None:
         scaffold_planning_run(self.project_root, "self-targeted-change-request", ["frontend"])
@@ -12763,11 +18218,10 @@ url = "https://example.com/mcp"
                     "why_local_resolution_is_invalid": "A local fix would fork the shared contract.",
                     "blocking": True,
                     "goal_critical": True,
-                    "affected_output_ids": [],
+                    "affected_output_ids": ["frontend-consumer-contract"],
                     "affected_handoff_ids": [],
                     "impacted_objective_ids": [],
                     "impacted_task_ids": [],
-                    "conflicting_input_refs": ["apps/todo/frontend/design/frontend-consumer-contract.md"],
                     "required_reentry_phase": "design",
                     "impact": {
                         "goal_changed": False,
@@ -12785,16 +18239,18 @@ url = "https://example.com/mcp"
             "collaboration_request": None,
         }
 
-        with self.assertRaisesRegex(ExecutorError, "cited only self-authored inputs"):
-            materialize_executor_response(
-                self.project_root,
-                "self-targeted-change-request",
-                task,
-                parsed_response,
-                runtime_warnings=[],
-                runtime_recovery=None,
-                runtime_observability=None,
-            )
+        report, _, change_request_ids = materialize_executor_response(
+            self.project_root,
+            "self-targeted-change-request",
+            task,
+            parsed_response,
+            runtime_warnings=[],
+            runtime_recovery=None,
+            runtime_observability=None,
+        )
+
+        self.assertEqual(len(change_request_ids), 1)
+        self.assertEqual(report["change_requests"][0]["affected_output_ids"], ["frontend-consumer-contract"])
 
     def test_conflicting_input_refs_drive_true_consumer_impact_resolution(self) -> None:
         scaffold_dual_planning_run(self.project_root, "resolved-impact-graph")
@@ -14143,6 +19599,62 @@ url = "https://example.com/mcp"
         self.assertIsNone(updated_request["replacement_plan_revision"])
         self.assertEqual(read_activity(self.project_root, "change-replan-fail", "APP-A-FRONT-001")["status"], "needs_revision")
 
+    def test_active_approved_change_requests_dedupes_feedback_generated_replans(self) -> None:
+        scaffold_dual_planning_run(self.project_root, "change-dedupe")
+        run_dir = self.project_root / "runs" / "change-dedupe"
+        requests_dir = run_dir / "change-requests"
+        requests_dir.mkdir(parents=True, exist_ok=True)
+
+        def write_request(change_id: str, *, source_task_id: str, summary: str = "Add due dates.") -> None:
+            write_json(
+                requests_dir / f"{change_id}.json",
+                {
+                    "schema": "change-request.v2",
+                    "run_id": "change-dedupe",
+                    "change_id": change_id,
+                    "source_task_id": source_task_id,
+                    "source_objective_id": "app-a",
+                    "phase": "polish",
+                    "change_category": "feature_extension",
+                    "summary": summary,
+                    "blocking_reason": "Approved feedback requires a shared feature update.",
+                    "why_local_resolution_is_invalid": "The feature affects shared contracts and cross-objective behavior.",
+                    "blocking": True,
+                    "goal_critical": True,
+                    "affected_output_ids": ["todo-api-contract"],
+                    "affected_handoff_ids": [],
+                    "impacted_objective_ids": ["app-a", "app-b", "app-c"],
+                    "impacted_task_ids": [],
+                    "required_reentry_phase": "design",
+                    "impact": {
+                        "goal_changed": False,
+                        "scope_changed": False,
+                        "boundary_changed": False,
+                        "interface_changed": True,
+                        "architecture_changed": False,
+                        "team_changed": False,
+                        "implementation_changed": False,
+                    },
+                    "approval": {"mode": "auto", "status": "approved"},
+                    "replacement_plan_revision": None,
+                },
+            )
+
+        write_request("feedback-FBK-003-chg-001", source_task_id="feedback-FBK-003")
+        write_request("feedback-FBK-003-chg-002", source_task_id="feedback-FBK-003")
+        write_request("feedback-FBK-004-chg-001", source_task_id="feedback-FBK-004")
+        write_request("feedback-FBK-004-chg-002", source_task_id="feedback-FBK-004")
+        write_request(
+            "backend-runtime-chg-001",
+            source_task_id="backend-runtime-implementation",
+            summary="Fix backend runtime contract mismatch.",
+        )
+
+        self.assertEqual(
+            [item["change_id"] for item in active_approved_change_requests(self.project_root, "change-dedupe")],
+            ["backend-runtime-chg-001", "feedback-FBK-004-chg-002"],
+        )
+
     def test_run_guidance_prefers_apply_approved_changes_for_approved_requests(self) -> None:
         scaffold_dual_planning_run(self.project_root, "change-guidance")
         run_dir = self.project_root / "runs" / "change-guidance"
@@ -14215,6 +19727,1156 @@ url = "https://example.com/mcp"
 
         self.assertEqual(guidance["run_status"], "recoverable")
         self.assertIn("apply-approved-changes", guidance["next_action_command"])
+
+    def test_submit_feedback_auto_triages_local_frontend_bug(self) -> None:
+        scaffold_feedback_run(self.project_root, "feedback-intake")
+
+        feedback = submit_feedback(
+            self.project_root,
+            "feedback-intake",
+            summary="Editing an existing todo only lets me type one character before the whole input gets replaced.",
+            expected_behavior="Editing should allow normal multi-character typing without resetting the field selection.",
+            observed_behavior="The edit input highlights the full title after each keypress and replaces the text with the latest character.",
+            repro_steps=[
+                "Create a todo.",
+                "Click Edit on that todo.",
+                "Type multiple characters into the edit input.",
+            ],
+        )
+
+        self.assertEqual(feedback["status"], "approved")
+        self.assertEqual(feedback["triage"]["feedback_kind"], "local_bug")
+        self.assertEqual(feedback["triage"]["route"], "local_repair")
+        self.assertEqual(
+            feedback["triage"]["owner_objective_id"],
+            "react-web-frontend-for-creating-viewing-completing-editing-and-deleting-todo-items",
+        )
+        self.assertEqual(feedback["triage"]["owner_capability"], "frontend")
+        self.assertEqual(feedback["triage"]["required_reentry_phase"], "polish")
+        self.assertTrue(feedback["triage"]["focus_paths"])
+
+    def test_run_guidance_prefers_apply_feedback_for_approved_feedback(self) -> None:
+        scaffold_feedback_run(self.project_root, "feedback-guidance")
+        submit_feedback(
+            self.project_root,
+            "feedback-guidance",
+            summary="Editing an existing todo only lets me type one character before the whole input gets replaced.",
+            expected_behavior="Editing should allow normal multi-character typing without resetting the field selection.",
+            observed_behavior="The edit input highlights the full title after each keypress and replaces the text with the latest character.",
+        )
+
+        guidance = run_guidance(self.project_root, "feedback-guidance")
+
+        self.assertEqual(guidance["run_status"], "recoverable")
+        self.assertIn("apply-feedback", guidance["next_action_command"])
+
+    def test_run_guidance_defers_apply_feedback_while_targeted_objective_has_active_work(self) -> None:
+        scaffold_feedback_run(self.project_root, "feedback-guidance-blocked")
+        submit_feedback(
+            self.project_root,
+            "feedback-guidance-blocked",
+            summary="Editing an existing todo only lets me type one character before the whole input gets replaced.",
+            expected_behavior="Editing should allow normal multi-character typing without resetting the field selection.",
+            observed_behavior="The edit input highlights the full title after each keypress and replaces the text with the latest character.",
+        )
+        ensure_activity(
+            self.project_root,
+            "feedback-guidance-blocked",
+            activity_id="frontend-polish-regression-tests",
+            kind="task_execution",
+            entity_id="frontend-polish-regression-tests",
+            phase="polish",
+            objective_id="react-web-frontend-for-creating-viewing-completing-editing-and-deleting-todo-items",
+            display_name="Frontend polish regression tests",
+            assigned_role="objectives.react-web-frontend-for-creating-viewing-completing-editing-and-deleting-todo-items.frontend-worker",
+            status="finalizing",
+            current_activity="Codex turn completed.",
+        )
+
+        guidance = run_guidance(self.project_root, "feedback-guidance-blocked")
+
+        self.assertEqual(guidance["run_status"], "working")
+        self.assertIsNone(guidance["next_action_command"])
+        self.assertIn("frontend-polish-regression-tests (finalizing)", guidance["run_status_reason"])
+        self.assertIn("Wait for the active work to finish", guidance["next_action_reason"])
+
+    def test_submit_feedback_triages_cross_boundary_feature_as_approved_change(self) -> None:
+        scaffold_feedback_run(self.project_root, "feedback-cross-boundary")
+        feedback = submit_feedback(
+            self.project_root,
+            "feedback-cross-boundary",
+            summary=(
+                "Add due dates to todos so the frontend UI can create and edit them, "
+                "the backend API stores and validates them, and the integrated runtime "
+                "shows overdue items in the app."
+            ),
+            expected_behavior="Due dates are supported across the full todo application.",
+            observed_behavior="Due dates do not exist anywhere in the current app.",
+        )
+
+        self.assertEqual(feedback["status"], "approved")
+        self.assertEqual(feedback["triage"]["feedback_kind"], "cross_boundary_change")
+        self.assertEqual(feedback["triage"]["route"], "cross_boundary_change")
+        self.assertEqual(feedback["triage"]["required_reentry_phase"], "design")
+        self.assertGreaterEqual(len(feedback["triage"]["matched_objective_ids"]), 2)
+
+    def test_planning_prompt_payload_applies_replanned_change_scope_overrides(self) -> None:
+        scaffold_feedback_run(self.project_root, "feedback-scope-override")
+        run_dir = self.project_root / "runs" / "feedback-scope-override"
+        (run_dir / "goal.md").write_text(
+            "\n".join(
+                [
+                    "# Goal",
+                    "",
+                    "## Summary",
+                    "Build a simple todo app.",
+                    "",
+                    "## In Scope",
+                    "- Create, edit, complete, and delete todos.",
+                    "",
+                    "## Out Of Scope",
+                    "- Multi-user collaboration",
+                    "- Due dates, calendars, labels, or complex filtering",
+                    "",
+                    "## Objectives",
+                    "- React web frontend for creating, viewing, completing, editing, and deleting todo items",
+                    "- Simple backend API and persistence layer for storing todo items",
+                    "- Basic application integration and delivery workflow connecting frontend and backend",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        phase_plan = read_json(run_dir / "phase-plan.json")
+        phase_plan["current_phase"] = "mvp-build"
+        for item in phase_plan["phases"]:
+            if item["phase"] in {"discovery", "design"}:
+                item["status"] = "complete"
+                item["human_approved"] = True
+            elif item["phase"] == "mvp-build":
+                item["status"] = "active"
+                item["human_approved"] = False
+            else:
+                item["status"] = "locked"
+                item["human_approved"] = False
+        write_json(run_dir / "phase-plan.json", phase_plan)
+        write_json(
+            run_dir / "change-requests" / "feedback-FBK-001-chg-001.json",
+            {
+                "schema": "change-request.v2",
+                "run_id": "feedback-scope-override",
+                "change_id": "feedback-FBK-001-chg-001",
+                "source_task_id": "feedback-FBK-001",
+                "source_objective_id": "react-web-frontend-for-creating-viewing-completing-editing-and-deleting-todo-items",
+                "phase": "design",
+                "change_category": "shared_behavior",
+                "summary": (
+                    "Add due dates to todos so the frontend UI can create and edit them, "
+                    "the backend API stores and validates them, and the integrated runtime "
+                    "shows overdue items in the app."
+                ),
+                "blocking_reason": "User-requested cross-boundary feature change affects multiple owned objectives and shared behavior.",
+                "why_local_resolution_is_invalid": "A local-only repair would fork shared behavior across objectives.",
+                "blocking": True,
+                "goal_critical": True,
+                "affected_output_ids": ["backend-api-contract"],
+                "affected_handoff_ids": [],
+                "impacted_objective_ids": [
+                    "react-web-frontend-for-creating-viewing-completing-editing-and-deleting-todo-items",
+                    "simple-backend-api-and-persistence-layer-for-storing-todo-items",
+                    "basic-application-integration-and-delivery-workflow-connecting-frontend-and-backend",
+                ],
+                "impacted_task_ids": [],
+                "required_reentry_phase": "design",
+                "impact": {
+                    "goal_changed": False,
+                    "scope_changed": False,
+                    "boundary_changed": False,
+                    "interface_changed": True,
+                    "architecture_changed": False,
+                    "team_changed": False,
+                    "implementation_changed": True,
+                },
+                "approval": {"mode": "human", "status": "approved"},
+                "replacement_plan_revision": "design:2026-03-27T18:57:17Z",
+            },
+        )
+
+        payload = build_planning_prompt_payload(
+            self.project_root,
+            "feedback-scope-override",
+            "react-web-frontend-for-creating-viewing-completing-editing-and-deleting-todo-items",
+        )
+
+        self.assertTrue(payload["approved_scope_overrides"])
+        self.assertIn("Add due dates to todos", payload["goal_context"]["sections"]["Approved Scope Overrides"])
+        self.assertNotIn("due dates", payload["goal_context"]["sections"].get("Out Of Scope", "").lower())
+
+        prompt_metadata = render_objective_planning_prompt(
+            self.project_root,
+            "feedback-scope-override",
+            "react-web-frontend-for-creating-viewing-completing-editing-and-deleting-todo-items",
+        )
+        prompt_text = (self.project_root / prompt_metadata["prompt_path"]).read_text(encoding="utf-8")
+        self.assertIn("These approved changes supersede conflicting baseline goal scope notes", prompt_text)
+        self.assertIn("Add due dates to todos", prompt_text)
+
+    def test_scope_override_coverage_rejects_generic_objective_and_capability_plans(self) -> None:
+        scaffold_feedback_run(self.project_root, "feedback-scope-validation")
+        run_dir = self.project_root / "runs" / "feedback-scope-validation"
+        phase_plan = read_json(run_dir / "phase-plan.json")
+        phase_plan["current_phase"] = "design"
+        for item in phase_plan["phases"]:
+            if item["phase"] == "design":
+                item["status"] = "active"
+                item["human_approved"] = False
+            elif item["phase"] == "discovery":
+                item["status"] = "complete"
+                item["human_approved"] = True
+            else:
+                item["status"] = "locked"
+                item["human_approved"] = False
+        write_json(run_dir / "phase-plan.json", phase_plan)
+        write_json(
+            run_dir / "change-requests" / "feedback-FBK-001-chg-001.json",
+            {
+                "schema": "change-request.v2",
+                "run_id": "feedback-scope-validation",
+                "change_id": "feedback-FBK-001-chg-001",
+                "source_task_id": "feedback-FBK-001",
+                "source_objective_id": "react-web-frontend-for-creating-viewing-completing-editing-and-deleting-todo-items",
+                "phase": "design",
+                "change_category": "shared_behavior",
+                "summary": (
+                    "Add due dates to todos so the frontend UI can create and edit them, "
+                    "the backend API stores and validates them, and the integrated runtime "
+                    "shows overdue items in the app."
+                ),
+                "blocking_reason": "User-requested cross-boundary feature change affects multiple owned objectives and shared behavior.",
+                "why_local_resolution_is_invalid": "A local-only repair would fork shared behavior across objectives.",
+                "blocking": True,
+                "goal_critical": True,
+                "affected_output_ids": ["backend-design-lane-reconciled"],
+                "affected_handoff_ids": [],
+                "impacted_objective_ids": [
+                    "react-web-frontend-for-creating-viewing-completing-editing-and-deleting-todo-items",
+                    "simple-backend-api-and-persistence-layer-for-storing-todo-items",
+                    "basic-application-integration-and-delivery-workflow-connecting-frontend-and-backend",
+                ],
+                "impacted_task_ids": [],
+                "required_reentry_phase": "design",
+                "impact": {
+                    "goal_changed": False,
+                    "scope_changed": False,
+                    "boundary_changed": False,
+                    "interface_changed": True,
+                    "architecture_changed": False,
+                    "team_changed": False,
+                    "implementation_changed": True,
+                },
+                "approval": {"mode": "human", "status": "approved"},
+                "replacement_plan_revision": None,
+            },
+        )
+
+        with self.assertRaisesRegex(ValueError, "approved scope overrides"):
+            validate_scope_override_coverage_for_objective_outline(
+                self.project_root,
+                "feedback-scope-validation",
+                "design",
+                "simple-backend-api-and-persistence-layer-for-storing-todo-items",
+                {
+                    "summary": "Deliver a minimal backend design plan.",
+                    "dependency_notes": [],
+                    "capability_lanes": [{"capability": "backend", "objective": "Define a simple backend design lane."}],
+                    "collaboration_edges": [],
+                },
+            )
+
+        with self.assertRaisesRegex(ValueError, "approved scope overrides"):
+            validate_scope_override_coverage_for_capability_plan(
+                self.project_root,
+                "feedback-scope-validation",
+                "design",
+                "simple-backend-api-and-persistence-layer-for-storing-todo-items",
+                {
+                    "summary": "Minimal backend design work.",
+                    "tasks": [
+                        {
+                            "task_id": "backend-design-contract-reconciliation",
+                            "objective": "Reconcile the backend design lane to a minimal MVP service boundary for todo CRUD and persistence.",
+                            "done_when": [],
+                            "expected_outputs": [],
+                        }
+                    ],
+                },
+            )
+
+    def test_dashboard_refreshes_and_shows_feedback_blocker_activity(self) -> None:
+        scaffold_feedback_run(self.project_root, "feedback-dashboard-blocked")
+        submit_feedback(
+            self.project_root,
+            "feedback-dashboard-blocked",
+            summary="Editing an existing todo only lets me type one character before the whole input gets replaced.",
+            expected_behavior="Editing should allow normal multi-character typing without resetting the field selection.",
+            observed_behavior="The edit input highlights the full title after each keypress and replaces the text with the latest character.",
+        )
+        ensure_activity(
+            self.project_root,
+            "feedback-dashboard-blocked",
+            activity_id="frontend-polish-regression-tests",
+            kind="task_execution",
+            entity_id="frontend-polish-regression-tests",
+            phase="polish",
+            objective_id="react-web-frontend-for-creating-viewing-completing-editing-and-deleting-todo-items",
+            display_name="Frontend polish regression tests",
+            assigned_role="objectives.react-web-frontend-for-creating-viewing-completing-editing-and-deleting-todo-items.frontend-worker",
+            status="finalizing",
+            current_activity="Codex turn completed.",
+        )
+        write_json(
+            self.project_root / "runs" / "feedback-dashboard-blocked" / "live" / "run-state.json",
+            {
+                "schema": "run-live-state.v1",
+                "run_id": "feedback-dashboard-blocked",
+                "current_phase": "polish",
+                "active_activity_ids": [],
+                "queued_activity_ids": [],
+                "counts_by_status": {},
+                "counts_by_kind": {},
+                "updated_at": "2026-03-27T00:00:00Z",
+            },
+        )
+
+        console = Console(record=True, width=160)
+        console.print(build_run_dashboard(self.project_root, "feedback-dashboard-blocked"))
+        dashboard_output = console.export_text()
+
+        self.assertIn("frontend-polish-regression-tests", dashboard_output)
+        self.assertIn("finalizing", dashboard_output)
+        self.assertIn("Approved user feedback cannot be applied yet", dashboard_output)
+        self.assertNotIn("apply-feedback feedback-dashboard-blocked", dashboard_output)
+
+    def test_apply_feedback_and_resume_routes_cross_boundary_feedback_through_change_replan(self) -> None:
+        scaffold_feedback_run(self.project_root, "feedback-cross-apply")
+        run_dir = self.project_root / "runs" / "feedback-cross-apply"
+        write_json(
+            run_dir / "tasks" / "frontend-design-due-date-contract.json",
+            {
+                "task_id": "frontend-design-due-date-contract",
+                "objective_id": "react-web-frontend-for-creating-viewing-completing-editing-and-deleting-todo-items",
+                "phase": "design",
+                "expected_outputs": [{"output_id": "frontend_due_date_contract"}],
+            },
+        )
+        write_json(
+            run_dir / "tasks" / "backend-design-due-date-contract.json",
+            {
+                "task_id": "backend-design-due-date-contract",
+                "objective_id": "simple-backend-api-and-persistence-layer-for-storing-todo-items",
+                "phase": "design",
+                "expected_outputs": [{"output_id": "backend_due_date_contract"}],
+            },
+        )
+        write_json(
+            run_dir / "tasks" / "middleware-design-due-date-contract.json",
+            {
+                "task_id": "middleware-design-due-date-contract",
+                "objective_id": "basic-application-integration-and-delivery-workflow-connecting-frontend-and-backend",
+                "phase": "design",
+                "expected_outputs": [{"output_id": "runtime_due_date_contract"}],
+            },
+        )
+        feedback = submit_feedback(
+            self.project_root,
+            "feedback-cross-apply",
+            summary=(
+                "Add due dates to todos so the frontend UI can create and edit them, "
+                "the backend API stores and validates them, and the integrated runtime "
+                "shows overdue items in the app."
+            ),
+            expected_behavior="Due dates are supported across the full todo application.",
+            observed_behavior="Due dates do not exist anywhere in the current app.",
+        )
+
+        with patch(
+            "company_orchestrator.change_replan.apply_approved_changes_and_resume",
+            return_value={
+                "run_id": "feedback-cross-apply",
+                "applied_change_ids": ["feedback-FBK-001-chg-001"],
+                "reentry_phase": "design",
+                "replanned_objective_ids": [
+                    "react-web-frontend-for-creating-viewing-completing-editing-and-deleting-todo-items",
+                    "simple-backend-api-and-persistence-layer-for-storing-todo-items",
+                ],
+                "resumed": True,
+                "resume_summary": {"phase": "design"},
+            },
+        ) as apply_changes_mock, patch(
+            "company_orchestrator.feedback.generate_phase_report",
+            return_value=({"phase": "design", "recommendation": "advance"}, Path("phase-report.md")),
+        ):
+            summary = apply_feedback_and_resume(
+                self.project_root,
+                "feedback-cross-apply",
+            )
+
+        apply_changes_mock.assert_called_once()
+        self.assertEqual(summary["applied_feedback_ids"], [feedback["feedback_id"]])
+        self.assertEqual(summary["applied_change_ids"], ["feedback-FBK-001-chg-001"])
+        change_request = read_json(
+            self.project_root
+            / "runs"
+            / "feedback-cross-apply"
+            / "change-requests"
+            / "feedback-FBK-001-chg-001.json"
+        )
+        self.assertEqual(change_request["approval"]["status"], "approved")
+        self.assertEqual(change_request["approval"]["mode"], "human")
+        self.assertEqual(change_request["change_category"], "shared_behavior")
+        self.assertTrue(change_request["affected_output_ids"])
+        self.assertEqual(
+            sorted(change_request["impacted_objective_ids"]),
+            sorted(
+                [
+                    "basic-application-integration-and-delivery-workflow-connecting-frontend-and-backend",
+                    "react-web-frontend-for-creating-viewing-completing-editing-and-deleting-todo-items",
+                    "simple-backend-api-and-persistence-layer-for-storing-todo-items",
+                ]
+            ),
+        )
+        persisted_feedback = read_json(
+            self.project_root / "runs" / "feedback-cross-apply" / "feedback" / f"{feedback['feedback_id']}.json"
+        )
+        self.assertEqual(persisted_feedback["status"], "resolved")
+
+    def test_apply_feedback_and_resume_rewinds_completed_run_and_resolves_feedback(self) -> None:
+        scaffold_feedback_run(self.project_root, "feedback-apply")
+        feedback = submit_feedback(
+            self.project_root,
+            "feedback-apply",
+            summary="Editing an existing todo only lets me type one character before the whole input gets replaced.",
+            expected_behavior="Editing should allow normal multi-character typing without resetting the field selection.",
+            observed_behavior="The edit input highlights the full title after each keypress and replaces the text with the latest character.",
+        )
+        task_id = (
+            "react-web-frontend-for-creating-viewing-completing-editing-and-deleting-todo-items-frontend-polish-implementation"
+        )
+        write_json(
+            self.project_root / "runs" / "feedback-apply" / "tasks" / f"{task_id}.json",
+            {
+                "schema": "task-assignment.v1",
+                "run_id": "feedback-apply",
+                "phase": "polish",
+                "objective_id": "react-web-frontend-for-creating-viewing-completing-editing-and-deleting-todo-items",
+                "capability": "frontend",
+                "task_id": task_id,
+                "assigned_role": "objectives.react-web-frontend-for-creating-viewing-completing-editing-and-deleting-todo-items.frontend-worker",
+                "manager_role": "objectives.react-web-frontend-for-creating-viewing-completing-editing-and-deleting-todo-items.frontend-manager",
+                "acceptance_role": "objectives.react-web-frontend-for-creating-viewing-completing-editing-and-deleting-todo-items.acceptance-manager",
+                "objective": "Polish the existing frontend implementation.",
+                "inputs": [],
+                "expected_outputs": [],
+                "done_when": ["frontend polish is complete"],
+                "depends_on": [],
+                "validation": [],
+                "collaboration_rules": [],
+                "writes_existing_paths": [],
+                "owned_paths": [],
+                "shared_asset_ids": [],
+            },
+        )
+
+        report_path = self.project_root / "runs" / "feedback-apply" / "phase-reports" / "polish.json"
+        frontend_report_path = self.project_root / "runs" / "feedback-apply" / "reports" / f"{task_id}.json"
+
+        def run_phase_side_effect(*args, **kwargs):
+            write_json(
+                frontend_report_path,
+                {
+                    "task_id": task_id,
+                    "objective_id": "react-web-frontend-for-creating-viewing-completing-editing-and-deleting-todo-items",
+                    "phase": "polish",
+                    "status": "ready_for_bundle_review",
+                    "validation_results": [{"id": "frontend-editing", "status": "passed"}],
+                },
+            )
+            return {
+                "run_id": "feedback-apply",
+                "phase": "polish",
+                "repair_context_exists": (
+                    self.project_root / "runs" / "feedback-apply" / "repair-contexts" / f"{task_id}.json"
+                ).exists(),
+            }
+
+        with patch("company_orchestrator.feedback.plan_objective") as plan_mock, patch(
+            "company_orchestrator.management.run_phase",
+            side_effect=run_phase_side_effect,
+        ) as run_phase_mock, patch(
+            "company_orchestrator.feedback.generate_phase_report",
+            return_value=(
+                {
+                    "phase": "polish",
+                    "recommendation": "advance",
+                    "release_validation_summary": {
+                        "status": "passed",
+                        "report_path": "runs/feedback-apply/phase-reports/polish-release-validation.json",
+                    },
+                },
+                report_path,
+            ),
+        ):
+            summary = apply_feedback_and_resume(
+                self.project_root,
+                "feedback-apply",
+                feedback_ids=[feedback["feedback_id"]],
+            )
+
+        self.assertTrue(summary["resumed"])
+        self.assertEqual(summary["resolved_feedback_ids"], [feedback["feedback_id"]])
+        plan_mock.assert_called_once()
+        self.assertEqual(plan_mock.call_args.kwargs["repair_context"]["source"], "user_feedback")
+        self.assertIn("Edit", plan_mock.call_args.kwargs["repair_context"]["rejection_reasons"][0])
+        run_phase_mock.assert_called_once()
+        self.assertTrue(summary["resume_summary"]["repair_context_exists"])
+        self.assertFalse(
+            (self.project_root / "runs" / "feedback-apply" / "repair-contexts" / f"{task_id}.json").exists()
+        )
+
+        updated_feedback = list_feedback(self.project_root, "feedback-apply")[0]
+        self.assertEqual(updated_feedback["status"], "resolved")
+        self.assertTrue(str(updated_feedback["replacement_plan_revision"]).startswith("feedback:polish:"))
+        self.assertEqual(updated_feedback["resolution"]["status"], "resolved")
+        phase_plan = read_json(self.project_root / "runs" / "feedback-apply" / "phase-plan.json")
+        self.assertEqual(phase_plan["current_phase"], "polish")
+        polish_phase = next(item for item in phase_plan["phases"] if item["phase"] == "polish")
+        self.assertEqual(polish_phase["status"], "active")
+        self.assertFalse(polish_phase["human_approved"])
+
+    def test_active_approved_feedback_auto_resolves_in_progress_feedback_when_phase_report_already_passes(self) -> None:
+        scaffold_feedback_run(self.project_root, "feedback-auto-resolve")
+        feedback = submit_feedback(
+            self.project_root,
+            "feedback-auto-resolve",
+            summary="Editing an existing todo only lets me type one character before the whole input gets replaced.",
+            expected_behavior="Editing should allow normal multi-character typing without resetting the field selection.",
+            observed_behavior="The edit input highlights the full title after each keypress and replaces the text with the latest character.",
+        )
+        feedback_path = self.project_root / "runs" / "feedback-auto-resolve" / "feedback" / f"{feedback['feedback_id']}.json"
+        persisted = read_json(feedback_path)
+        persisted["status"] = "in_progress"
+        persisted["replacement_plan_revision"] = "feedback:polish:2026-03-27T16:38:46Z"
+        write_json(feedback_path, persisted)
+        write_json(
+            self.project_root / "runs" / "feedback-auto-resolve" / "phase-reports" / "polish.json",
+            {
+                "phase": "polish",
+                "recommendation": "advance",
+                "release_validation_summary": {
+                    "status": "passed",
+                    "report_path": "runs/feedback-auto-resolve/phase-reports/polish-release-validation.json",
+                },
+            },
+        )
+        create_collaboration_request(
+            self.project_root,
+            "feedback-auto-resolve",
+            "frontend-polish-regression-tests-CR-002",
+            "react-web-frontend-for-creating-viewing-completing-editing-and-deleting-todo-items",
+            "objectives.react-web-frontend-for-creating-viewing-completing-editing-and-deleting-todo-items.frontend-worker",
+            "objectives.react-web-frontend-for-creating-viewing-completing-editing-and-deleting-todo-items.frontend-manager",
+            "blocking_help",
+            "Need help reviewing the final polish notes.",
+            blocking=True,
+        )
+        write_json(
+            self.project_root / "runs" / "feedback-auto-resolve" / "change-requests" / "frontend-polish-ui-api-hardening-chg-001.json",
+            {
+                "schema": "change-request.v2",
+                "run_id": "feedback-auto-resolve",
+                "change_id": "frontend-polish-ui-api-hardening-chg-001",
+                "source_task_id": "frontend-polish-ui-api-hardening",
+                "source_objective_id": "react-web-frontend-for-creating-viewing-completing-editing-and-deleting-todo-items",
+                "phase": "polish",
+                "change_category": "shared_behavior",
+                "summary": "Older pending change request.",
+                "blocking_reason": "Stale change request should not block feedback auto-resolution once polish passes.",
+                "why_local_resolution_is_invalid": "Stale test fixture only.",
+                "blocking": True,
+                "goal_critical": True,
+                "affected_output_ids": ["frontend-polish-report"],
+                "affected_handoff_ids": [],
+                "impacted_objective_ids": [],
+                "impacted_task_ids": [],
+                "required_reentry_phase": "polish",
+                "impact": {
+                    "goal_changed": False,
+                    "scope_changed": False,
+                    "boundary_changed": False,
+                    "interface_changed": True,
+                    "architecture_changed": False,
+                    "team_changed": False,
+                    "implementation_changed": False
+                },
+                "approval": {"mode": "human", "status": "pending_human_review"},
+                "replacement_plan_revision": None,
+            },
+        )
+
+        active = active_approved_feedback(self.project_root, "feedback-auto-resolve")
+
+        self.assertEqual(active, [])
+        updated_feedback = read_json(feedback_path)
+        self.assertEqual(updated_feedback["status"], "resolved")
+        self.assertEqual(updated_feedback["resolution"]["status"], "resolved")
+
+    def test_active_approved_feedback_does_not_auto_resolve_without_replacement_plan_revision(self) -> None:
+        scaffold_feedback_run(self.project_root, "feedback-no-auto-resolve")
+        feedback = submit_feedback(
+            self.project_root,
+            "feedback-no-auto-resolve",
+            summary="Editing an existing todo still reselects the full title after each keystroke.",
+            expected_behavior="Editing should preserve the caret and allow normal multi-character typing.",
+            observed_behavior="The next character replaces the whole title because the field reselects after each keypress.",
+        )
+        write_json(
+            self.project_root / "runs" / "feedback-no-auto-resolve" / "phase-reports" / "polish.json",
+            {
+                "phase": "polish",
+                "recommendation": "advance",
+                "release_validation_summary": {
+                    "status": "passed",
+                    "report_path": "runs/feedback-no-auto-resolve/phase-reports/polish-release-validation.json",
+                },
+            },
+        )
+
+        active = active_approved_feedback(self.project_root, "feedback-no-auto-resolve")
+
+        self.assertEqual([item["feedback_id"] for item in active], [feedback["feedback_id"]])
+        updated_feedback = read_json(
+            self.project_root / "runs" / "feedback-no-auto-resolve" / "feedback" / f"{feedback['feedback_id']}.json"
+        )
+        self.assertEqual(updated_feedback["status"], "approved")
+        self.assertIsNone(updated_feedback["resolution"])
+
+    def test_triage_feedback_clears_stale_resolution_when_reopening_feedback(self) -> None:
+        scaffold_feedback_run(self.project_root, "feedback-retriage")
+        feedback = submit_feedback(
+            self.project_root,
+            "feedback-retriage",
+            summary="Editing still replaces the whole title after each keypress.",
+            expected_behavior="Editing should preserve the caret.",
+            observed_behavior="Typing one character causes the next character to replace the entire field.",
+        )
+        feedback_path = self.project_root / "runs" / "feedback-retriage" / "feedback" / f"{feedback['feedback_id']}.json"
+        payload = read_json(feedback_path)
+        payload["status"] = "resolved"
+        payload["resolution"] = {
+            "status": "resolved",
+            "resolved_at": "2026-03-28T00:00:00Z",
+            "phase_report_path": "runs/feedback-retriage/phase-reports/polish.json",
+            "validation_report_path": "runs/feedback-retriage/phase-reports/polish-release-validation.json",
+            "notes": "Old resolution.",
+        }
+        write_json(feedback_path, payload)
+
+        updated = triage_feedback(self.project_root, "feedback-retriage", feedback["feedback_id"])
+
+        self.assertEqual(updated["status"], "approved")
+        self.assertIsNone(updated["resolution"])
+
+    def test_apply_feedback_and_resume_replans_after_manager_collaboration_request(self) -> None:
+        scaffold_feedback_run(self.project_root, "feedback-collab-repair")
+        feedback = submit_feedback(
+            self.project_root,
+            "feedback-collab-repair",
+            summary="Editing an existing todo only lets me type one character before the whole input gets replaced.",
+            expected_behavior="Editing should allow normal multi-character typing without resetting the field selection.",
+            observed_behavior="The edit input highlights the full title after each keypress and replaces the text with the latest character.",
+        )
+        create_collaboration_request(
+            self.project_root,
+            "feedback-collab-repair",
+            "frontend-polish-ui-api-hardening-CR-001",
+            "react-web-frontend-for-creating-viewing-completing-editing-and-deleting-todo-items",
+            "objectives.react-web-frontend-for-creating-viewing-completing-editing-and-deleting-todo-items.frontend-worker",
+            "objectives.react-web-frontend-for-creating-viewing-completing-editing-and-deleting-todo-items.frontend-manager",
+            "scope_repair",
+            "The fix needs `apps/todo/frontend/src/todos/app.js` and maybe `apps/todo/frontend/src/index.js` because the live entrypoint bypasses `TodoApp.jsx`.",
+            blocking=True,
+        )
+
+        report_path = self.project_root / "runs" / "feedback-collab-repair" / "phase-reports" / "polish.json"
+        passed_report = (
+            {
+                "phase": "polish",
+                "recommendation": "advance",
+                "release_validation_summary": {
+                    "status": "passed",
+                    "report_path": "runs/feedback-collab-repair/phase-reports/polish-release-validation.json",
+                },
+            },
+            report_path,
+        )
+        failed_report = (
+            {
+                "phase": "polish",
+                "recommendation": "hold",
+                "release_validation_summary": {
+                    "status": "failed",
+                    "report_path": "runs/feedback-collab-repair/phase-reports/polish-release-validation.json",
+                },
+            },
+            report_path,
+        )
+        with patch("company_orchestrator.feedback.plan_objective") as plan_mock, patch(
+            "company_orchestrator.management.run_phase",
+            side_effect=[
+                {"run_id": "feedback-collab-repair", "phase": "polish"},
+                {"run_id": "feedback-collab-repair", "phase": "polish"},
+            ],
+        ) as run_phase_mock, patch(
+            "company_orchestrator.feedback.generate_phase_report",
+            side_effect=[failed_report, passed_report],
+        ):
+            summary = apply_feedback_and_resume(
+                self.project_root,
+                "feedback-collab-repair",
+                feedback_ids=[feedback["feedback_id"]],
+            )
+
+        self.assertTrue(summary["resumed"])
+        self.assertEqual(summary["resolved_feedback_ids"], [feedback["feedback_id"]])
+        self.assertEqual(plan_mock.call_count, 2)
+        second_context = plan_mock.call_args_list[1].kwargs["repair_context"]
+        self.assertEqual(second_context["source"], "user_feedback")
+        self.assertTrue(second_context["collaboration_requests"])
+        self.assertIn(
+            "apps/todo/frontend/src/todos/app.js",
+            second_context["focus_paths"],
+        )
+        request = read_json(
+            self.project_root
+            / "runs"
+            / "feedback-collab-repair"
+            / "collaboration"
+            / "frontend-polish-ui-api-hardening-CR-001.json"
+        )
+        self.assertEqual(request["status"], "resolved")
+        run_phase_mock.assert_called()
+
+    def test_collect_existing_feedback_scope_files_filters_to_concrete_existing_files(self) -> None:
+        app_js = self.project_root / "apps" / "todo" / "frontend" / "src" / "todos" / "app.js"
+        app_js.parent.mkdir(parents=True, exist_ok=True)
+        app_js.write_text("export const value = 1;\n", encoding="utf-8")
+        index_js = self.project_root / "apps" / "todo" / "frontend" / "src" / "index.js"
+        index_js.parent.mkdir(parents=True, exist_ok=True)
+        index_js.write_text("export {};\n", encoding="utf-8")
+        api_js = self.project_root / "apps" / "todo" / "frontend" / "src" / "todos" / "todoApi.js"
+        api_js.parent.mkdir(parents=True, exist_ok=True)
+        api_js.write_text("export const api = {};\n", encoding="utf-8")
+        regression_test = self.project_root / "apps" / "todo" / "frontend" / "test" / "todoApp.polish-regression.test.jsx"
+        regression_test.parent.mkdir(parents=True, exist_ok=True)
+        regression_test.write_text("test('placeholder', () => {});\n", encoding="utf-8")
+
+        concrete = collect_existing_feedback_scope_files(
+            self.project_root,
+            [
+                "apps/todo/frontend/**",
+                "apps/todo/frontend/src/index.js",
+                "apps/todo/frontend/src/todos/app.js",
+                "runs/example/reports/frontend.json",
+            ],
+        )
+
+        self.assertEqual(
+            concrete,
+            [
+                "apps/todo/frontend/src/todos/app.js",
+                "apps/todo/frontend/src/todos/todoApi.js",
+                "apps/todo/frontend/src/index.js",
+                "apps/todo/frontend/test/todoApp.polish-regression.test.jsx",
+            ],
+        )
+
+    def test_user_feedback_repair_context_promotes_concrete_collaboration_files_into_prompt_payload(self) -> None:
+        run_id = "feedback-concrete-files"
+        objective_id = "react-web-frontend-for-creating-viewing-completing-editing-and-deleting-todo-items"
+        scaffold_feedback_run(self.project_root, run_id)
+        app_js = self.project_root / "apps" / "todo" / "frontend" / "src" / "todos" / "app.js"
+        app_js.parent.mkdir(parents=True, exist_ok=True)
+        app_js.write_text("export const TodoApp = () => null;\n", encoding="utf-8")
+        index_js = self.project_root / "apps" / "todo" / "frontend" / "src" / "index.js"
+        index_js.parent.mkdir(parents=True, exist_ok=True)
+        index_js.write_text("export {};\n", encoding="utf-8")
+        todo_app = self.project_root / "apps" / "todo" / "frontend" / "src" / "todos" / "TodoApp.jsx"
+        todo_app.parent.mkdir(parents=True, exist_ok=True)
+        todo_app.write_text("export default function TodoApp() { return null; }\n", encoding="utf-8")
+
+        feedback = submit_feedback(
+            self.project_root,
+            run_id,
+            summary="Editing an existing todo only lets me type one character before the whole input gets replaced.",
+            expected_behavior="Editing should allow normal multi-character typing without resetting the field selection.",
+            observed_behavior="The edit input highlights the full title after each keypress and replaces the text with the latest character.",
+        )
+        create_collaboration_request(
+            self.project_root,
+            run_id,
+            "frontend-polish-ui-api-hardening-CR-001",
+            objective_id,
+            f"objectives.{objective_id}.frontend-worker",
+            f"objectives.{objective_id}.frontend-manager",
+            "scope_repair",
+            "The fix needs `apps/todo/frontend/src/todos/app.js` and maybe `apps/todo/frontend/src/index.js` because the live entrypoint bypasses `TodoApp.jsx`.",
+            blocking=True,
+        )
+        context = build_feedback_repair_context(
+            self.project_root,
+            run_id,
+            objective_id=objective_id,
+            reentry_phase="polish",
+            feedback_items=[feedback],
+            collaboration_requests=[
+                read_json(
+                    self.project_root
+                    / "runs"
+                    / run_id
+                    / "collaboration"
+                    / "frontend-polish-ui-api-hardening-CR-001.json"
+                )
+            ],
+        )
+        self.assertIn("apps/todo/frontend/src/todos/app.js", context["existing_file_hints"])
+        self.assertIn("apps/todo/frontend/src/index.js", context["existing_file_hints"])
+
+        outline = {
+            "schema": "objective-outline.v1",
+            "run_id": run_id,
+            "phase": "polish",
+            "objective_id": objective_id,
+            "summary": "Frontend polish repair outline.",
+            "dependency_notes": [],
+            "capability_lanes": [
+                {
+                    "capability": "frontend",
+                    "assigned_manager_role": f"objectives.{objective_id}.frontend-manager",
+                    "objective": "Repair the frontend todo editing flow.",
+                    "inputs": [
+                        "apps/todo/frontend/src/todos/TodoApp.jsx",
+                        "apps/todo/frontend/src/index.js",
+                    ],
+                    "expected_outputs": [
+                        {
+                            "kind": "artifact",
+                            "output_id": "frontend-polish-ui-api-hardening-ui",
+                            "path": "apps/todo/frontend/src/todos/TodoApp.jsx",
+                            "asset_id": None,
+                            "description": None,
+                            "evidence": None,
+                        },
+                        {
+                            "kind": "artifact",
+                            "output_id": "frontend-polish-regression-tests-suite",
+                            "path": "apps/todo/frontend/test/todo-editing-regression.test.jsx",
+                            "asset_id": None,
+                            "description": None,
+                            "evidence": None,
+                        },
+                    ],
+                    "depends_on": [],
+                    "done_when": ["frontend polish repair is planned"],
+                    "planning_notes": [],
+                    "collaboration_rules": [],
+                }
+            ],
+            "collaboration_edges": [],
+        }
+
+        sanitized = sanitize_outline_for_release_repair(
+            self.project_root,
+            run_id,
+            objective_id=objective_id,
+            outline=outline,
+            repair_context=context,
+        )
+        self.assertIn(
+            "apps/todo/frontend/src/todos/app.js",
+            sanitized["capability_lanes"][0]["inputs"],
+        )
+
+        payload = build_capability_prompt_payload(
+            self.project_root,
+            run_id,
+            objective_id,
+            "frontend",
+            sanitized,
+            repair_context=context,
+        )
+        self.assertIn("apps/todo/frontend/src/todos/app.js", payload["repair_existing_file_hints"])
+
+    def test_user_feedback_repair_reuses_existing_outline_for_single_capability_objective(self) -> None:
+        self.assertTrue(
+            should_reuse_existing_outline_for_repair(
+                replace=True,
+                objective={"capabilities": ["frontend"]},
+                repair_context={"source": "user_feedback"},
+            )
+        )
+
+    def test_render_polish_prompt_includes_approved_user_feedback_details(self) -> None:
+        run_id = "feedback-prompt-details"
+        objective_id = "react-web-frontend-for-creating-viewing-completing-editing-and-deleting-todo-items"
+        task_id = f"{objective_id}-frontend-polish-implementation"
+        scaffold_feedback_run(self.project_root, run_id)
+        feedback = submit_feedback(
+            self.project_root,
+            run_id,
+            summary="Improve inline todo editing so the edit field behaves like a normal text input during continuous typing.",
+            expected_behavior="Inline editing preserves the full draft while typing and supports save and cancel.",
+            observed_behavior="Typing into the inline editor can collapse into one-character-at-a-time behavior.",
+            repro_steps=[
+                "Open the todo app.",
+                "Click Edit on an existing todo.",
+                "Type a multi-character replacement title.",
+            ],
+        )
+        repair_context = build_feedback_repair_context(
+            self.project_root,
+            run_id,
+            objective_id=objective_id,
+            reentry_phase="polish",
+            feedback_items=[feedback],
+        )
+        repair_context_dir = self.project_root / "runs" / run_id / "repair-contexts"
+        repair_context_dir.mkdir(parents=True, exist_ok=True)
+        write_json(repair_context_dir / f"{task_id}.json", repair_context)
+
+        todo_item_path = self.project_root / "apps" / "todo" / "frontend" / "src" / "todos" / "TodoItem.jsx"
+        todo_item_path.parent.mkdir(parents=True, exist_ok=True)
+        todo_item_path.write_text("export function TodoItem() { return null; }\n", encoding="utf-8")
+        task = {
+            "schema": "task-assignment.v1",
+            "run_id": run_id,
+            "phase": "polish",
+            "objective_id": objective_id,
+            "capability": "frontend",
+            "task_id": task_id,
+            "assigned_role": f"objectives.{objective_id}.frontend-worker",
+            "manager_role": f"objectives.{objective_id}.frontend-manager",
+            "acceptance_role": f"objectives.{objective_id}.acceptance-manager",
+            "objective": "Harden inline todo editing behavior and regression coverage.",
+            "inputs": [],
+            "expected_outputs": [
+                {
+                    "kind": "artifact",
+                    "output_id": "frontend-polish-ui",
+                    "path": "apps/todo/frontend/src/todos/TodoItem.jsx",
+                    "asset_id": None,
+                    "description": None,
+                    "evidence": None,
+                }
+            ],
+            "done_when": ["inline editing polish behavior is repaired"],
+            "depends_on": [],
+            "validation": [
+                {
+                    "id": "frontend-inline-edit-regression",
+                    "command": "node --test apps/todo/frontend/test/app.editing.test.js",
+                }
+            ],
+            "collaboration_rules": [],
+            "writes_existing_paths": ["apps/todo/frontend/src/todos/TodoItem.jsx"],
+            "owned_paths": ["apps/todo/frontend/src/todos/TodoItem.jsx"],
+            "shared_asset_ids": [],
+        }
+        task_path = self.project_root / "runs" / run_id / "tasks" / f"{task_id}.json"
+        write_json(task_path, task)
+
+        metadata = render_prompt(self.project_root, run_id, task_path)
+        prompt_text = (self.project_root / metadata["prompt_path"]).read_text(encoding="utf-8")
+
+        self.assertIn("# Approved User Feedback", prompt_text)
+        self.assertIn(feedback["summary"], prompt_text)
+        self.assertIn(feedback["expected_behavior"], prompt_text)
+        self.assertIn(feedback["observed_behavior"], prompt_text)
+        self.assertIn("Repro 1: Open the todo app.", prompt_text)
+        self.assertIn("# Feedback Repair Rules", prompt_text)
+        self.assertIn("Add or update regression coverage for the reported behavior", prompt_text)
+        self.assertIn("`Repair Inputs.user_feedback`", prompt_text)
+        self.assertIn("\"Repair Inputs.user_feedback\"", prompt_text)
+
+    def test_render_polish_prompt_omits_feedback_sections_without_feedback_repair_context(self) -> None:
+        run_id = "polish-prompt-no-feedback"
+        objective_id = "react-web-frontend-for-creating-viewing-completing-editing-and-deleting-todo-items"
+        task_id = f"{objective_id}-frontend-polish-implementation"
+        scaffold_feedback_run(self.project_root, run_id)
+        task = {
+            "schema": "task-assignment.v1",
+            "run_id": run_id,
+            "phase": "polish",
+            "objective_id": objective_id,
+            "capability": "frontend",
+            "task_id": task_id,
+            "assigned_role": f"objectives.{objective_id}.frontend-worker",
+            "manager_role": f"objectives.{objective_id}.frontend-manager",
+            "acceptance_role": f"objectives.{objective_id}.acceptance-manager",
+            "objective": "General frontend polish implementation.",
+            "inputs": [],
+            "expected_outputs": [],
+            "done_when": ["frontend polish is complete"],
+            "depends_on": [],
+            "validation": [],
+            "collaboration_rules": [],
+            "writes_existing_paths": [],
+            "owned_paths": [],
+            "shared_asset_ids": [],
+        }
+        task_path = self.project_root / "runs" / run_id / "tasks" / f"{task_id}.json"
+        write_json(task_path, task)
+
+        metadata = render_prompt(self.project_root, run_id, task_path)
+        prompt_text = (self.project_root / metadata["prompt_path"]).read_text(encoding="utf-8")
+
+        self.assertNotIn("# Approved User Feedback", prompt_text)
+        self.assertNotIn("# Feedback Repair Rules", prompt_text)
+        self.assertNotIn("`Repair Inputs.user_feedback`", prompt_text)
+
+    def test_active_approved_feedback_includes_unresolved_in_progress_items(self) -> None:
+        scaffold_feedback_run(self.project_root, "feedback-retry")
+        submit_feedback(
+            self.project_root,
+            "feedback-retry",
+            summary="Editing an existing todo only lets me type one character before the whole input gets replaced.",
+            expected_behavior="Editing should allow normal multi-character typing without resetting the field selection.",
+            observed_behavior="The edit input highlights the full title after each keypress and replaces the text with the latest character.",
+        )
+        payload = list_feedback(self.project_root, "feedback-retry")[0]
+        payload["status"] = "in_progress"
+        payload["replacement_plan_revision"] = "feedback:polish:test"
+        write_json(self.project_root / "runs" / "feedback-retry" / "feedback" / f"{payload['feedback_id']}.json", payload)
+
+        active = active_approved_feedback(self.project_root, "feedback-retry")
+
+        self.assertEqual([item["feedback_id"] for item in active], [payload["feedback_id"]])
+
+    def test_active_approved_feedback_defers_later_phase_feedback_by_default(self) -> None:
+        scaffold_feedback_run(self.project_root, "feedback-deferred")
+        feedback = submit_feedback(
+            self.project_root,
+            "feedback-deferred",
+            summary="Editing an existing todo only lets me type one character before the whole input gets replaced.",
+            expected_behavior="Editing should allow normal multi-character typing without resetting the field selection.",
+            observed_behavior="The edit input highlights the full title after each keypress and replaces the text with the latest character.",
+        )
+        phase_plan = read_json(self.project_root / "runs" / "feedback-deferred" / "phase-plan.json")
+        phase_plan["current_phase"] = "design"
+        for item in phase_plan["phases"]:
+            if item["phase"] == "design":
+                item["status"] = "active"
+                item["human_approved"] = False
+            elif item["phase"] == "polish":
+                item["status"] = "pending"
+                item["human_approved"] = False
+        write_json(self.project_root / "runs" / "feedback-deferred" / "phase-plan.json", phase_plan)
+
+        active = active_approved_feedback(self.project_root, "feedback-deferred")
+        explicit = active_approved_feedback(
+            self.project_root,
+            "feedback-deferred",
+            feedback_ids=[feedback["feedback_id"]],
+        )
+
+        self.assertEqual(active, [])
+        self.assertEqual([item["feedback_id"] for item in explicit], [feedback["feedback_id"]])
+
+    def test_apply_feedback_blocks_when_target_objective_already_has_active_work(self) -> None:
+        scaffold_feedback_run(self.project_root, "feedback-active-blocker")
+        feedback = submit_feedback(
+            self.project_root,
+            "feedback-active-blocker",
+            summary="Editing an existing todo only lets me type one character before the whole input gets replaced.",
+            expected_behavior="Editing should allow normal multi-character typing without resetting the field selection.",
+            observed_behavior="The edit input highlights the full title after each keypress and replaces the text with the latest character.",
+        )
+        payload = list_feedback(self.project_root, "feedback-active-blocker")[0]
+        payload["status"] = "in_progress"
+        payload["replacement_plan_revision"] = "feedback:polish:test"
+        write_json(
+            self.project_root / "runs" / "feedback-active-blocker" / "feedback" / f"{payload['feedback_id']}.json",
+            payload,
+        )
+
+        with patch(
+            "company_orchestrator.change_replan.active_replan_blockers",
+            return_value=[{"activity_id": "task-1", "status": "running"}],
+        ):
+            with self.assertRaisesRegex(ValueError, "still have active work"):
+                apply_feedback_and_resume(
+                    self.project_root,
+                    "feedback-active-blocker",
+                    feedback_ids=[feedback["feedback_id"]],
+                )
+
+    def test_active_approved_feedback_reopens_invalid_resolved_feedback(self) -> None:
+        scaffold_feedback_run(self.project_root, "feedback-reopen")
+        feedback = submit_feedback(
+            self.project_root,
+            "feedback-reopen",
+            summary="Editing an existing todo only lets me type one character before the whole input gets replaced.",
+            expected_behavior="Editing should allow normal multi-character typing without resetting the field selection.",
+            observed_behavior="The edit input highlights the full title after each keypress and replaces the text with the latest character.",
+        )
+        payload = list_feedback(self.project_root, "feedback-reopen")[0]
+        payload["status"] = "resolved"
+        payload["resolution"] = {
+            "status": "resolved",
+            "resolved_at": "2026-03-27T16:30:00Z",
+            "phase_report_path": "runs/feedback-reopen/phase-reports/polish.json",
+            "validation_report_path": "runs/feedback-reopen/phase-reports/polish-release-validation.json",
+            "notes": "incorrectly resolved",
+        }
+        write_json(
+            self.project_root / "runs" / "feedback-reopen" / "feedback" / f"{payload['feedback_id']}.json",
+            payload,
+        )
+        write_json(
+            self.project_root / "runs" / "feedback-reopen" / "reports" / "frontend-polish-ui-api-hardening.json",
+            {
+                "schema": "completion-report.v1",
+                "run_id": "feedback-reopen",
+                "phase": "polish",
+                "objective_id": feedback["triage"]["owner_objective_id"],
+                "task_id": "frontend-polish-ui-api-hardening",
+                "agent_role": "objectives.react-web-frontend-for-creating-viewing-completing-editing-and-deleting-todo-items.frontend-worker",
+                "status": "blocked",
+                "summary": "Still blocked.",
+                "artifacts": [],
+                "validation_results": [],
+                "open_issues": [],
+                "produced_outputs": [],
+                "change_requests": [],
+            },
+        )
+        write_json(
+            self.project_root / "runs" / "feedback-reopen" / "phase-reports" / "polish.json",
+            {
+                "phase": "polish",
+                "recommendation": "advance",
+                "release_validation_summary": {
+                    "status": "passed",
+                    "report_path": "runs/feedback-reopen/phase-reports/polish-release-validation.json",
+                },
+            },
+        )
+
+        active = active_approved_feedback(self.project_root, "feedback-reopen")
+
+        self.assertEqual([item["feedback_id"] for item in active], [feedback["feedback_id"]])
+        updated = list_feedback(self.project_root, "feedback-reopen")[0]
+        self.assertEqual(updated["status"], "approved")
+        self.assertIsNone(updated["resolution"])
 
     def test_materialize_executor_response_accepts_artifacts_present_only_in_task_worktree(self) -> None:
         scaffold_planning_run(self.project_root, "structured-produced-outputs-worktree", ["frontend"])
@@ -14329,19 +20991,7 @@ url = "https://example.com/mcp"
             "validation_results": [{"id": "scope-check", "status": "passed", "evidence": "scope validated"}],
             "open_issues": [],
             "change_requests": [],
-            "produced_outputs": [
-                {
-                    "kind": "assertion",
-                    "output_id": "frontend.discovery.ready",
-                    "path": None,
-                    "asset_id": None,
-                    "description": "Frontend discovery scope is ready for the next phase.",
-                    "evidence": {
-                        "validation_ids": ["scope-check"],
-                        "artifact_paths": [],
-                    },
-                }
-            ],
+            "produced_output_ids": ["frontend.discovery.ready"],
             "context_echo": {
                 "role_id": "objectives.app-a.frontend-worker",
                 "objective_id": "app-a",
@@ -14363,6 +21013,143 @@ url = "https://example.com/mcp"
         )
 
         self.assertEqual(report["produced_outputs"], task["expected_outputs"])
+
+    def test_materialize_executor_response_canonicalizes_asset_outputs_by_output_id(self) -> None:
+        scaffold_planning_run(self.project_root, "structured-produced-outputs-asset", ["middleware"])
+        output_path = (
+            self.project_root
+            / "runs"
+            / "structured-produced-outputs-asset"
+            / "artifacts"
+            / "middleware"
+            / "design"
+            / "frontend-backend-integration-contract.md"
+        )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text("# contract\n", encoding="utf-8")
+        task = {
+            "schema": "task-assignment.v1",
+            "run_id": "structured-produced-outputs-asset",
+            "phase": "design",
+            "objective_id": "app-a",
+            "capability": "middleware",
+            "task_id": "APP-A-MIDDLEWARE-002",
+            "assigned_role": "objectives.app-a.middleware-worker",
+            "manager_role": "objectives.app-a.middleware-manager",
+            "acceptance_role": "objectives.app-a.acceptance-manager",
+            "objective": "Produce the shared integration contract asset.",
+            "inputs": [],
+            "expected_outputs": [
+                {
+                    "kind": "asset",
+                    "output_id": "middleware-integration-contract-design",
+                    "path": "runs/structured-produced-outputs-asset/artifacts/middleware/design/frontend-backend-integration-contract.md",
+                    "asset_id": "shared.integration.frontend-backend-contract",
+                    "description": None,
+                    "evidence": None,
+                }
+            ],
+            "done_when": [],
+            "depends_on": [],
+            "validation": [],
+            "collaboration_rules": [],
+        }
+        parsed_response = {
+            "summary": "Produced the middleware integration contract asset.",
+            "status": "ready_for_bundle_review",
+            "artifacts": [
+                {
+                    "path": "runs/structured-produced-outputs-asset/artifacts/middleware/design/frontend-backend-integration-contract.md",
+                    "status": "created",
+                }
+            ],
+            "validation_results": [],
+            "open_issues": [],
+            "change_requests": [],
+            "produced_output_ids": ["middleware-integration-contract-design"],
+            "collaboration_request": None,
+        }
+
+        report, _, _ = materialize_executor_response(
+            self.project_root,
+            "structured-produced-outputs-asset",
+            task,
+            parsed_response,
+            runtime_warnings=[],
+            runtime_recovery=None,
+            runtime_observability=None,
+        )
+
+        self.assertEqual(report["produced_outputs"], task["expected_outputs"])
+
+    def test_materialize_executor_response_drops_blocked_produced_outputs(self) -> None:
+        scaffold_planning_run(self.project_root, "blocked-produced-outputs", ["backend"])
+        task = {
+            "schema": "task-assignment.v1",
+            "run_id": "blocked-produced-outputs",
+            "phase": "discovery",
+            "objective_id": "app-a",
+            "capability": "backend",
+            "task_id": "APP-A-BACKEND-003",
+            "assigned_role": "objectives.app-a.backend-worker",
+            "manager_role": "objectives.app-a.backend-manager",
+            "acceptance_role": "objectives.app-a.acceptance-manager",
+            "objective": "Reconcile blocked backend discovery scope.",
+            "inputs": [],
+            "expected_outputs": [
+                {
+                    "kind": "assertion",
+                    "output_id": "backend.discovery.ready",
+                    "path": None,
+                    "asset_id": None,
+                    "description": "Backend discovery output is ready.",
+                    "evidence": {
+                        "validation_ids": ["validate-discovery-context"],
+                        "artifact_paths": [],
+                    },
+                }
+            ],
+            "done_when": [],
+            "depends_on": [],
+            "validation": [{"id": "validate-discovery-context", "command": "validate-discovery-context"}],
+            "collaboration_rules": [],
+        }
+        parsed_response = {
+            "summary": "Blocked because the validation command was truncated in the task assignment.",
+            "status": "blocked",
+            "artifacts": [],
+            "validation_results": [
+                {
+                    "id": "validate-discovery-context",
+                    "status": "failed",
+                    "evidence": "command was truncated",
+                }
+            ],
+            "open_issues": ["Blocking: validation command was truncated."],
+            "change_requests": [],
+            "produced_output_ids": ["backend.discovery.ready"],
+            "collaboration_request": {
+                "to_role": "objectives.app-a.backend-manager",
+                "type": "contract_resolution",
+                "summary": "Provide the full validation command.",
+                "blocking": True,
+            },
+        }
+
+        report, collaboration_ids, change_request_ids = materialize_executor_response(
+            self.project_root,
+            "blocked-produced-outputs",
+            task,
+            parsed_response,
+            runtime_warnings=[],
+            runtime_recovery=None,
+            runtime_observability=None,
+        )
+
+        self.assertEqual(report["status"], "blocked")
+        self.assertEqual(report["produced_outputs"], [])
+        self.assertEqual(len(collaboration_ids), 1)
+        self.assertEqual(change_request_ids, [])
 
     def test_ensure_run_integration_workspace_serializes_concurrent_setup(self) -> None:
         active = threading.Lock()
@@ -14479,6 +21266,24 @@ url = "https://example.com/mcp"
             )
 
         self.assertIn("references validations that are not declared on the task", str(ctx.exception))
+
+    def test_validate_capability_plan_backfills_assigned_role(self) -> None:
+        scaffold_planning_run(self.project_root, "capability-plan-role-backfill", ["frontend"])
+        outline = objective_outline_for_objective("capability-plan-role-backfill", "app-a", ["frontend"])
+        plan = capability_plan_for_objective("capability-plan-role-backfill", "app-a", "frontend")
+        plan["tasks"][0].pop("assigned_role")
+
+        validate_capability_plan_contents(
+            self.project_root,
+            plan,
+            run_id="capability-plan-role-backfill",
+            phase="discovery",
+            objective_id="app-a",
+            capability="frontend",
+            objective_outline=outline,
+        )
+
+        self.assertEqual(plan["tasks"][0]["assigned_role"], "objectives.app-a.frontend-worker")
 
     def test_validate_capability_plan_rejects_discovery_producer_assertions_and_self_checks(self) -> None:
         scaffold_planning_run(self.project_root, "invalid-discovery-producer-contract", ["middleware"])
@@ -15004,6 +21809,18 @@ url = "https://example.com/mcp"
 
         self.assertIn("must not emit shared api contract outputs", str(ctx.exception))
 
+    def test_validate_objective_plan_backfills_assigned_role(self) -> None:
+        plan = planned_payload_for_objective("objective-plan-role-backfill", "app-a")
+        plan["tasks"][0].pop("assigned_role")
+
+        validate_objective_plan_contents(
+            self.project_root,
+            plan,
+            {"objective_id": "app-a", "capabilities": ["frontend"]},
+        )
+
+        self.assertEqual(plan["tasks"][0]["assigned_role"], "objectives.app-a.frontend-worker")
+
     def test_validate_capability_plan_rejects_middleware_shared_api_contract_outputs(self) -> None:
         scaffold_planning_run(self.project_root, "middleware-contract-authority", ["middleware"])
         outline = objective_outline_for_objective("middleware-contract-authority", "app-a", ["middleware"])
@@ -15073,6 +21890,148 @@ url = "https://example.com/mcp"
             )
 
         self.assertIn("must not emit shared api contract outputs", str(ctx.exception))
+
+    def test_normalize_objective_outline_rejects_silent_move_of_prior_artifact_path(self) -> None:
+        scaffold_planning_run(self.project_root, "outline-artifact-continuity", ["middleware"])
+        run_dir = self.project_root / "runs" / "outline-artifact-continuity"
+        objective_root = find_objective_root(self.project_root, "app-a")
+        prior_path = str((objective_root / "design" / "mvp-delivery-workflow.md").relative_to(self.project_root))
+        prior_file = self.project_root / prior_path
+        prior_file.parent.mkdir(parents=True, exist_ok=True)
+        prior_file.write_text("workflow\n", encoding="utf-8")
+        write_json(
+            run_dir / "reports" / "middleware-mvp-build.json",
+            {
+                "schema": "completion-report.v1",
+                "run_id": "outline-artifact-continuity",
+                "phase": "mvp-build",
+                "objective_id": "app-a",
+                "task_id": "MW-MVP-WORKFLOW",
+                "agent_role": "objectives.app-a.middleware-worker",
+                "summary": "Updated the MVP delivery workflow.",
+                "artifacts": [{"path": prior_path, "status": "updated"}],
+            },
+        )
+
+        objective = {
+            "objective_id": "app-a",
+            "capabilities": ["middleware"],
+        }
+        outline = objective_outline_for_objective("outline-artifact-continuity", "app-a", ["middleware"])
+        outline["phase"] = "polish"
+        outline["capability_lanes"][0]["expected_outputs"] = [
+            {
+                "kind": "artifact",
+                "output_id": "runtime_delivery_workflow_script",
+                "path": "apps/todo/runtime/scripts/delivery-workflow.js",
+                "asset_id": None,
+                "description": None,
+                "evidence": None,
+            }
+        ]
+
+        with self.assertRaises(ExecutorError) as ctx:
+            normalize_objective_outline(
+                self.project_root,
+                outline,
+                run_id="outline-artifact-continuity",
+                phase="polish",
+                objective=objective,
+            )
+
+        self.assertIn("silently moved the previously accepted artifact", str(ctx.exception))
+        self.assertIn(prior_path, str(ctx.exception))
+
+    def test_validate_capability_plan_rejects_silent_move_of_prior_artifact_path(self) -> None:
+        scaffold_planning_run(self.project_root, "capability-artifact-continuity", ["middleware"])
+        run_dir = self.project_root / "runs" / "capability-artifact-continuity"
+        objective_root = find_objective_root(self.project_root, "app-a")
+        prior_path = str((objective_root / "design" / "mvp-delivery-workflow.md").relative_to(self.project_root))
+        prior_file = self.project_root / prior_path
+        prior_file.parent.mkdir(parents=True, exist_ok=True)
+        prior_file.write_text("workflow\n", encoding="utf-8")
+        write_json(
+            run_dir / "reports" / "middleware-mvp-build.json",
+            {
+                "schema": "completion-report.v1",
+                "run_id": "capability-artifact-continuity",
+                "phase": "mvp-build",
+                "objective_id": "app-a",
+                "task_id": "MW-MVP-WORKFLOW",
+                "agent_role": "objectives.app-a.middleware-worker",
+                "summary": "Updated the MVP delivery workflow.",
+                "artifacts": [{"path": prior_path, "status": "updated"}],
+            },
+        )
+
+        outline = objective_outline_for_objective("capability-artifact-continuity", "app-a", ["middleware"])
+        outline["phase"] = "polish"
+        outline["capability_lanes"][0]["expected_outputs"] = [
+            {
+                "kind": "artifact",
+                "output_id": "runtime_delivery_workflow_script",
+                "path": "apps/todo/runtime/scripts/delivery-workflow.js",
+                "asset_id": None,
+                "description": None,
+                "evidence": None,
+            }
+        ]
+        plan = {
+            "schema": "capability-plan.v1",
+            "run_id": "capability-artifact-continuity",
+            "phase": "polish",
+            "objective_id": "app-a",
+            "capability": "middleware",
+            "summary": "Middleware polish plan.",
+            "tasks": [
+                {
+                    "task_id": "APP-A-MW-001",
+                    "capability": "middleware",
+                    "assigned_role": "objectives.app-a.middleware-worker",
+                    "execution_mode": "isolated_write",
+                    "parallel_policy": "serialize",
+                    "owned_paths": ["apps/todo/runtime/scripts/delivery-workflow.js"],
+                    "writes_existing_paths": [],
+                    "shared_asset_ids": [],
+                    "objective": "Replace the accepted workflow with a runtime script.",
+                    "inputs": [],
+                    "expected_outputs": [
+                        {
+                            "kind": "artifact",
+                            "output_id": "runtime_delivery_workflow_script",
+                            "path": "apps/todo/runtime/scripts/delivery-workflow.js",
+                            "asset_id": None,
+                            "description": None,
+                            "evidence": None,
+                        }
+                    ],
+                    "done_when": ["done"],
+                    "depends_on": [],
+                    "validation": [],
+                    "collaboration_rules": [],
+                    "working_directory": None,
+                    "additional_directories": [],
+                    "sandbox_mode": "workspace-write",
+                }
+            ],
+            "bundle_plan": [{"bundle_id": "middleware-bundle", "task_ids": ["APP-A-MW-001"], "summary": "bundle"}],
+            "dependency_notes": [],
+            "collaboration_handoffs": [],
+        }
+
+        with self.assertRaises(ExecutorError) as ctx:
+            validate_capability_plan_contents(
+                self.project_root,
+                plan,
+                run_id="capability-artifact-continuity",
+                phase="polish",
+                objective_id="app-a",
+                capability="middleware",
+                objective_outline=outline,
+            )
+
+        self.assertIn("silently moved the previously accepted artifact", str(ctx.exception))
+        self.assertIn(prior_path, str(ctx.exception))
 
     def test_validate_capability_plan_rejects_nonfrontend_consumer_contract_inputs(self) -> None:
         scaffold_planning_run(self.project_root, "consumer-contract-authority", ["middleware"])
@@ -15277,6 +22236,109 @@ url = "https://example.com/mcp"
         terminal_output_ids = [item["output_id"] for item in terminal_task["expected_outputs"]]
         self.assertIn("backend-crud-tests", terminal_output_ids)
         self.assertIn("apps/todo/backend/tests/todo-api.test.ts", terminal_task["owned_paths"])
+
+    def test_normalize_capability_plan_rejects_typescript_backend_plan_against_established_javascript_workspace(self) -> None:
+        scaffold_planning_run(self.project_root, "backend-language-shape", ["backend"])
+        generic_root = self.project_root / "orchestrator" / "roles" / "objectives" / "app-a"
+        app_role_root = self.project_root / "apps" / "todo" / "orchestrator" / "roles" / "objectives" / "app-a"
+        app_role_root.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(generic_root, app_role_root)
+        shutil.rmtree(generic_root)
+        backend_src = self.project_root / "apps" / "todo" / "backend" / "src" / "todos"
+        backend_src.mkdir(parents=True, exist_ok=True)
+        (self.project_root / "apps" / "todo" / "backend" / "src" / "server.js").write_text("module.exports = {};\n", encoding="utf-8")
+        (backend_src / "repository.js").write_text("module.exports = {};\n", encoding="utf-8")
+        backend_design = self.project_root / "apps" / "todo" / "backend" / "design"
+        backend_design.mkdir(parents=True, exist_ok=True)
+        (backend_design / "backend-design-package.md").write_text("backend design\n", encoding="utf-8")
+
+        outline = objective_outline_for_objective("backend-language-shape", "app-a", ["backend"])
+        outline["phase"] = "mvp-build"
+        outline["capability_lanes"][0]["expected_outputs"] = [
+            {
+                "kind": "asset",
+                "output_id": "backend-http-entrypoint",
+                "path": "apps/todo/backend/src/server.ts",
+                "asset_id": "backend-http-entrypoint",
+                "description": None,
+                "evidence": None,
+            },
+            {
+                "kind": "asset",
+                "output_id": "backend-repository",
+                "path": "apps/todo/backend/src/todos/repository.ts",
+                "asset_id": "backend-repository",
+                "description": None,
+                "evidence": None,
+            },
+        ]
+        plan = {
+            "schema": "capability-plan.v1",
+            "run_id": "backend-language-shape",
+            "phase": "mvp-build",
+            "objective_id": "app-a",
+            "capability": "backend",
+            "summary": "Backend build plan.",
+            "tasks": [
+                {
+                    "task_id": "BACKEND-001",
+                    "capability": "backend",
+                    "assigned_role": "objectives.app-a.backend-worker",
+                    "execution_mode": "isolated_write",
+                    "parallel_policy": "serialize",
+                    "owned_paths": [],
+                    "writes_existing_paths": [],
+                    "shared_asset_ids": [],
+                    "objective": "Implement backend in TypeScript.",
+                    "inputs": ["apps/todo/backend/design/backend-design-package.md"],
+                    "expected_outputs": [
+                        {
+                            "kind": "asset",
+                            "output_id": "backend-http-entrypoint",
+                            "path": "apps/todo/backend/src/server.ts",
+                            "asset_id": "backend-http-entrypoint",
+                            "description": None,
+                            "evidence": None,
+                        },
+                        {
+                            "kind": "asset",
+                            "output_id": "backend-repository",
+                            "path": "apps/todo/backend/src/todos/repository.ts",
+                            "asset_id": "backend-repository",
+                            "description": None,
+                            "evidence": None,
+                        },
+                    ],
+                    "done_when": ["done"],
+                    "depends_on": [],
+                    "validation": [
+                        {"id": "backend-types", "command": "pnpm exec tsc --noEmit --project apps/todo/backend/tsconfig.json"}
+                    ],
+                    "collaboration_rules": [],
+                    "working_directory": None,
+                    "additional_directories": [],
+                    "sandbox_mode": "workspace-write",
+                }
+            ],
+            "bundle_plan": [{"bundle_id": "backend-build", "task_ids": ["BACKEND-001"], "summary": "bundle"}],
+            "dependency_notes": [],
+            "collaboration_handoffs": [],
+        }
+
+        with self.assertRaises(ExecutorError) as ctx:
+            normalize_capability_plan(
+                self.project_root,
+                plan,
+                run_id="backend-language-shape",
+                phase="mvp-build",
+                objective_id="app-a",
+                capability="backend",
+                objective_outline=outline,
+                default_sandbox_mode="workspace-write",
+            )
+
+        self.assertIn("observed backend workspace language", str(ctx.exception))
+        self.assertIn("apps/todo/backend/src/server.ts", str(ctx.exception))
 
     def test_align_required_outbound_handoff_output_ids_keeps_source_task_scope(self) -> None:
         plan = {
@@ -15568,6 +22630,53 @@ def scaffold_dual_planning_run(project_root: Path, run_id: str) -> None:
     generate_role_files(project_root, run_id, approve=True)
 
 
+def scaffold_feedback_run(project_root: Path, run_id: str) -> None:
+    run_dir = initialize_run(
+        project_root,
+        run_id,
+        "# Goal\n\n## Objectives\n- React web frontend for creating, viewing, completing, editing, and deleting todo items\n"
+        "- Simple backend API and persistence layer for storing todo items\n"
+        "- Basic application integration and delivery workflow connecting frontend and backend",
+    )
+    objective_map = {
+        "schema": "objective-map.v1",
+        "run_id": run_id,
+        "objectives": [
+            {
+                "objective_id": "react-web-frontend-for-creating-viewing-completing-editing-and-deleting-todo-items",
+                "title": "React web frontend for creating, viewing, completing, editing, and deleting todo items",
+                "summary": "Frontend todo experience",
+                "status": "approved",
+                "capabilities": ["frontend"],
+            },
+            {
+                "objective_id": "simple-backend-api-and-persistence-layer-for-storing-todo-items",
+                "title": "Simple backend API and persistence layer for storing todo items",
+                "summary": "Backend todo persistence",
+                "status": "approved",
+                "capabilities": ["backend"],
+            },
+            {
+                "objective_id": "basic-application-integration-and-delivery-workflow-connecting-frontend-and-backend",
+                "title": "Basic application integration and delivery workflow connecting frontend and backend",
+                "summary": "Integration delivery workflow",
+                "status": "approved",
+                "capabilities": ["middleware"],
+            },
+        ],
+        "dependencies": [],
+    }
+    write_json(run_dir / "objective-map.json", objective_map)
+    suggest_team_proposals(project_root, run_id)
+    generate_role_files(project_root, run_id, approve=True)
+    phase_plan = read_json(run_dir / "phase-plan.json")
+    phase_plan["current_phase"] = "polish"
+    for item in phase_plan["phases"]:
+        item["status"] = "complete"
+        item["human_approved"] = True
+    write_json(run_dir / "phase-plan.json", phase_plan)
+
+
 def planned_payload_for_objective(run_id: str, objective_id: str) -> dict[str, object]:
     capability = "frontend" if objective_id == "app-a" else "backend"
     return {
@@ -15641,7 +22750,7 @@ def objective_outline_for_objective(
                     else f"objectives.{objective_id}.objective-manager"
                 ),
                 "objective": f"Plan {capability} discovery work for {objective_id}",
-                "inputs": ["Planning Inputs.goal_markdown"],
+                "inputs": ["Planning Inputs.goal_context"],
                 "expected_outputs": [
                     {
                         "kind": "artifact",
@@ -15689,7 +22798,7 @@ def capability_plan_for_objective(
                 "owned_paths": [],
                 "shared_asset_ids": [],
                 "objective": f"Plan {capability} work for {objective_id}",
-                "inputs": ["Planning Inputs.goal_markdown"],
+                "inputs": ["Planning Inputs.goal_context"],
                 "expected_outputs": [
                     {
                         "kind": "artifact",

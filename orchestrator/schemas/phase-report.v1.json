@@ -205,13 +205,32 @@
       ],
       "additionalProperties": false,
       "properties": {
-        "status": {"type": "string", "enum": ["passed", "failed"]},
+        "status": {"type": "string", "enum": ["passed", "failed", "running"]},
+        "attempt": {"type": "number"},
+        "evaluation_mode": {"type": ["string", "null"]},
         "command": {"type": ["string", "null"]},
-        "working_directory": {"type": "string"},
+        "working_directory": {"type": ["string", "null"]},
         "report_path": {"type": "string"},
-        "stdout_path": {"type": "string"},
-        "stderr_path": {"type": "string"},
+        "stdout_path": {"type": ["string", "null"]},
+        "stderr_path": {"type": ["string", "null"]},
         "summary": {"type": "string"},
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["task_id", "objective_id", "capability", "validation_id", "command", "status", "summary"],
+            "additionalProperties": false,
+            "properties": {
+              "task_id": {"type": "string"},
+              "objective_id": {"type": ["string", "null"]},
+              "capability": {"type": ["string", "null"]},
+              "validation_id": {"type": ["string", "null"]},
+              "command": {"type": ["string", "null"]},
+              "status": {"type": "string"},
+              "summary": {"type": "string"}
+            }
+          }
+        },
         "failure_diagnostics": {
           "type": "array",
           "items": {
@@ -220,6 +239,7 @@
               "category",
               "owner_capability",
               "owner_objective_id",
+              "task_id",
               "source_test",
               "paths",
               "excerpt",
@@ -230,6 +250,7 @@
               "category": {"type": "string"},
               "owner_capability": {"type": ["string", "null"]},
               "owner_objective_id": {"type": ["string", "null"]},
+              "task_id": {"type": ["string", "null"]},
               "source_test": {"type": ["string", "null"]},
               "paths": {"type": "array", "items": {"type": "string"}},
               "excerpt": {"type": "string"},

@@ -24,6 +24,7 @@ function createTodoFrontendServer(options = {}) {
 
   app.disable('x-powered-by');
   app.get('/', (_request, response) => {
+    applyNoStore(response);
     response.type('html');
     response.send(createTodoFrontendHtml({ apiBaseUrl }));
   });
@@ -75,6 +76,7 @@ function createTodoFrontendServer(options = {}) {
 
 async function startTodoFrontendServer(options = {}) {
   const host = options.host || DEFAULT_HOST;
+  const publicHost = options.publicHost || host;
   const port = options.port ?? DEFAULT_PORT;
   const serverContext = createTodoFrontendServer(options);
 
@@ -96,7 +98,7 @@ async function startTodoFrontendServer(options = {}) {
 
   return {
     ...serverContext,
-    url: createBaseUrl(serverContext.server, host),
+    url: createBaseUrl(serverContext.server, publicHost),
   };
 }
 
@@ -130,6 +132,10 @@ function normalizeApiBaseUrl(apiBaseUrl) {
   normalizedUrl.pathname = normalizedUrl.pathname.replace(/\/+$/, '');
 
   return normalizedUrl.toString().replace(/\/$/, '');
+}
+
+function applyNoStore(response) {
+  response.setHeader('cache-control', 'no-store');
 }
 
 function createTodoFrontendHtml({ apiBaseUrl }) {

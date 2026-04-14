@@ -85,7 +85,7 @@ def apply_approved_changes_and_resume(
     if not replanned_objective_ids:
         raise ValueError("Approved changes did not identify any producer or impacted objectives to replan.")
 
-    blocking_activities = _active_replan_blockers(project_root, run_id, replanned_objective_ids)
+    blocking_activities = active_replan_blockers(project_root, run_id, replanned_objective_ids)
     if blocking_activities:
         blocker_summary = ", ".join(
             f"{activity['activity_id']} ({activity['status']})" for activity in blocking_activities
@@ -110,8 +110,8 @@ def apply_approved_changes_and_resume(
         },
     )
 
-    _rewind_phase_plan_for_reentry(project_root, run_id, reentry_phase)
-    _archive_future_phase_objective_artifacts(project_root, run_id, reentry_phase, replanned_objective_ids)
+    rewind_run_for_reentry(project_root, run_id, reentry_phase)
+    archive_future_phase_objective_artifacts(project_root, run_id, reentry_phase, replanned_objective_ids)
     for objective_id in replanned_objective_ids:
         plan_objective(
             project_root,
@@ -176,7 +176,7 @@ def _ordered_unique(values: Any) -> list[str]:
     return ordered
 
 
-def _active_replan_blockers(project_root: Path, run_id: str, objective_ids: list[str]) -> list[dict[str, Any]]:
+def active_replan_blockers(project_root: Path, run_id: str, objective_ids: list[str]) -> list[dict[str, Any]]:
     objective_id_set = set(objective_ids)
     blockers: list[dict[str, Any]] = []
     for activity in list_activities(project_root, run_id):
@@ -188,7 +188,7 @@ def _active_replan_blockers(project_root: Path, run_id: str, objective_ids: list
     return blockers
 
 
-def _rewind_phase_plan_for_reentry(project_root: Path, run_id: str, reentry_phase: str) -> dict[str, Any]:
+def rewind_run_for_reentry(project_root: Path, run_id: str, reentry_phase: str) -> dict[str, Any]:
     run_dir = project_root / "runs" / run_id
     phase_plan_path = run_dir / "phase-plan.json"
     phase_plan = read_json(phase_plan_path)
@@ -218,7 +218,7 @@ def _rewind_phase_plan_for_reentry(project_root: Path, run_id: str, reentry_phas
     return phase_plan
 
 
-def _archive_future_phase_objective_artifacts(
+def archive_future_phase_objective_artifacts(
     project_root: Path,
     run_id: str,
     reentry_phase: str,

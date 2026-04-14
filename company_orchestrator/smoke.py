@@ -103,6 +103,7 @@ def simulate_context_echo_completion(project_root: Path, run_id: str, task_id: s
         "artifacts": [{"path": prompt_log["prompt_path"], "status": "referenced"}],
         "validation_results": [{"id": "context-echo", "status": "passed", "evidence": "mock-runtime returned expected fields"}],
         "open_issues": [],
+        "blockers": [],
         "change_requests": [],
         "produced_outputs": [
             {

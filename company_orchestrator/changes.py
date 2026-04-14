@@ -179,6 +179,82 @@ def active_approved_change_requests(
         if payload.get("replacement_plan_revision") is not None:
             continue
         requests.append(payload)
+    return dedupe_active_feedback_generated_change_requests(requests)
+
+
+def dedupe_active_feedback_generated_change_requests(
+    requests: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    latest_by_feedback_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+    ordered_non_feedback_requests: list[dict[str, Any]] = []
+    for payload in requests:
+        source_task_id = str(payload.get("source_task_id") or "").strip()
+        if not source_task_id.startswith("feedback-FBK-"):
+            ordered_non_feedback_requests.append(payload)
+            continue
+        key = (
+            str(payload.get("source_objective_id") or "").strip(),
+            str(payload.get("required_reentry_phase") or "").strip(),
+            str(payload.get("summary") or "").strip().lower(),
+        )
+        current = latest_by_feedback_key.get(key)
+        if current is None or _feedback_generated_change_sort_key(payload) > _feedback_generated_change_sort_key(current):
+            latest_by_feedback_key[key] = payload
+    deduped_feedback_requests = sorted(
+        latest_by_feedback_key.values(),
+        key=lambda payload: _feedback_generated_change_sort_key(payload),
+    )
+    return ordered_non_feedback_requests + deduped_feedback_requests
+
+
+def _feedback_generated_change_sort_key(payload: dict[str, Any]) -> tuple[int, int, str]:
+    change_id = str(payload.get("change_id") or "").strip()
+    feedback_match = change_id.split("-chg-", 1)
+    feedback_index = 0
+    change_index = 0
+    if len(feedback_match) == 2:
+        feedback_prefix, change_suffix = feedback_match
+        feedback_tail = feedback_prefix.rsplit("FBK-", 1)[-1]
+        if feedback_tail.isdigit():
+            feedback_index = int(feedback_tail)
+        if change_suffix.isdigit():
+            change_index = int(change_suffix)
+    return (feedback_index, change_index, change_id)
+
+
+def replanned_approved_change_requests(
+    project_root: Path,
+    run_id: str,
+    *,
+    objective_id: str | None = None,
+    phase: str | None = None,
+) -> list[dict[str, Any]]:
+    run_dir = project_root / "runs" / run_id
+    requests_dir = run_dir / "change-requests"
+    if not requests_dir.exists():
+        return []
+    phase_order = {name: index for index, name in enumerate(PHASES)}
+    requests: list[dict[str, Any]] = []
+    for path in sorted(requests_dir.glob("*.json")):
+        payload = read_json(path)
+        if payload.get("approval", {}).get("status") != "approved":
+            continue
+        replacement_plan_revision = str(payload.get("replacement_plan_revision") or "").strip()
+        if not replacement_plan_revision:
+            continue
+        if phase is not None:
+            required_reentry_phase = str(payload.get("required_reentry_phase") or "").strip()
+            if required_reentry_phase in phase_order and phase in phase_order:
+                if phase_order[required_reentry_phase] > phase_order[phase]:
+                    continue
+        if objective_id is not None:
+            impacted_objective_ids = {
+                str(item).strip() for item in payload.get("impacted_objective_ids", []) if str(item).strip()
+            }
+            source_objective_id = str(payload.get("source_objective_id") or "").strip()
+            if objective_id not in impacted_objective_ids and objective_id != source_objective_id:
+                continue
+        requests.append(payload)
     return requests
 
 
